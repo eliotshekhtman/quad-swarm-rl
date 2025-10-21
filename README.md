@@ -192,7 +192,33 @@ Please check following videos for more details:
 }
 ```
 
-### The next paper will appear soon. Hopefully, it will be the end of 2024. That would be a big surprise. 
+### Tiny End-to-End Navigation for Quadrotor Swarms
+ICRA 2025 Workshop
+
+An end-to-end system for navigating a quadrotor swarm with severely resource-constrained hardware, fully relying on onboard resources for perception, localization, planning, and control.
+
+```
+@article{chiutiny,
+  title={Tiny End-to-End Navigation for Quadrotor Swarms},
+  author={Chiu, Darren and Huang, Zhehui and Ge, Ruohai and Sukhatme, Gaurav S}
+}
+```
+
+### Latent Activation Editing: Inference-Time Refinement of Learned Policies for Safer Multirobot Navigation
+Under Review
+
+A novel framwork for inference-time behavior steering of pre-trained robot policies without retraining or fine-tuning.
+```
+@article{das2025latent,
+  title={Latent Activation Editing: Inference-Time Refinement of Learned Policies for Safer Multirobot Navigation},
+  author={Das, Satyajeet and Chiu, Darren and Huang, Zhehui and Lindemann, Lars and Sukhatme, Gaurav S},
+  journal={arXiv preprint arXiv:2509.20623},
+  year={2025}
+}
+```
+
+
+### The next paper will appear soon. Hopefully, it will be the end of 2025. That would be a big surprise. 
 ### After that paper publish, we will spend more time on the community, including maintain a website to cover more details of using this simulator and open source some important trained models. 
 
 Github issues and pull requests are welcome.
