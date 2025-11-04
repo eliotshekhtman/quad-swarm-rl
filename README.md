@@ -31,15 +31,15 @@ https://github.com/alex-petrenko/sample-factory
 Initialize a Python environment, i.e. with `conda` (Python versions >=3.11 are supported):
 
 ```
-conda create -n swarm-rl python=3.11
-conda activate swarm-rl
-```
-
-Clone and install this repo as an editable Pip package:
-```
-git clone https://github.com/Zhehui-Huang/quad-swarm-rl.git
+git clone https://github.com/eliotshekhtman/quad-swarm-rl.git
 cd quad-swarm-rl
+
+conda create -n swarm-cbf python=3.11 "numpy<2" "scipy<1.14" "cvxpy==1.4.2" osqp scs ecos -c conda-forge
+conda activate swarm-cbf
 pip install -e .
+conda install -c conda-forge ffmpeg
+pip install pybind11 --no-deps
+conda install -c conda-forge libiconv
 ```
 
 This should pull and install all the necessary dependencies including PyTorch.
