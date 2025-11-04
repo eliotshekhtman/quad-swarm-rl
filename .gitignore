@@ -14,3 +14,4 @@ _results
 *.egg-info/
 train_dir/
 wandb/
+*.npz
