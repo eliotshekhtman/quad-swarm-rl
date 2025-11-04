@@ -22,6 +22,7 @@ print('IMPORTING OPENGL RENDERING MODULE. THIS SHOULD NOT BE IMPORTED IN HEADLES
 try:
     import pyglet
     pyglet.options['debug_gl'] = False
+    from pyglet import window as pyglet_window
 except ImportError as e:
         raise ImportError('''
     Cannot import pyglet.
@@ -118,7 +119,11 @@ class WindowTarget(object):
             config = Config(double_buffer=True, depth_size=16)
         else:
             antialiasing_x = 4
-            config = Config(double_buffer=True, depth_size=16, sample_buffers=1, samples=antialiasing_x)
+            try:
+                config = Config(double_buffer=True, depth_size=16, sample_buffers=1, samples=antialiasing_x)
+            except pyglet_window.NoSuchConfigException:
+                # Codex: fallback when multisample config is unavailable (e.g., headless GLX servers)
+                config = Config(double_buffer=True, depth_size=16)
 
         display = get_display(display)
         # vsync is set to false to speed up FBO-only renders, we enable before draw
@@ -492,16 +497,20 @@ class _PygTexture(pyglet.graphics.Group):
 
         self.tex = tex
         glBindTexture(GL_TEXTURE_2D, self.tex.id)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-        glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+        glGenerateMipmap(GL_TEXTURE_2D)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag_filter)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
 
-        # anisotropic texturing helps a lot with checkerboard floors
-        anisotropy = (GLfloat)()
-        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy)
-        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy)
+        # Try to enable anisotropic filtering if available
+        try:
+            if gl_info.have_extension('GL_EXT_texture_filter_anisotropic'):
+                anisotropy = (GLfloat)()
+                glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy)
+                glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy)
+        except:
+            log.debug('Anisotropic filtering not available')
 
     def set_state(self):
         glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, (GLfloat * 4)(1,1,1,1))
@@ -874,5 +883,3 @@ def _np2tex(a):
     assert len(b) == w * h
     img = pyglet.image.ImageData(w, h, "L", b)
     return img.get_texture()
-
-
