@@ -6,8 +6,6 @@ dynamic_diff_goal scenario.
 Each sample records (position, velocity, angular velocity, rotation, thrusts, delta position,
 delta velocity, delta angular velocity, delta rotation) so the dataset can train a forward
 dynamics model that maps the current quad state and planner output to the state change.
-
-Place this file at: quad-swarm-rl/scripts/collect_dynamics_dataset.py
 """
 
 import argparse

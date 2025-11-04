@@ -5,8 +5,6 @@ and planner outputs using datasets produced by collect_dynamics_dataset.py.
 
 The dataset must provide the fields: position, velocity, angular_velocity, rotation (flattened 3x3),
 thrusts, delta_position, delta_velocity, delta_angular_velocity, and delta_rotation (flattened 3x3).
-
-Place this file at: quad-swarm-rl/scripts/train_dynamics_model.py
 """
 
 import argparse

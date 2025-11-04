@@ -18,9 +18,6 @@ cycle the script:
        respecting actuator bounds and the softened ECBF constraints.
     6. Maps the safe thrust profile back to the environment's native action
        space and steps the simulator.
-
-Place this script under ``quad-swarm-rl/scripts/`` to match the layout of
-``mixed_enjoy.py``.
 """
 
 from __future__ import annotations

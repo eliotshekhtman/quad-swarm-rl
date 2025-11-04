@@ -9,8 +9,6 @@ exactly 1,000 sequences suitable for training recurrent predictors.
 Dataset contents (all float32):
     - positions:  [num_sequences, sequence_length, 3]
     - velocities: [num_sequences, sequence_length, 3]
-
-Place this file at: quad-swarm-rl/scripts/collect_solo_sequence_dataset.py
 """
 
 import argparse
