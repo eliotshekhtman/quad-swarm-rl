@@ -415,7 +415,7 @@ def main() -> None:
         scores.sort() # Make sure the index isn't equal to len
         # Just want to visually check that this makes sense
         print(f'Scores for agent {agent_id}: ', scores)
-        conformal_radius = scores[np.ceil(len(scores) * (1 - alpha)) - 1]
+        conformal_radius = scores[np.ceil(len(scores) * (1 - args.alpha)) - 1]
 
         finetuned_path = os.path.join(experiment_dir, f"predictor_{agent_id}.pt")
         payload = {
