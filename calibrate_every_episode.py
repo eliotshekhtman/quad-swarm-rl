@@ -162,35 +162,46 @@ def finetune_rnn(logs, num_multi_agents, predictor_checkpoint):
         predictors.append(predictor)
     return predictors
 
-def conformal_radii(logs, num_multi_agents, predictors, alpha):
+def conformal_radii(logs, num_multi_agents, predictors, histories, alpha, episode_length):
+    device = torch.device("cpu")
+    radii = np.full(num_multi_agents, 0, dtype=np.float64) # Probs set to arm len
+    # Need a radius for each agent
     for agent_id in range(num_multi_agents):
         print('Collecting trajectory-level nonconformity scores')
+        history_log = histories[agent_id]
+        # Original true history array
+        history_array = np.concatenate(
+            [history_log["position"], history_log["velocity"]], axis=-1
+        ).astype(np.float32)
+        # Track history as a Python list so we can append predictions
+        history = [entry.copy() for entry in history_array]
+        history_len = len(history)
+        # Roll out a predicted trajectory
+        for i in range(episode_length):
+            # New history array generated from appended-to history
+            history_np = np.asarray(history, dtype=np.float32)
+            history_tensor = torch.from_numpy(history_np).unsqueeze(0).to(
+                device = device, dtype = torch.float32)
+            pred = predictors[agent_id](history_tensor)[0, -1].detach().cpu().numpy()
+            history.append(pred.astype(np.float32))
         # Collect trajectory-level nonconformity scores
         scores = []
-        progress = tqdm(logs[agent_id][:-1])
-        for run_log in progress:
+        for run_log in logs[agent_id]:
             score = 0  # Lowerbound on possible nonconformity score
-            # Warm it up with the first 50 steps, and collect predictions for the rest
             run = np.concatenate(
                 [run_log["position"], run_log["velocity"]],
                 axis=-1,
             ).astype(np.float32)
-            warmup = min(50, len(run))
-            predictions = [run[idx].copy() for idx in range(warmup)]
-            for i in range(warmup, len(run)):
-                history_arr = np.asarray(predictions, dtype=np.float32)
-                history = torch.from_numpy(history_arr).unsqueeze(0).to(
-                    device=device, dtype=torch.float32
-                )
-                pred = predictor(history)[0, -1].detach().cpu().numpy()
-                predictions.append(pred.astype(np.float32))
-                # L2 norm difference between prediction and what really happened
-                score = max(score, np.linalg.norm(pred - run[i]))
+            for i in range(episode_length):
+                # Largest distance across timesteps in the episode
+                score = max(score, np.linalg.norm(history[history_len + i] - run[i]))
             scores.append(score)
-        scores.sort() # Make sure the index isn't equal to len
+        scores.sort()
         # Just want to visually check that this makes sense
         print(f'Scores for agent {agent_id}: ', scores)
-        conformal_radius = scores[np.ceil(len(scores) * (1 - alpha)) - 1]
+        conformal_radius = scores[int(np.ceil(len(scores) * (1 - alpha)) - 1)]
+        radii[agent_id] = conformal_radius
+    return radii
 
 
 # ---------------------------------------------------------------------------
@@ -219,20 +230,6 @@ def ensure_experiment_dir(base_dir: str, name: str) -> str:
     experiment_dir = os.path.join(base_dir, name)
     os.makedirs(experiment_dir, exist_ok=True)
     return experiment_dir
-
-
-def save_initial_states(path: str, states: List[QuadState]) -> None:
-    payload = [quad_state_to_serialisable(s) for s in states]
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-
-
-def load_initial_states(path: str) -> Optional[List[QuadState]]:
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    return [quad_state_from_dict(entry) for entry in payload]
 
 
 def main() -> None:
@@ -311,6 +308,10 @@ def main() -> None:
     progress_bar = tqdm(range(num_episodes))
     radii = np.full(num_multi_agents, 0, dtype=np.float64)
     # Collect histories for each agent to pass to their respective predictors
+    pos, vel = extract_positions_velocities(env.unwrapped)
+    histories = [] # list of pos,vel histories, each entry is a quad
+    for i in range(num_multi_agents + 1):
+        histories.append({ "position" : [pos[i]], "velocity" : [vel[i]] })
     for episode in progress_bar:
         progress_bar.set_postfix_str("Setting radii")
         filter = make_cbf_filter(radii)
@@ -323,7 +324,7 @@ def main() -> None:
                     max_steps=args.episode_length, 
                     num_runs=args.num_trajectories, 
                     deterministic=False)
-        # conformal radii and actual prediction traj's
+        # call conformal_radii
         # solver stuff for other radii
         temp_env.close()
         for step in range(args.episode_length):
@@ -370,6 +371,11 @@ def main() -> None:
             if solo_info_rewards.get("rewraw_quadcol", 0.0) < 0.0:
                 solo_collision_count += 1
                 progress_bar.set_postfix_str(f"crashes={solo_collision_count}")
+            
+            pos, vel = extract_positions_velocities(env.unwrapped)
+            for i in range(num_multi_agents + 1): # Save for all quads
+                histories[i]["position"].append(pos[i])
+                histories[i]["velocity"].append(vel[i])
 
             terminated = np.asarray(terminated)
             truncated = np.asarray(truncated)
