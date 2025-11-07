@@ -86,7 +86,7 @@ def capture_env_snapshot(env) -> EnvSnapshot:
     return EnvSnapshot(env_state=env_copy, rng=rng_snapshot)
 
 
-def restore_env_snapshot(env, snapshot: EnvSnapshot, restore_rng: bool) -> None:
+def restore_env_snapshot(env, snapshot: EnvSnapshot, restore_rng=False) -> None:
     """
     Mutate ``env.unwrapped`` in-place to match the captured snapshot.
 
@@ -103,7 +103,7 @@ def restore_env_snapshot(env, snapshot: EnvSnapshot, restore_rng: bool) -> None:
         _restore_rng(snapshot.rng)
 
 
-def clone_env_from_snapshot(snapshot: EnvSnapshot, restore_rng: bool):
+def clone_env_from_snapshot(snapshot: EnvSnapshot, restore_rng=False):
     """
     Create a new environment instance initialised with the captured state.
 

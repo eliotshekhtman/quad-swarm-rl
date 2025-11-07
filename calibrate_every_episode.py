@@ -58,7 +58,7 @@ from restart_utils import (
 # Conformal utilities
 # ---------------------------------------------------------------------------
 
-def fall_down(action_solo):
+def fall_down(base_action, env_state, swarm_state):
     return np.array([-1., -1., -1., -1.], dtype=np.float64)
 
 def run_multi_agents(env, obs, num_multi_agents, 
@@ -110,20 +110,23 @@ def run_multi_agents(env, obs, num_multi_agents,
             if action_solo.dim() == 1:
                 action_solo = action_solo.unsqueeze(0)
             action_solo = action_solo.detach().cpu().numpy()[0]
-            action_solo = solo_action_fn(action_solo) # May need more params
+            swarm_state = get_swarm_state(env_run.unwrapped)
+            # Apply CBF to the ego agent based on radius determined earlier
+            action_solo = solo_action_fn(
+                base_action=action_solo,
+                env_state=env_run.unwrapped,
+                swarm_state=swarm_state
+            )
 
             actions = np.vstack([actions_multi, action_solo[None, :]])
-            obs_run, rewards, terminated, truncated, infos = env_run.step(actions)
+            obs_run, rewards, dones, infos = env_run.step(actions)
             obs_run = np.array(obs_run, dtype=np.float32)
 
             pos, vel = extract_positions_velocities(env_run.unwrapped)
             for i in range(num_multi_agents):
                 logs[i][-1]["position"].append(pos[i])
                 logs[i][-1]["velocity"].append(vel[i])
-
-            terminated = np.asarray(terminated)
-            truncated = np.asarray(truncated)
-            done = np.all(np.logical_or(terminated, truncated))
+            done = np.all(dones)
             step_num += 1
         env_run.close()
 
@@ -251,6 +254,9 @@ def main() -> None:
 
     device = torch.device("cpu")
 
+    # Load multi config early since it has some useful info
+    cfg_multi = load_cfg(args.multi_train_dir, args.multi_experiment)
+
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
@@ -271,11 +277,10 @@ def main() -> None:
     eval_cfg = parse_swarm_cfg(eval_cli, evaluation=True)
     render_mode = "rgb_array"
     
-    num_multi_agents = int(eval_cfg.quads_num_agents)
+    num_multi_agents = int(eval_cfg.quads_num_agents - 1)
 
     # Load in multi-agents
     env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=render_mode)
-    cfg_multi = load_cfg(args.multi_train_dir, args.multi_experiment)
     multi_ckpt = latest_checkpoint(args.multi_train_dir, args.multi_experiment, policy_index=0)
     multi_actor = load_actor(cfg_multi, env.observation_space, env.action_space, multi_ckpt, device)
     multi_rnn_size = get_rnn_size(cfg_multi)
@@ -303,10 +308,15 @@ def main() -> None:
     predictors = finetune_rnn(logs, num_multi_agents, args.predictor_checkpoint)
     temp_env.close()
 
+    # Collect arm length for default radius
+    arm_len = env.quad_arm
+
     # Make sure no resets are needed for the actual run
     num_episodes = 1500 // args.episode_length - 1
     progress_bar = tqdm(range(num_episodes))
-    radii = np.full(num_multi_agents, 0, dtype=np.float64)
+    # Init r0 to some large value that ought to be safe
+    radii = np.full(num_multi_agents, 2, dtype=np.float64)
+    filter = make_cbf_filter(radii)
     # Collect histories for each agent to pass to their respective predictors
     pos, vel = extract_positions_velocities(env.unwrapped)
     histories = [] # list of pos,vel histories, each entry is a quad
@@ -314,8 +324,7 @@ def main() -> None:
         histories.append({ "position" : [pos[i]], "velocity" : [vel[i]] })
     for episode in progress_bar:
         progress_bar.set_postfix_str("Setting radii")
-        filter = make_cbf_filter(radii)
-        # Set conformal radii
+        # Find qj using old pi_j
         snapshot = capture_env_snapshot(env)
         temp_env = clone_env_from_snapshot(shapshot)
         logs = run_multi_agents(temp_env, obs, num_multi_agents, 
@@ -324,8 +333,15 @@ def main() -> None:
                     max_steps=args.episode_length, 
                     num_runs=args.num_trajectories, 
                     deterministic=False)
-        # call conformal_radii
-        # solver stuff for other radii
+        qj = conformal_radii(logs, num_multi_agents, predictors, 
+                    histories, args.alpha, args.episode_length)
+        print(qj)
+        # get Deltaj
+        # get rhoj
+        # set total radius
+        radii = np.full(num_multi_agents, 2 * arm_len, dtype=np.float64)
+        radii += qj # and Deltaj and rhoj
+        filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
         for step in range(args.episode_length):
             # Actually run the normal execution
@@ -358,7 +374,7 @@ def main() -> None:
 
             swarm_state = get_swarm_state(env.unwrapped)
             # Apply CBF to the ego agent based on radius determined earlier
-            action_solo = filter (
+            action_solo = filter(
                 base_action=action_solo,
                 env_state=env.unwrapped,
                 swarm_state=swarm_state
