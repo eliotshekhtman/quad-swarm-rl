@@ -104,7 +104,7 @@ def main() -> None:
     scene = env.unwrapped.scenes[0] # first entry matches the first quads_view_mode
     scene.camera_drone_index = -1
 
-    radii = np.full(args.num_multi_agents, 3, dtype=np.float64)
+    radii = np.full(args.num_multi_agents, 1, dtype=np.float64)
     filter = make_cbf_filter(radii)
 
     progress_bar = tqdm(range(args.max_steps))

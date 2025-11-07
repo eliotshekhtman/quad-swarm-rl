@@ -196,6 +196,7 @@ def _solve_cbf_qp(
         return np.clip(u_ref, u_min, u_max)
     if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
         return np.clip(u_ref, u_min, u_max)
+    # print('Slack: ', slack.value)
     solution = np.array(u_var.value, dtype=np.float64)
     return np.clip(solution, u_min, u_max)
 
