@@ -86,7 +86,7 @@ def capture_env_snapshot(env) -> EnvSnapshot:
     return EnvSnapshot(env_state=env_copy, rng=rng_snapshot)
 
 
-def restore_env_snapshot(env, snapshot: EnvSnapshot) -> None:
+def restore_env_snapshot(env, snapshot: EnvSnapshot, restore_rng: bool) -> None:
     """
     Mutate ``env.unwrapped`` in-place to match the captured snapshot.
 
@@ -99,10 +99,11 @@ def restore_env_snapshot(env, snapshot: EnvSnapshot) -> None:
     restored = copy.deepcopy(snapshot.env_state.__dict__)
     base_env.__dict__.clear()
     base_env.__dict__.update(restored)
-    _restore_rng(snapshot.rng)
+    if restore_rng:
+        _restore_rng(snapshot.rng)
 
 
-def clone_env_from_snapshot(snapshot: EnvSnapshot):
+def clone_env_from_snapshot(snapshot: EnvSnapshot, restore_rng: bool):
     """
     Create a new environment instance initialised with the captured state.
 
@@ -112,6 +113,7 @@ def clone_env_from_snapshot(snapshot: EnvSnapshot):
         Deep copy of the stored ``QuadrotorEnvMulti`` that can be stepped independently.
     """
     clone = copy.deepcopy(snapshot.env_state)
-    _restore_rng(snapshot.rng)
+    if restore_rng:
+        _restore_rng(snapshot.rng)
     return clone
 
