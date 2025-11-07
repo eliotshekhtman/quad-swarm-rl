@@ -202,6 +202,26 @@ def train_model(
 
     return train_losses, val_losses, best_val
 
+def load_rnn_checkpoint(path: str, device: torch.device) -> RNNPredictor:
+    checkpoint = torch.load(path, map_location=device)
+    cfg = checkpoint.get("config")
+    if cfg is None:
+        raise KeyError("Checkpoint missing 'config' field required to rebuild the model.")
+    input_dim = cfg["hidden_size"] if False else None  # placeholder to satisfy linter
+    input_dim = checkpoint["model_state_dict"]["head.bias"].shape[0]
+    model = RNNPredictor(
+        input_dim=input_dim,
+        hidden_size=cfg["hidden_size"],
+        num_layers=cfg["num_layers"],
+        rnn_type=cfg["rnn_type"],
+        dropout=cfg["dropout"],
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+    model.config = cfg
+    return model
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train an RNN next-step predictor on solo quad sequences.")
