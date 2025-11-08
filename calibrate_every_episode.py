@@ -54,6 +54,7 @@ from restart_utils import (
 )
 
 DEVICE = torch.device("cpu")
+DELTA_T = 0.015
 
 
 def safe_capture_env_snapshot(env):
@@ -187,11 +188,15 @@ def roll_out_predictor(history_array: ndarray, predictor, rollout_length):
     history_len = len(history)
     # Roll out a predicted trajectory
     for i in range(rollout_length):
+        # Predictor wasn't doing that well so just replaced with predicting from velocity
         # New history array generated from appended-to history
-        history_np = np.asarray(history, dtype=np.float32)
-        history_tensor = torch.from_numpy(history_np).unsqueeze(0).to(
-            device = DEVICE, dtype = torch.float32)
-        pred = predictor(history_tensor)[0, -1].detach().cpu().numpy()
+        # history_np = np.asarray(history, dtype=np.float32)
+        # history_tensor = torch.from_numpy(history_np).unsqueeze(0).to(
+        #     device = DEVICE, dtype = torch.float32)
+        # pred = predictor(history_tensor)[0, -1].detach().cpu().numpy()
+        pred = np.concatenate([
+            history[-1][:3] + history[-1][3:] * DELTA_T, history[-1][3:]], 
+            axis=-1)
         history.append(pred.astype(np.float32))
     return history[history_len:]
 
@@ -317,17 +322,19 @@ def main() -> None:
     obs, stored_states = deterministic_reset(env, args.seed, None)
 
     # Finetune a predictor for each multi-agent
-    shapshot = safe_capture_env_snapshot(env)
-    temp_env = clone_env_from_snapshot(shapshot)
-    logs = run_multi_agents(temp_env, obs, num_multi_agents, 
-                    multi_actor, multi_rnn_states, 
-                    solo_actor, solo_rnn_states, solo_obs_dim, fall_down,
-                    deterministic=True)
-    predictors = finetune_rnn(logs, num_multi_agents, args.predictor_checkpoint)
-    temp_env.close()
+    # snapshot = safe_capture_env_snapshot(env)
+    # temp_env = clone_env_from_snapshot(snapshot)
+    # logs = run_multi_agents(temp_env, obs, num_multi_agents, 
+    #                 multi_actor, multi_rnn_states, 
+    #                 solo_actor, solo_rnn_states, solo_obs_dim, fall_down,
+    #                 deterministic=True)
+    # predictors = finetune_rnn(logs, num_multi_agents, args.predictor_checkpoint)
+    # temp_env.close()
+    predictors = [None] * num_multi_agents
 
-    # Collect arm length for default radius
+    # Collect arm length for default radius and dt for time btn steps
     arm_len = env.quad_arm
+    DELTA_T = env.control_dt
 
     # Make sure no resets are needed for the actual run
     num_episodes = 1500 // args.episode_length - 1
@@ -342,10 +349,10 @@ def main() -> None:
     for i in range(num_multi_agents + 1):
         histories.append({ "position" : [pos[i]], "velocity" : [vel[i]] })
     for episode in progress_bar:
-        progress_bar.set_postfix_str("Setting radii")
+        # progress_bar.set_postfix_str("Setting radii")
         # Find qj using old pi_j
         snapshot = safe_capture_env_snapshot(env)
-        temp_env = clone_env_from_snapshot(shapshot)
+        temp_env = clone_env_from_snapshot(snapshot)
         logs = run_multi_agents(temp_env, obs, num_multi_agents, 
                     multi_actor, multi_rnn_states, 
                     solo_actor, solo_rnn_states, solo_obs_dim, filter,
@@ -362,7 +369,7 @@ def main() -> None:
         radii += qj # and Deltaj and rhoj
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
-        progress_bar.set_postfix_str(f"crashes={solo_collision_count}")
+        # progress_bar.set_postfix_str(f"crashes={solo_collision_count}")
         for step in range(args.episode_length):
             # Actually run the normal execution
             obs_np = np.asarray(obs)
@@ -399,6 +406,12 @@ def main() -> None:
                 env_state=env.unwrapped,
                 swarm_state=swarm_state
             )
+            closest_dist = 100 # arbitrarily big
+            solo_pos = swarm_state.positions[-1]
+            for teammate_pos in swarm_state.positions[:-1]:
+                dist = np.linalg.norm(solo_pos - teammate_pos)
+                closest_dist = min(dist, closest_dist)
+            progress_bar.set_postfix_str(f"dist>={closest_dist}")
 
             actions = np.vstack([actions_multi, action_solo[None, :]])
             obs, rewards, terminated, truncated, infos = env.step(actions)
