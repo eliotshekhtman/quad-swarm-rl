@@ -411,6 +411,99 @@ def estimate_LYx(
     return float(lipschitz)
 
 
+def estimate_LYu(
+    temp_env,
+    obs,
+    num_multi_agents,
+    multi_actor,
+    multi_rnn_states,
+    solo_actor,
+    solo_rnn_states,
+    solo_obs_dim,
+    perturbation_radius,
+) -> float:
+    """
+    Estimate a local Lipschitz constant relating solo-action perturbations to the
+    next teammate state (solo quad excluded).
+    """
+    if perturbation_radius <= 0.0 or num_multi_agents <= 0:
+        return 0.0
+
+    obs_np = np.asarray(obs, dtype=np.float32)
+    snapshot = safe_capture_env_snapshot(temp_env)
+
+    run_solo_rnn_states = solo_rnn_states.clone()
+    obs_solo_self = obs_np[-1, :solo_obs_dim]
+    obs_solo_dict = {OBS_KEY: obs_solo_self[None, :]}
+    with torch.no_grad():
+        normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
+        solo_actor(normalized_solo, run_solo_rnn_states)
+    base_action = argmax_actions(solo_actor.action_distribution())
+    if base_action.dim() == 1:
+        base_action = base_action.unsqueeze(0)
+    base_action = base_action.detach().cpu().numpy()[0].astype(np.float32)
+    action_dim = int(base_action.shape[-1])
+
+    def simulate_teammate_state(action: np.ndarray) -> np.ndarray:
+        rng_backup = snapshot_rng_state()
+        restore_rng_state(snapshot.rng)
+        env_clone = clone_env_from_snapshot(snapshot)
+        try:
+            obs_clone = _collect_observations_from_env(env_clone)
+
+            run_multi_states = multi_rnn_states.clone()
+            obs_multi_dict = {OBS_KEY: obs_clone[:num_multi_agents]}
+            with torch.no_grad():
+                normalized_multi = prepare_and_normalize_obs(multi_actor, obs_multi_dict)
+                policy_multi = multi_actor(normalized_multi, run_multi_states)
+            actions_multi = policy_multi["actions"]
+            actions_multi = argmax_actions(multi_actor.action_distribution())
+            if actions_multi.dim() == 1:
+                actions_multi = actions_multi.unsqueeze(-1)
+            actions_multi = actions_multi.detach().cpu().numpy()
+
+            stacked_actions = np.vstack([actions_multi, action[None, :]])
+            env_clone.step(stacked_actions)
+            return _extract_full_swarm_state_vector(env_clone.unwrapped, num_multi_agents)
+        finally:
+            env_clone.close()
+            restore_rng_state(rng_backup)
+
+    base_env_state = simulate_teammate_state(base_action)
+
+    required_samples = max(32, 3 * action_dim)
+    directions: List[np.ndarray] = []
+    for axis in range(action_dim):
+        basis = np.zeros(action_dim, dtype=np.float32)
+        basis[axis] = 1.0
+        directions.append(basis)
+        directions.append(-basis)
+    while len(directions) < required_samples:
+        directions.append(np.random.uniform(low=-1.0, high=1.0, size=action_dim).astype(np.float32))
+    
+    # Printing what happens with NO perturbation
+    pert_env_state = simulate_teammate_state(base_action)
+    print("DELTA Y: ", np.linalg.norm(pert_env_state - base_env_state))
+
+    lipschitz = 0.0
+    for direction in directions:
+        norm = np.linalg.norm(direction)
+        if norm < 1e-9:
+            continue
+        perturb = (perturbation_radius * direction / norm).astype(np.float32)
+        candidate_action = np.clip(base_action + perturb, -1.0, 1.0)
+        delta_u = np.linalg.norm(candidate_action - base_action)
+        if delta_u < 1e-9:
+            continue
+        pert_state = simulate_teammate_state(candidate_action)
+        delta_y = np.linalg.norm(pert_state - base_env_state)
+        if delta_y <= 0.0:
+            continue
+        lipschitz = max(lipschitz, delta_y / delta_u)
+
+    return float(lipschitz)
+
+
 def estimate_LYy(
     temp_env,
     obs,
@@ -828,8 +921,11 @@ def main() -> None:
             solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
         L_Yy = estimate_LYy(temp_env, obs, num_multi_agents, 
             multi_actor, multi_rnn_states,
-            solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius,
-)
+            solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
+        # L_Yu is zero, definitively
+        # L_Yu = estimate_LYu(temp_env, obs, num_multi_agents, 
+        #     multi_actor, multi_rnn_states,
+        #     solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
         print(L_Xu, L_Yx, L_Yy)
         # get Deltaj
         # get rhoj
