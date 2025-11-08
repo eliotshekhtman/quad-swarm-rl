@@ -57,6 +57,336 @@ DEVICE = torch.device("cpu")
 DELTA_T = 0.015
 
 
+# ---------------------------------------------------------------------------
+# Estimate Lipschitz constants
+# ---------------------------------------------------------------------------
+
+def _extract_agent_state(env, agent_index=-1) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (position, velocity, rotation_matrix, angular_velocity) for the chosen agent."""
+    base_env = getattr(env, "unwrapped", env)
+    quad = base_env.envs[agent_index]
+    dynamics = quad.dynamics
+    position = np.asarray(dynamics.pos, dtype=np.float64)
+    velocity = np.asarray(dynamics.vel, dtype=np.float64)
+    rotation = np.asarray(dynamics.rot, dtype=np.float64)
+    omega = np.asarray(dynamics.omega, dtype=np.float64)
+    return position, velocity, rotation, omega
+
+def _pack_agent_state(position, velocity, rotation, omega) -> np.ndarray:
+    """Flatten the provided components into a single vector for distance computations."""
+    return np.concatenate(
+        [
+            position.reshape(-1),
+            velocity.reshape(-1),
+            rotation.reshape(-1),
+            omega.reshape(-1),
+        ],
+        axis=0,
+    ).astype(np.float64)
+
+def _project_to_so3(rotation: np.ndarray) -> np.ndarray:
+    """Project an arbitrary 3x3 matrix onto SO(3) via SVD."""
+    rot_mat = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    U, _, Vt = np.linalg.svd(rot_mat)
+    proj = U @ Vt
+    if np.linalg.det(proj) < 0.0:
+        U[:, -1] *= -1.0
+        proj = U @ Vt
+    return proj
+
+def _unpack_agent_state(state_vec: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Inverse of `_pack_agent_state`."""
+    flat = np.asarray(state_vec, dtype=np.float64).reshape(-1)
+    if flat.size != 18:
+        raise ValueError(f"Expected 18-dimensional state vector, received {flat.size}")
+    position = flat[0:3]
+    velocity = flat[3:6]
+    rotation = flat[6:15].reshape(3, 3)
+    omega = flat[15:18]
+    return position, velocity, rotation, omega
+
+def _apply_agent_state(env, agent_index: int, position, velocity, rotation, omega) -> None:
+    """Write the supplied state into the chosen agent and update cached arrays."""
+    base_env = getattr(env, "unwrapped", env)
+    quad = base_env.envs[agent_index]
+    # Assume that the rotation is valid
+    quad.dynamics.set_state(position, velocity, rotation, omega)
+    base_env.pos[agent_index, :] = quad.dynamics.pos
+    base_env.vel[agent_index, :] = quad.dynamics.vel
+
+def _collect_observations_from_env(env) -> np.ndarray:
+    """Rebuild the per-agent observations from the environment's current physical state."""
+    base_env = getattr(env, "unwrapped", env)
+    obs = [quad.state_vector(quad) for quad in base_env.envs]
+    if getattr(base_env, "num_use_neighbor_obs", 0) > 0:
+        obs = base_env.add_neighborhood_obs(obs)
+    return np.asarray(obs, dtype=np.float32)
+
+def _extract_full_swarm_state_vector(env, num_multi_agents: int) -> np.ndarray:
+    """
+    Flatten (pos, vel, rot, omega) for every multi-agent quad into a single vector.
+    Assumes the solo agent occupies the last slot and is therefore excluded.
+    """
+    base_env = getattr(env, "unwrapped", env)
+    if num_multi_agents <= 0:
+        return np.empty(0, dtype=np.float64)
+    packed = []
+    for agent_idx in range(num_multi_agents):
+        quad = base_env.envs[agent_idx]
+        dynamics = quad.dynamics
+        packed.append(
+            _pack_agent_state(
+                np.asarray(dynamics.pos, dtype=np.float64),
+                np.asarray(dynamics.vel, dtype=np.float64),
+                np.asarray(dynamics.rot, dtype=np.float64),
+                np.asarray(dynamics.omega, dtype=np.float64),
+            )
+        )
+    return np.concatenate(packed, axis=0)
+
+def _apply_full_swarm_state(env, state_vec: np.ndarray, num_multi_agents: int) -> None:
+    """
+    Overwrite each multi-agent quad's state using the flattened vector representation.
+    Leaves the solo agent (last index) untouched.
+    """
+    if num_multi_agents <= 0:
+        return
+    base_env = getattr(env, "unwrapped", env)
+    state_array = np.asarray(state_vec, dtype=np.float64)
+    try:
+        per_agent = state_array.reshape(num_multi_agents, 18)
+    except ValueError as exc:
+        raise ValueError("State vector length must be num_multi_agents * 18") from exc
+    for agent_idx in range(num_multi_agents):
+        entry = per_agent[agent_idx]
+        position = entry[0:3]
+        velocity = entry[3:6]
+        rotation = entry[6:15].reshape(3, 3)
+        omega = entry[15:18]
+        _apply_agent_state(base_env, agent_idx, position, velocity, rotation, omega)
+
+def simulate_env_from_snapshot(
+    snapshot,
+    base_env_state_vec: np.ndarray,
+    base_solo_state_vec: np.ndarray,
+    env_state_perturb: Optional[np.ndarray],
+    solo_state_perturb: Optional[np.ndarray],
+    num_multi_agents: int,
+    multi_actor,
+    multi_rnn_states,
+    solo_actor,
+    solo_rnn_states,
+    solo_obs_dim: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Run a single environment step from a snapshot while applying optional perturbations.
+    Returns (multi_agents_state_vec, solo_state_vec) after stepping.
+    """
+    env_clone = clone_env_from_snapshot(snapshot)
+    try:
+        solo_reference_vec = base_solo_state_vec
+        if env_state_perturb is not None:
+            candidate_env_state = base_env_state_vec + env_state_perturb
+            _apply_full_swarm_state(env_clone, candidate_env_state, num_multi_agents)
+            solo_reference_vec = _pack_agent_state(*_extract_agent_state(env_clone, -1))
+        if solo_state_perturb is not None:
+            candidate_solo = solo_reference_vec + solo_state_perturb
+            position, velocity, rotation, omega = _unpack_agent_state(candidate_solo)
+            _apply_agent_state(env_clone, -1, position, velocity, rotation, omega)
+
+        obs_clone = _collect_observations_from_env(env_clone)
+
+        run_multi_states = multi_rnn_states.clone()
+        obs_multi_dict = {OBS_KEY: obs_clone[:num_multi_agents]}
+        with torch.no_grad():
+            normalized_multi = prepare_and_normalize_obs(multi_actor, obs_multi_dict)
+            policy_multi = multi_actor(normalized_multi, run_multi_states)
+        actions_multi = policy_multi["actions"]
+        if actions_multi.dim() == 1:
+            actions_multi = actions_multi.unsqueeze(-1)
+        actions_multi = actions_multi.detach().cpu().numpy()
+
+        run_solo_states = solo_rnn_states.clone()
+        solo_obs = obs_clone[-1, :solo_obs_dim]
+        obs_solo_dict = {OBS_KEY: solo_obs[None, :]}
+        with torch.no_grad():
+            normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
+            solo_actor(normalized_solo, run_solo_states)
+        action_solo = argmax_actions(solo_actor.action_distribution())
+        if action_solo.dim() == 1:
+            action_solo = action_solo.unsqueeze(0)
+        action_solo = action_solo.detach().cpu().numpy()[0]
+
+        actions = np.vstack([actions_multi, action_solo[None, :]])
+        env_clone.step(actions)
+        swarm_state_vec = _extract_full_swarm_state_vector(env_clone, num_multi_agents)
+        solo_state_vec = _pack_agent_state(*_extract_agent_state(env_clone, -1))
+        return swarm_state_vec, solo_state_vec
+    finally:
+        env_clone.close()
+
+def estimate_LXu(
+    temp_env,
+    obs,
+    num_multi_agents,
+    solo_actor,
+    solo_rnn_states,
+    solo_obs_dim,
+) -> float:
+    """
+    Empirically estimate a local Lipschitz constant L such that
+    ||x_{t+1}(u_1) - x_{t+1}(u_2)|| <= L ||u_1 - u_2|| for the solo agent.
+    """
+
+
+    obs_np = np.asarray(obs, dtype=np.float32)
+    snapshot = safe_capture_env_snapshot(temp_env)
+
+    # Run solo agent to get the base action / state
+    run_solo_rnn_states = solo_rnn_states.clone()
+    obs_solo_self = obs_np[-1, :solo_obs_dim]
+    obs_solo_dict = {OBS_KEY: obs_solo_self[None, :]}
+    with torch.no_grad():
+        normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
+        solo_actor(normalized_solo, run_solo_rnn_states)
+    base_action = argmax_actions(solo_actor.action_distribution())
+    if base_action.dim() == 1:
+        base_action = base_action.unsqueeze(0)
+    base_action = base_action.detach().cpu().numpy()[0].astype(np.float32)
+    action_dim = int(base_action.shape[-1])
+
+    # zero thrust for teammates
+    actions_multi = np.zeros((num_multi_agents, action_dim), dtype=np.float32)  
+
+    def simulate_next_state(action: np.ndarray) -> np.ndarray:
+        env_clone = clone_env_from_snapshot(snapshot)
+        try:
+            stacked_actions = np.vstack([actions_multi, action[None, :]])
+            env_clone.step(stacked_actions)
+            position, velocity, rotation, omega = _extract_agent_state(env_clone.unwrapped, -1)
+            return _pack_agent_state(position, velocity, rotation, omega)
+        finally:
+            env_clone.close()
+
+    base_state = simulate_next_state(base_action)
+
+    # Collect directions to act in
+    required_samples = max(32, 3 * action_dim)
+    directions: List[np.ndarray] = []
+    for axis in range(action_dim):
+        basis = np.zeros(action_dim, dtype=np.float32)
+        basis[axis] = 1.0
+        directions.append(basis)
+        directions.append(-basis)
+    while len(directions) < required_samples:
+        directions.append(np.random.uniform(low=-1., high=1., size=action_dim).astype(np.float32))
+
+    # Collect max ratio
+    lipschitz = 0.0
+    for direction in directions:
+        delta_u = np.linalg.norm(direction - base_action)
+        if delta_u < 1e-9:
+            continue
+        pert_state = simulate_next_state(direction)
+        delta_x = np.linalg.norm(pert_state - base_state)
+        if delta_x <= 0.0:
+            continue
+        lipschitz = max(lipschitz, delta_x / delta_u)
+
+    return float(lipschitz)
+
+def estimate_LYx(
+    temp_env,
+    obs,
+    num_multi_agents,
+    multi_actor,
+    multi_rnn_states,
+    solo_actor,
+    solo_rnn_states,
+    solo_obs_dim,
+    perturbation_radius,
+) -> float:
+    """
+    Estimate a local Lipschitz constant relating perturbations in the solo quad's
+    physical state to the next environment-wide state (all teammates included).
+    """
+    if perturbation_radius <= 0.0:
+        return 0.0
+
+    snapshot = safe_capture_env_snapshot(temp_env)
+    solo_position, solo_velocity, solo_rotation, solo_omega = _extract_agent_state(temp_env.unwrapped, -1)
+    base_state_vec = _pack_agent_state(solo_position, solo_velocity, solo_rotation, solo_omega)
+    base_env_state_vec = _extract_full_swarm_state_vector(temp_env.unwrapped, num_multi_agents)
+    # Size of total solo agent state
+    state_dim = base_state_vec.size
+
+    # The total concatenated environment state after a timestep
+    base_next_state, _ = simulate_env_from_snapshot(
+        snapshot,
+        base_env_state_vec,
+        base_state_vec,
+        env_state_perturb=None,
+        solo_state_perturb=None,
+        num_multi_agents=num_multi_agents,
+        multi_actor=multi_actor,
+        multi_rnn_states=multi_rnn_states,
+        solo_actor=solo_actor,
+        solo_rnn_states=solo_rnn_states,
+        solo_obs_dim=solo_obs_dim
+    )
+
+    required_samples = max(32, 3 * state_dim)
+    directions: List[np.ndarray] = []
+    for axis in range(state_dim):
+        basis = np.zeros(state_dim, dtype=np.float64)
+        basis[axis] = 1.0
+        directions.append(basis)
+        directions.append(-basis)
+    while len(directions) < required_samples:
+        directions.append(np.random.uniform(low=-1., high=1., size=state_dim))
+
+    lipschitz = 0.0
+    for direction in directions:
+        norm = np.linalg.norm(direction)
+        if norm < 1e-9:
+            continue
+        perturb = (perturbation_radius * direction / norm).astype(np.float64)
+        # Make it so that the perturbation itself respects SO(3)
+        candidate = base_state_vec + perturb
+        position, velocity, rotation, omega = _unpack_agent_state(candidate)
+        rotation = _project_to_so3(rotation)
+        candidate = _pack_agent_state(position, velocity, rotation, omega)
+        perturb = candidate - base_state_vec
+        delta_x = np.linalg.norm(perturb)
+        if delta_x < 1e-9:
+            continue
+        # Run environment one step and collect the new state
+        perturbed_state, _ = simulate_env_from_snapshot(
+            snapshot,
+            base_env_state_vec,
+            base_state_vec,
+            env_state_perturb=None,
+            solo_state_perturb=perturb,
+            num_multi_agents=num_multi_agents,
+            multi_actor=multi_actor,
+            multi_rnn_states=multi_rnn_states,
+            solo_actor=solo_actor,
+            solo_rnn_states=solo_rnn_states,
+            solo_obs_dim=solo_obs_dim
+        )
+        delta_y = np.linalg.norm(perturbed_state - base_next_state)
+        if delta_y <= 0.0:
+            continue
+        lipschitz = max(lipschitz, delta_y / delta_x)
+
+    return float(lipschitz)
+
+
+
+# ---------------------------------------------------------------------------
+# Conformal utilities
+# ---------------------------------------------------------------------------
+
 def safe_capture_env_snapshot(env):
     """
     Capture a snapshot without copying OpenGL scene objects that own module references.
@@ -71,11 +401,6 @@ def safe_capture_env_snapshot(env):
     finally:
         if had_scenes:
             base_env.scenes = saved_scenes
-
-
-# ---------------------------------------------------------------------------
-# Conformal utilities
-# ---------------------------------------------------------------------------
 
 def fall_down(base_action, env_state, swarm_state):
     return np.array([-1., -1., -1., -1.], dtype=np.float64)
@@ -157,98 +482,7 @@ def run_multi_agents(env, obs, num_multi_agents,
 
     return logs
 
-def _extract_agent_state(env, agent_index=-1) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (position, velocity, rotation_matrix, angular_velocity) for the chosen agent."""
-    base_env = getattr(env, "unwrapped", env)
-    quad = base_env.envs[agent_index]
-    dynamics = quad.dynamics
-    position = np.asarray(dynamics.pos, dtype=np.float64)
-    velocity = np.asarray(dynamics.vel, dtype=np.float64)
-    rotation = np.asarray(dynamics.rot, dtype=np.float64)
-    omega = np.asarray(dynamics.omega, dtype=np.float64)
-    return position, velocity, rotation, omega
 
-def _pack_agent_state(position, velocity, rotation, omega) -> np.ndarray:
-    """Flatten the provided components into a single vector for distance computations."""
-    return np.concatenate(
-        [
-            position.reshape(-1),
-            velocity.reshape(-1),
-            rotation.reshape(-1),
-            omega.reshape(-1),
-        ],
-        axis=0,
-    ).astype(np.float64)
-
-def estimate_LXu(
-    temp_env,
-    obs,
-    num_multi_agents,
-    solo_actor,
-    solo_rnn_states,
-    solo_obs_dim,
-) -> float:
-    """
-    Empirically estimate a local Lipschitz constant L such that
-    ||x_{t+1}(u_1) - x_{t+1}(u_2)|| <= L ||u_1 - u_2|| for the solo agent.
-    """
-
-
-    obs_np = np.asarray(obs, dtype=np.float32)
-    snapshot = safe_capture_env_snapshot(temp_env)
-
-    # Run solo agent to get the base action / state
-    run_solo_rnn_states = solo_rnn_states.clone()
-    obs_solo_self = obs_np[-1, :solo_obs_dim]
-    obs_solo_dict = {OBS_KEY: obs_solo_self[None, :]}
-    with torch.no_grad():
-        normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
-        solo_actor(normalized_solo, run_solo_rnn_states)
-    base_action = argmax_actions(solo_actor.action_distribution())
-    if base_action.dim() == 1:
-        base_action = base_action.unsqueeze(0)
-    base_action = base_action.detach().cpu().numpy()[0].astype(np.float32)
-    action_dim = int(base_action.shape[-1])
-
-    # zero thrust for teammates
-    actions_multi = np.zeros((num_multi_agents, action_dim), dtype=np.float32)  
-
-    def simulate_next_state(action: np.ndarray) -> np.ndarray:
-        env_clone = clone_env_from_snapshot(snapshot)
-        try:
-            stacked_actions = np.vstack([actions_multi, action[None, :]])
-            env_clone.step(stacked_actions)
-            position, velocity, rotation, omega = _extract_agent_state(env_clone.unwrapped, -1)
-            return _pack_agent_state(position, velocity, rotation, omega)
-        finally:
-            env_clone.close()
-
-    base_state = simulate_next_state(base_action)
-
-    # Collect directions to act in
-    required_samples = max(32, 3 * action_dim)
-    directions: List[np.ndarray] = []
-    for axis in range(action_dim):
-        basis = np.zeros(action_dim, dtype=np.float32)
-        basis[axis] = 1.0
-        directions.append(basis)
-        directions.append(-basis)
-    while len(directions) < required_samples:
-        directions.append(np.random.uniform(low=-1., high=1., size=action_dim).astype(np.float32))
-
-    # Collect max ratio
-    lipschitz = 0.0
-    for direction in directions:
-        delta_u = np.linalg.norm(direction - base_action)
-        if delta_u < 1e-9:
-            continue
-        pert_state = simulate_next_state(direction)
-        delta_x = np.linalg.norm(pert_state - base_state)
-        if delta_x <= 0.0:
-            continue
-        lipschitz = max(lipschitz, delta_x / delta_u)
-
-    return float(lipschitz)
 
 def finetune_rnn(logs, num_multi_agents, predictor_checkpoint):
 
@@ -467,9 +701,14 @@ def main() -> None:
                     num_runs=args.num_trajectories, 
                     deterministic=False)
         # Set radius depending on how bad our prediction was
+        perturbation_radius = 0.1
         qj = conformal_radii(logs, num_multi_agents, pred_trajectories, bar_alpha, args.episode_length)
-        L_Xu = estimate_LXu(temp_env, obs, num_multi_agents, solo_actor, solo_rnn_states, solo_obs_dim)
-        print(L_Xu)
+        L_Xu = estimate_LXu(temp_env, obs, num_multi_agents, 
+            solo_actor, solo_rnn_states, solo_obs_dim)
+        L_Yx = estimate_LYx(temp_env, obs, num_multi_agents, 
+            multi_actor, multi_rnn_states, 
+            solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
+        print(L_Xu, L_Yx)
         # get Deltaj
         # get rhoj
         # set total radius
