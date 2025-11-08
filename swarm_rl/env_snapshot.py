@@ -117,3 +117,12 @@ def clone_env_from_snapshot(snapshot: EnvSnapshot, restore_rng=False):
         _restore_rng(snapshot.rng)
     return clone
 
+
+def snapshot_rng_state() -> RNGSnapshot:
+    """Public helper that captures the current RNG streams."""
+    return _snapshot_rng()
+
+
+def restore_rng_state(rng_snapshot: RNGSnapshot) -> None:
+    """Public helper that restores previously captured RNG streams."""
+    _restore_rng(rng_snapshot)

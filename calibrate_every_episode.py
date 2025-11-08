@@ -182,6 +182,8 @@ def simulate_env_from_snapshot(
     Run a single environment step from a snapshot while applying optional perturbations.
     Returns (multi_agents_state_vec, solo_state_vec) after stepping.
     """
+    rng_backup = snapshot_rng_state()
+    restore_rng_state(snapshot.rng)
     env_clone = clone_env_from_snapshot(snapshot)
     try:
         solo_reference_vec = base_solo_state_vec
@@ -201,7 +203,7 @@ def simulate_env_from_snapshot(
         with torch.no_grad():
             normalized_multi = prepare_and_normalize_obs(multi_actor, obs_multi_dict)
             policy_multi = multi_actor(normalized_multi, run_multi_states)
-        actions_multi = policy_multi["actions"]
+        actions_multi = argmax_actions(multi_actor.action_distribution())
         if actions_multi.dim() == 1:
             actions_multi = actions_multi.unsqueeze(-1)
         actions_multi = actions_multi.detach().cpu().numpy()
@@ -224,6 +226,7 @@ def simulate_env_from_snapshot(
         return swarm_state_vec, solo_state_vec
     finally:
         env_clone.close()
+        restore_rng_state(rng_backup)
 
 def estimate_LXu(
     temp_env,
@@ -256,9 +259,11 @@ def estimate_LXu(
     action_dim = int(base_action.shape[-1])
 
     # zero thrust for teammates
-    actions_multi = np.zeros((num_multi_agents, action_dim), dtype=np.float32)  
+    actions_multi = np.zeros((num_multi_agents, action_dim), dtype=np.float32)
 
     def simulate_next_state(action: np.ndarray) -> np.ndarray:
+        rng_backup = snapshot_rng_state()
+        restore_rng_state(snapshot.rng)
         env_clone = clone_env_from_snapshot(snapshot)
         try:
             stacked_actions = np.vstack([actions_multi, action[None, :]])
@@ -267,6 +272,7 @@ def estimate_LXu(
             return _pack_agent_state(position, velocity, rotation, omega)
         finally:
             env_clone.close()
+            restore_rng_state(rng_backup)
 
     base_state = simulate_next_state(base_action)
 
@@ -280,6 +286,10 @@ def estimate_LXu(
         directions.append(-basis)
     while len(directions) < required_samples:
         directions.append(np.random.uniform(low=-1., high=1., size=action_dim).astype(np.float32))
+
+    # Printing what happens with NO perturbation
+    # pert_state = simulate_next_state(base_action)
+    # print("DELTA X: ", np.linalg.norm(pert_state - base_state))
 
     # Collect max ratio
     lipschitz = 0.0
@@ -332,7 +342,7 @@ def estimate_LYx(
         multi_rnn_states=multi_rnn_states,
         solo_actor=solo_actor,
         solo_rnn_states=solo_rnn_states,
-        solo_obs_dim=solo_obs_dim
+        solo_obs_dim=solo_obs_dim,
     )
 
     required_samples = max(32, 3 * state_dim)
@@ -344,6 +354,24 @@ def estimate_LYx(
         directions.append(-basis)
     while len(directions) < required_samples:
         directions.append(np.random.uniform(low=-1., high=1., size=state_dim))
+
+    # Printing what happens with NO perturbation
+    # perturb = directions[0] * 0.0
+    # perturbed_state, _ = simulate_env_from_snapshot(
+    #     snapshot,
+    #     base_env_state_vec,
+    #     base_state_vec,
+    #     env_state_perturb=None,
+    #     solo_state_perturb=perturb,
+    #     num_multi_agents=num_multi_agents,
+    #     multi_actor=multi_actor,
+    #     multi_rnn_states=multi_rnn_states,
+    #     solo_actor=solo_actor,
+    #     solo_rnn_states=solo_rnn_states,
+    #     solo_obs_dim=solo_obs_dim,
+    # )
+    # delta_y = np.linalg.norm(perturbed_state - base_next_state)
+    # print("DELTA Y: ", delta_y)
 
     lipschitz = 0.0
     for direction in directions:
@@ -369,19 +397,18 @@ def estimate_LYx(
             solo_state_perturb=perturb,
             num_multi_agents=num_multi_agents,
             multi_actor=multi_actor,
-            multi_rnn_states=multi_rnn_states,
-            solo_actor=solo_actor,
-            solo_rnn_states=solo_rnn_states,
-            solo_obs_dim=solo_obs_dim
+        multi_rnn_states=multi_rnn_states,
+        solo_actor=solo_actor,
+        solo_rnn_states=solo_rnn_states,
+        solo_obs_dim=solo_obs_dim,
         )
         delta_y = np.linalg.norm(perturbed_state - base_next_state)
         if delta_y <= 0.0:
             continue
+        # print(delta_y, delta_x)
         lipschitz = max(lipschitz, delta_y / delta_x)
 
     return float(lipschitz)
-
-
 
 # ---------------------------------------------------------------------------
 # Conformal utilities
