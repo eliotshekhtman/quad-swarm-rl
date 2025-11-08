@@ -410,6 +410,97 @@ def estimate_LYx(
 
     return float(lipschitz)
 
+
+def estimate_LYy(
+    temp_env,
+    obs,
+    num_multi_agents,
+    multi_actor,
+    multi_rnn_states,
+    solo_actor,
+    solo_rnn_states,
+    solo_obs_dim,
+    perturbation_radius,
+) -> float:
+    """
+    Estimate a local Lipschitz constant relating teammate-state perturbations to
+    the subsequent teammate state.
+    """
+    if perturbation_radius <= 0.0 or num_multi_agents <= 0:
+        return 0.0
+
+    snapshot = safe_capture_env_snapshot(temp_env)
+    base_env_state_vec = _extract_full_swarm_state_vector(temp_env.unwrapped, num_multi_agents)
+    solo_position, solo_velocity, solo_rotation, solo_omega = _extract_agent_state(temp_env.unwrapped, -1)
+    base_solo_state_vec = _pack_agent_state(solo_position, solo_velocity, solo_rotation, solo_omega)
+    state_dim = base_env_state_vec.size
+
+    base_next_state, _ = simulate_env_from_snapshot(
+        snapshot,
+        base_env_state_vec,
+        base_solo_state_vec,
+        env_state_perturb=None,
+        solo_state_perturb=None,
+        num_multi_agents=num_multi_agents,
+        multi_actor=multi_actor,
+        multi_rnn_states=multi_rnn_states,
+        solo_actor=solo_actor,
+        solo_rnn_states=solo_rnn_states,
+        solo_obs_dim=solo_obs_dim,
+    )
+
+    required_samples = max(32, 3 * state_dim)
+    directions: List[np.ndarray] = []
+    for axis in range(state_dim):
+        basis = np.zeros(state_dim, dtype=np.float64)
+        basis[axis] = 1.0
+        directions.append(basis)
+        directions.append(-basis)
+    while len(directions) < required_samples:
+        directions.append(np.random.uniform(low=-1.0, high=1.0, size=state_dim))
+
+    lipschitz = 0.0
+    for direction in directions:
+        norm = np.linalg.norm(direction)
+        if norm < 1e-9:
+            continue
+        raw_perturb = (perturbation_radius * direction / norm).astype(np.float64)
+        candidate_state = base_env_state_vec + raw_perturb
+        candidate_state = candidate_state.reshape(num_multi_agents, 18)
+        projected = []
+        for agent_state in candidate_state:
+            pos = agent_state[0:3]
+            vel = agent_state[3:6]
+            rot = agent_state[6:15].reshape(3, 3)
+            omega = agent_state[15:18]
+            rot = _project_to_so3(rot)
+            projected.append(_pack_agent_state(pos, vel, rot, omega))
+        candidate_state = np.concatenate(projected, axis=0)
+        perturb = candidate_state - base_env_state_vec
+        delta_x = np.linalg.norm(perturb)
+        if delta_x < 1e-9:
+            continue
+        perturbed_state, _ = simulate_env_from_snapshot(
+            snapshot,
+            base_env_state_vec,
+            base_solo_state_vec,
+            env_state_perturb=perturb,
+            solo_state_perturb=None,
+            num_multi_agents=num_multi_agents,
+            multi_actor=multi_actor,
+            multi_rnn_states=multi_rnn_states,
+            solo_actor=solo_actor,
+            solo_rnn_states=solo_rnn_states,
+            solo_obs_dim=solo_obs_dim,
+        )
+        delta_y = np.linalg.norm(perturbed_state - base_next_state)
+        if delta_y <= 0.0:
+            continue
+        lipschitz = max(lipschitz, delta_y / delta_x)
+
+    return float(lipschitz)
+
+
 # ---------------------------------------------------------------------------
 # Conformal utilities
 # ---------------------------------------------------------------------------
@@ -735,7 +826,11 @@ def main() -> None:
         L_Yx = estimate_LYx(temp_env, obs, num_multi_agents, 
             multi_actor, multi_rnn_states, 
             solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
-        print(L_Xu, L_Yx)
+        L_Yy = estimate_LYy(temp_env, obs, num_multi_agents, 
+            multi_actor, multi_rnn_states,
+            solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius,
+)
+        print(L_Xu, L_Yx, L_Yy)
         # get Deltaj
         # get rhoj
         # set total radius
