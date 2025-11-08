@@ -35,6 +35,7 @@ from sample_factory.algo.utils.rl_utils import prepare_and_normalize_obs
 from sample_factory.model.actor_critic import create_actor_critic
 from sample_factory.model.model_utils import get_rnn_size
 from sample_factory.utils.attr_dict import AttrDict
+from sample_factory.huggingface.huggingface_utils import generate_replay_video
 
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
@@ -52,6 +53,23 @@ from restart_utils import (
     quad_state_to_serialisable,
 )
 
+DEVICE = torch.device("cpu")
+
+
+def safe_capture_env_snapshot(env):
+    """
+    Capture a snapshot without copying OpenGL scene objects that own module references.
+    """
+    base_env = env.unwrapped
+    had_scenes = hasattr(base_env, "scenes")
+    saved_scenes = base_env.scenes if had_scenes else None
+    if had_scenes:
+        base_env.scenes = []
+    try:
+        return capture_env_snapshot(env)
+    finally:
+        if had_scenes:
+            base_env.scenes = saved_scenes
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +87,7 @@ def run_multi_agents(env, obs, num_multi_agents,
     Run the environment for [max_steps] steps, where the multi agents act like normal
     but the solo agent plays a fixed action, and return positions and velocities.
     '''
-    device = torch.device("cpu")
-    snapshot = capture_env_snapshot(env)
+    snapshot = safe_capture_env_snapshot(env)
 
     logs = {}
     for i in range(num_multi_agents):
@@ -133,12 +150,11 @@ def run_multi_agents(env, obs, num_multi_agents,
     return logs
 
 def finetune_rnn(logs, num_multi_agents, predictor_checkpoint):
-    device = torch.device("cpu")
 
     # Fine-tune it just a little for the actual path
     predictors = []
     for agent_id in range(num_multi_agents):
-        predictor = load_rnn_checkpoint(predictor_checkpoint, device)
+        predictor = load_rnn_checkpoint(predictor_checkpoint, DEVICE)
         deterministic_run = np.concatenate(
             [logs[agent_id][-1]["position"], logs[agent_id][-1]["velocity"]],
             axis=-1,
@@ -151,7 +167,7 @@ def finetune_rnn(logs, num_multi_agents, predictor_checkpoint):
         with torch.enable_grad():
             for _ in tqdm(range(3)):
                 sequence_tensor = torch.from_numpy(deterministic_run).to(
-                    device=device, dtype=torch.float32
+                    device=DEVICE, dtype=torch.float32
                 )
                 inputs = sequence_tensor[:-1].unsqueeze(0)
                 targets = sequence_tensor[1:].unsqueeze(0)
@@ -165,8 +181,21 @@ def finetune_rnn(logs, num_multi_agents, predictor_checkpoint):
         predictors.append(predictor)
     return predictors
 
+def roll_out_predictor(history_array: ndarray, predictor, rollout_length):
+    # Track history as a Python list so we can append predictions
+    history = [entry.copy() for entry in history_array]
+    history_len = len(history)
+    # Roll out a predicted trajectory
+    for i in range(rollout_length):
+        # New history array generated from appended-to history
+        history_np = np.asarray(history, dtype=np.float32)
+        history_tensor = torch.from_numpy(history_np).unsqueeze(0).to(
+            device = DEVICE, dtype = torch.float32)
+        pred = predictor(history_tensor)[0, -1].detach().cpu().numpy()
+        history.append(pred.astype(np.float32))
+    return history[history_len:]
+
 def conformal_radii(logs, num_multi_agents, predictors, histories, alpha, episode_length):
-    device = torch.device("cpu")
     radii = np.full(num_multi_agents, 0, dtype=np.float64) # Probs set to arm len
     # Need a radius for each agent
     for agent_id in range(num_multi_agents):
@@ -176,17 +205,8 @@ def conformal_radii(logs, num_multi_agents, predictors, histories, alpha, episod
         history_array = np.concatenate(
             [history_log["position"], history_log["velocity"]], axis=-1
         ).astype(np.float32)
-        # Track history as a Python list so we can append predictions
-        history = [entry.copy() for entry in history_array]
-        history_len = len(history)
-        # Roll out a predicted trajectory
-        for i in range(episode_length):
-            # New history array generated from appended-to history
-            history_np = np.asarray(history, dtype=np.float32)
-            history_tensor = torch.from_numpy(history_np).unsqueeze(0).to(
-                device = device, dtype = torch.float32)
-            pred = predictors[agent_id](history_tensor)[0, -1].detach().cpu().numpy()
-            history.append(pred.astype(np.float32))
+        predictions = roll_out_predictor(history_array, predictors[agent_id], episode_length)
+        print(predictions[0].shape)
         # Collect trajectory-level nonconformity scores
         scores = []
         for run_log in logs[agent_id]:
@@ -197,7 +217,7 @@ def conformal_radii(logs, num_multi_agents, predictors, histories, alpha, episod
             ).astype(np.float32)
             for i in range(episode_length):
                 # Largest distance across timesteps in the episode
-                score = max(score, np.linalg.norm(history[history_len + i] - run[i]))
+                score = max(score, np.linalg.norm(predictions[i][:3] - run[i][:3]))
             scores.append(score)
         scores.sort()
         # Just want to visually check that this makes sense
@@ -252,8 +272,6 @@ def main() -> None:
 
     experiment_dir = ensure_experiment_dir(args.train_dir, args.experiment_name)
 
-    device = torch.device("cpu")
-
     # Load multi config early since it has some useful info
     cfg_multi = load_cfg(args.multi_train_dir, args.multi_experiment)
 
@@ -282,24 +300,24 @@ def main() -> None:
     # Load in multi-agents
     env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=render_mode)
     multi_ckpt = latest_checkpoint(args.multi_train_dir, args.multi_experiment, policy_index=0)
-    multi_actor = load_actor(cfg_multi, env.observation_space, env.action_space, multi_ckpt, device)
+    multi_actor = load_actor(cfg_multi, env.observation_space, env.action_space, multi_ckpt, DEVICE)
     multi_rnn_size = get_rnn_size(cfg_multi)
-    multi_rnn_states = torch.zeros((num_multi_agents, multi_rnn_size), dtype=torch.float32, device=device)
+    multi_rnn_states = torch.zeros((num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
 
     # Add in ego agent
     cfg_solo = load_cfg(args.solo_train_dir, args.solo_experiment)
     solo_env = make_quadrotor_env("quadrotor_multi", cfg=cfg_solo, render_mode=None)
     solo_ckpt = latest_checkpoint(args.solo_train_dir, args.solo_experiment, policy_index=0)
-    solo_actor = load_actor(cfg_solo, solo_env.observation_space, solo_env.action_space, solo_ckpt, device)
+    solo_actor = load_actor(cfg_solo, solo_env.observation_space, solo_env.action_space, solo_ckpt, DEVICE)
     solo_obs_dim = solo_env.observation_space.shape[0]
     solo_env.close()
-    solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=device)
+    solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
 
     # Save initial state so we can return to it later
     obs, stored_states = deterministic_reset(env, args.seed, None)
 
     # Finetune a predictor for each multi-agent
-    shapshot = capture_env_snapshot(env)
+    shapshot = safe_capture_env_snapshot(env)
     temp_env = clone_env_from_snapshot(shapshot)
     logs = run_multi_agents(temp_env, obs, num_multi_agents, 
                     multi_actor, multi_rnn_states, 
@@ -320,12 +338,13 @@ def main() -> None:
     # Collect histories for each agent to pass to their respective predictors
     pos, vel = extract_positions_velocities(env.unwrapped)
     histories = [] # list of pos,vel histories, each entry is a quad
+    solo_collision_count = 0
     for i in range(num_multi_agents + 1):
         histories.append({ "position" : [pos[i]], "velocity" : [vel[i]] })
     for episode in progress_bar:
         progress_bar.set_postfix_str("Setting radii")
         # Find qj using old pi_j
-        snapshot = capture_env_snapshot(env)
+        snapshot = safe_capture_env_snapshot(env)
         temp_env = clone_env_from_snapshot(shapshot)
         logs = run_multi_agents(temp_env, obs, num_multi_agents, 
                     multi_actor, multi_rnn_states, 
@@ -343,6 +362,7 @@ def main() -> None:
         radii += qj # and Deltaj and rhoj
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
+        progress_bar.set_postfix_str(f"crashes={solo_collision_count}")
         for step in range(args.episode_length):
             # Actually run the normal execution
             obs_np = np.asarray(obs)
