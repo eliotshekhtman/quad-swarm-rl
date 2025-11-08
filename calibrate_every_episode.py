@@ -200,6 +200,9 @@ def roll_out_predictor(history_array: ndarray, predictor, rollout_length):
         history.append(pred.astype(np.float32))
     return history[history_len:]
 
+def get_alpha_bar(alpha, delta, num_trajectories):
+    return alpha - np.sqrt(np.log(delta) / (2 * num_trajectories))
+
 def conformal_radii(logs, num_multi_agents, predictors, histories, alpha, episode_length):
     radii = np.full(num_multi_agents, 0, dtype=np.float64) # Probs set to arm len
     # Need a radius for each agent
@@ -226,7 +229,7 @@ def conformal_radii(logs, num_multi_agents, predictors, histories, alpha, episod
             scores.append(score)
         scores.sort()
         # Just want to visually check that this makes sense
-        print(f'Scores for agent {agent_id}: ', scores)
+        # print(f'Scores for agent {agent_id}: ', scores)
         conformal_radius = scores[int(np.ceil(len(scores) * (1 - alpha)) - 1)]
         radii[agent_id] = conformal_radius
     return radii
@@ -246,11 +249,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment_name", required=True, help="Subdirectory under train_dir for outputs.")
     parser.add_argument("--predictor_checkpoint", required=True, help="Path to a pretrained RNN predictor checkpoint.")
     parser.add_argument("--seed", type=int, default=42, help="Seed applied before every reset to reproduce goals.")
-    parser.add_argument("--alpha", type=float, default=0.05, help="Desired probability of conformal error")
+    parser.add_argument("--alpha", type=float, default=0.1, help="Desired probability of conformal error")
+    parser.add_argument("--delta", type=float, default=0.1, help="Desired probability of a bad draw")
     parser.add_argument("--video_name", default="conformal_replay.mp4")
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--episode_length", type=int, default=10)
-    parser.add_argument("--num_trajectories", type=int, default=20)
+    parser.add_argument("--num_trajectories", type=int, default=200)
     return parser.parse_args()
 
 
@@ -335,6 +339,7 @@ def main() -> None:
     # Collect arm length for default radius and dt for time btn steps
     arm_len = env.quad_arm
     DELTA_T = env.control_dt
+    bar_alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
 
     # Make sure no resets are needed for the actual run
     num_episodes = 1500 // args.episode_length - 1
@@ -360,7 +365,7 @@ def main() -> None:
                     num_runs=args.num_trajectories, 
                     deterministic=False)
         qj = conformal_radii(logs, num_multi_agents, predictors, 
-                    histories, args.alpha, args.episode_length)
+                    histories, bar_alpha, args.episode_length)
         print(qj)
         # get Deltaj
         # get rhoj
