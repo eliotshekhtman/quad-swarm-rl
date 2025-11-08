@@ -82,11 +82,13 @@ def fall_down(base_action, env_state, swarm_state):
 
 def run_multi_agents(env, obs, num_multi_agents, 
                     multi_actor, multi_rnn_states, 
-                    solo_actor, solo_rnn_states, solo_obs_dim, solo_action_fn,
+                    solo_actor, solo_rnn_states, solo_obs_dim, 
+                    pred_trajectories, solo_action_fn,
                     max_steps=1600, num_runs=1, deterministic=False):
     '''
     Run the environment for [max_steps] steps, where the multi agents act like normal
     but the solo agent plays a fixed action, and return positions and velocities.
+    Does not log the initial state.
     '''
     snapshot = safe_capture_env_snapshot(env)
 
@@ -129,6 +131,11 @@ def run_multi_agents(env, obs, num_multi_agents,
                 action_solo = action_solo.unsqueeze(0)
             action_solo = action_solo.detach().cpu().numpy()[0]
             swarm_state = get_swarm_state(env_run.unwrapped)
+            # We care about where we think they'll be next timestep: that's what
+            # the conformal radius is built on
+            for agent_id in range(num_multi_agents):
+                swarm_state.positions[agent_id, :] = pred_trajectories[agent_id][step_num][:3]
+                swarm_state.velocities[agent_id, :] = pred_trajectories[agent_id][step_num][3:]
             # Apply CBF to the ego agent based on radius determined earlier
             action_solo = solo_action_fn(
                 base_action=action_solo,
@@ -149,6 +156,99 @@ def run_multi_agents(env, obs, num_multi_agents,
         env_run.close()
 
     return logs
+
+def _extract_agent_state(env, agent_index=-1) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (position, velocity, rotation_matrix, angular_velocity) for the chosen agent."""
+    base_env = getattr(env, "unwrapped", env)
+    quad = base_env.envs[agent_index]
+    dynamics = quad.dynamics
+    position = np.asarray(dynamics.pos, dtype=np.float64)
+    velocity = np.asarray(dynamics.vel, dtype=np.float64)
+    rotation = np.asarray(dynamics.rot, dtype=np.float64)
+    omega = np.asarray(dynamics.omega, dtype=np.float64)
+    return position, velocity, rotation, omega
+
+def _pack_agent_state(position, velocity, rotation, omega) -> np.ndarray:
+    """Flatten the provided components into a single vector for distance computations."""
+    return np.concatenate(
+        [
+            position.reshape(-1),
+            velocity.reshape(-1),
+            rotation.reshape(-1),
+            omega.reshape(-1),
+        ],
+        axis=0,
+    ).astype(np.float64)
+
+def estimate_LXu(
+    temp_env,
+    obs,
+    num_multi_agents,
+    solo_actor,
+    solo_rnn_states,
+    solo_obs_dim,
+) -> float:
+    """
+    Empirically estimate a local Lipschitz constant L such that
+    ||x_{t+1}(u_1) - x_{t+1}(u_2)|| <= L ||u_1 - u_2|| for the solo agent.
+    """
+
+
+    obs_np = np.asarray(obs, dtype=np.float32)
+    snapshot = safe_capture_env_snapshot(temp_env)
+
+    # Run solo agent to get the base action / state
+    run_solo_rnn_states = solo_rnn_states.clone()
+    obs_solo_self = obs_np[-1, :solo_obs_dim]
+    obs_solo_dict = {OBS_KEY: obs_solo_self[None, :]}
+    with torch.no_grad():
+        normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
+        solo_actor(normalized_solo, run_solo_rnn_states)
+    base_action = argmax_actions(solo_actor.action_distribution())
+    if base_action.dim() == 1:
+        base_action = base_action.unsqueeze(0)
+    base_action = base_action.detach().cpu().numpy()[0].astype(np.float32)
+    action_dim = int(base_action.shape[-1])
+
+    # zero thrust for teammates
+    actions_multi = np.zeros((num_multi_agents, action_dim), dtype=np.float32)  
+
+    def simulate_next_state(action: np.ndarray) -> np.ndarray:
+        env_clone = clone_env_from_snapshot(snapshot)
+        try:
+            stacked_actions = np.vstack([actions_multi, action[None, :]])
+            env_clone.step(stacked_actions)
+            position, velocity, rotation, omega = _extract_agent_state(env_clone.unwrapped, -1)
+            return _pack_agent_state(position, velocity, rotation, omega)
+        finally:
+            env_clone.close()
+
+    base_state = simulate_next_state(base_action)
+
+    # Collect directions to act in
+    required_samples = max(32, 3 * action_dim)
+    directions: List[np.ndarray] = []
+    for axis in range(action_dim):
+        basis = np.zeros(action_dim, dtype=np.float32)
+        basis[axis] = 1.0
+        directions.append(basis)
+        directions.append(-basis)
+    while len(directions) < required_samples:
+        directions.append(np.random.uniform(low=-1., high=1., size=action_dim).astype(np.float32))
+
+    # Collect max ratio
+    lipschitz = 0.0
+    for direction in directions:
+        delta_u = np.linalg.norm(direction - base_action)
+        if delta_u < 1e-9:
+            continue
+        pert_state = simulate_next_state(direction)
+        delta_x = np.linalg.norm(pert_state - base_state)
+        if delta_x <= 0.0:
+            continue
+        lipschitz = max(lipschitz, delta_x / delta_u)
+
+    return float(lipschitz)
 
 def finetune_rnn(logs, num_multi_agents, predictor_checkpoint):
 
@@ -182,7 +282,12 @@ def finetune_rnn(logs, num_multi_agents, predictor_checkpoint):
         predictors.append(predictor)
     return predictors
 
-def roll_out_predictor(history_array: ndarray, predictor, rollout_length):
+def roll_out_predictor(histories, predictors, agent_id, rollout_length):
+    history_log = histories[agent_id]
+    # Original true history array
+    history_array = np.concatenate(
+        [history_log["position"], history_log["velocity"]], axis=-1
+    ).astype(np.float32)
     # Track history as a Python list so we can append predictions
     history = [entry.copy() for entry in history_array]
     history_len = len(history)
@@ -201,20 +306,13 @@ def roll_out_predictor(history_array: ndarray, predictor, rollout_length):
     return history[history_len:]
 
 def get_alpha_bar(alpha, delta, num_trajectories):
-    return alpha - np.sqrt(np.log(delta) / (2 * num_trajectories))
+    return alpha - np.sqrt(np.log(1 / delta) / (2 * num_trajectories))
 
-def conformal_radii(logs, num_multi_agents, predictors, histories, alpha, episode_length):
+def conformal_radii(logs, num_multi_agents, pred_trajectories, alpha, episode_length):
     radii = np.full(num_multi_agents, 0, dtype=np.float64) # Probs set to arm len
     # Need a radius for each agent
     for agent_id in range(num_multi_agents):
-        print('Collecting trajectory-level nonconformity scores')
-        history_log = histories[agent_id]
-        # Original true history array
-        history_array = np.concatenate(
-            [history_log["position"], history_log["velocity"]], axis=-1
-        ).astype(np.float32)
-        predictions = roll_out_predictor(history_array, predictors[agent_id], episode_length)
-        print(predictions[0].shape)
+        predictions = pred_trajectories[agent_id]
         # Collect trajectory-level nonconformity scores
         scores = []
         for run_log in logs[agent_id]:
@@ -358,15 +456,20 @@ def main() -> None:
         # Find qj using old pi_j
         snapshot = safe_capture_env_snapshot(env)
         temp_env = clone_env_from_snapshot(snapshot)
+        # Collect predictions of where we think they'll go using our naive predictor
+        pred_trajectories = [roll_out_predictor(histories, predictors, agent_id, args.episode_length) for agent_id in range(num_multi_agents)]
+        # Collect actual rollouts to compare against
         logs = run_multi_agents(temp_env, obs, num_multi_agents, 
                     multi_actor, multi_rnn_states, 
-                    solo_actor, solo_rnn_states, solo_obs_dim, filter,
+                    solo_actor, solo_rnn_states, solo_obs_dim, 
+                    pred_trajectories, filter,
                     max_steps=args.episode_length, 
                     num_runs=args.num_trajectories, 
                     deterministic=False)
-        qj = conformal_radii(logs, num_multi_agents, predictors, 
-                    histories, bar_alpha, args.episode_length)
-        print(qj)
+        # Set radius depending on how bad our prediction was
+        qj = conformal_radii(logs, num_multi_agents, pred_trajectories, bar_alpha, args.episode_length)
+        L_Xu = estimate_LXu(temp_env, obs, num_multi_agents, solo_actor, solo_rnn_states, solo_obs_dim)
+        print(L_Xu)
         # get Deltaj
         # get rhoj
         # set total radius
@@ -405,6 +508,11 @@ def main() -> None:
             action_solo = action_solo.detach().cpu().numpy()[0]
 
             swarm_state = get_swarm_state(env.unwrapped)
+            # We care about where we think they'll be next timestep: that's what
+            # the conformal radius is built on
+            for agent_id in range(num_multi_agents):
+                swarm_state.positions[agent_id, :] = pred_trajectories[agent_id][step][:3]
+                swarm_state.velocities[agent_id, :] = pred_trajectories[agent_id][step][3:]
             # Apply CBF to the ego agent based on radius determined earlier
             action_solo = filter(
                 base_action=action_solo,
