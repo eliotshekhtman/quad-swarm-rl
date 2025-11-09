@@ -44,7 +44,11 @@ from swarm_rl.env_snapshot import *
 from pretrain_rnn_predictor import RNNPredictor, load_rnn_checkpoint
 
 from utils import *
-from cbf_utils import make_cbf_filter
+from cbf_utils import (
+    make_cbf_filter, 
+    CBF_K0, 
+    CBF_K1,
+)
 from restart_utils import (
     QuadState,
     deterministic_reset,
@@ -55,6 +59,8 @@ from restart_utils import (
 
 DEVICE = torch.device("cpu")
 DELTA_T = 0.015
+MIN_RADIUS = 0
+MAX_RADIUS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +599,36 @@ def estimate_LYy(
 
     return float(lipschitz)
 
+def estimate_LXx(temp_env):
+    dynamics = temp_env.envs[-1].dynamics
+    solo_position, solo_velocity, solo_rotation, solo_omega = _extract_agent_state(temp_env.unwrapped, -1)
+    cond_number = np.linalg.cond(dynamics.model.I_com, 2)
+    omega_norm = np.linalg.norm(solo_omega)
+    max_thrust = np.linalg.norm(dynamics.thrust_max)
+    L_x = 1
+    L_v = np.sqrt(1 + DELTA_T ** 2)
+    L_R = np.sqrt((DELTA_T / dynamics.mass * max_thrust) ** 2 + (1 + DELTA_T * omega_norm) ** 2)
+    L_omega = np.sqrt(DELTA_T ** 2 + (1 + 2 * DELTA_T * cond_number * omega_norm) ** 2)
+    return 2 * max([L_x, L_v, L_R, L_omega])
+
+def estimate_LU(temp_env, num_multi_agents):
+    # NOT UNIFORM: need to set a minimum radius???
+    dynamics = temp_env.envs[-1].dynamics
+    solo_position, solo_velocity, solo_rotation, solo_omega = _extract_agent_state(temp_env.unwrapped, -1)
+    swarm_state = get_swarm_state(temp_env.unwrapped)
+    positions = swarm_state.positions[:-1] # Multi agent positions
+    a_k = []
+    mass_factor = 2.0 / float(dynamics.mass)
+    for agent_id in range(num_multi_agents):
+        difference = solo_position - positions[agent_id]
+        a = mass_factor * np.dot(solo_rotation[:, 2], difference) * np.ones(3)
+        a_k.append(np.linalg.norm(a)) # From ||a_const * 1||_2
+    return 2 * MAX_RADIUS * CBF_K0 * CBF_K1 / min(a_k)
+
+def calculate_beta_T(L_Xx, L_Xu, L_Yy, L_Yx, L_Yu, episode_length):
+    A_T = L_Xu * sum([L_Xx ** t for t in range(episode_length)])
+    expsum_Yy = sum([L_Yy ** t for t in range(episode_length)])
+    return (L_Yx * A_T + L_Yu) * expsum_Yy
 
 # ---------------------------------------------------------------------------
 # Conformal utilities
@@ -777,6 +813,11 @@ def conformal_radii(logs, num_multi_agents, pred_trajectories, alpha, episode_le
         radii[agent_id] = conformal_radius
     return radii
 
+def explicit_radius_update(prev_radius, conf_radius, kappa):
+    if conf_radius <= prev_radius:
+        return (conf_radius + kappa * prev_radius) / (1 + kappa)
+    else:
+        return (conf_radius - kappa * prev_radius) / (1 - kappa)
 
 # ---------------------------------------------------------------------------
 # Main script
@@ -882,6 +923,7 @@ def main() -> None:
     # Collect arm length for default radius and dt for time btn steps
     arm_len = env.quad_arm
     DELTA_T = env.control_dt
+    MIN_RADIUS = arm_len
     bar_alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
 
     # Make sure no resets are needed for the actual run
@@ -914,6 +956,8 @@ def main() -> None:
         # Set radius depending on how bad our prediction was
         perturbation_radius = 0.1
         qj = conformal_radii(logs, num_multi_agents, pred_trajectories, bar_alpha, args.episode_length)
+        L_U = estimate_LU(temp_env, num_multi_agents)
+        L_Xx = estimate_LXx(temp_env)
         L_Xu = estimate_LXu(temp_env, obs, num_multi_agents, 
             solo_actor, solo_rnn_states, solo_obs_dim)
         L_Yx = estimate_LYx(temp_env, obs, num_multi_agents, 
@@ -926,7 +970,8 @@ def main() -> None:
         # L_Yu = estimate_LYu(temp_env, obs, num_multi_agents, 
         #     multi_actor, multi_rnn_states,
         #     solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
-        print(L_Xu, L_Yx, L_Yy)
+        beta_t = calculate_beta_T(L_Xx, L_Xu, L_Yy, L_Yx, 0, args.episode_length)
+        print('L_U', L_U, 'L_Xx', L_Xx, 'L_Xu', L_Xu, 'L_Yx', L_Yx, 'L_Yy', L_Yy, 'beta_T', beta_t)
         # get Deltaj
         # get rhoj
         # set total radius
