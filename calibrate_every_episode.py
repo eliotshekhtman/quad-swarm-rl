@@ -60,7 +60,7 @@ from restart_utils import (
 DEVICE = torch.device("cpu")
 DELTA_T = 0.015
 MIN_RADIUS = 0
-MAX_RADIUS = 5
+MAX_RADIUS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -328,10 +328,24 @@ def estimate_LXx(
     if perturbation_radius <= 0.0:
         return 0.0
 
+    obs_np = np.asarray(obs, dtype=np.float32)
     snapshot = safe_capture_env_snapshot(temp_env)
     solo_position, solo_velocity, solo_rotation, solo_omega = _extract_agent_state(temp_env.unwrapped, -1)
     base_state_vec = _pack_agent_state(solo_position, solo_velocity, solo_rotation, solo_omega)
     state_dim = base_state_vec.size
+
+    run_solo_rnn_states = solo_rnn_states.clone()
+    obs_solo_self = obs_np[-1, :solo_obs_dim]
+    obs_solo_dict = {OBS_KEY: obs_solo_self[None, :]}
+    with torch.no_grad():
+        normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
+        solo_actor(normalized_solo, run_solo_rnn_states)
+    base_action = argmax_actions(solo_actor.action_distribution())
+    if base_action.dim() == 1:
+        base_action = base_action.unsqueeze(0)
+    base_action = base_action.detach().cpu().numpy()[0]
+    action_dim = base_action.shape[-1]
+    actions_multi = np.zeros((num_multi_agents, action_dim), dtype=np.float32)
 
     def simulate_next_state(state_vec: np.ndarray) -> np.ndarray:
         rng_backup = snapshot_rng_state()
@@ -341,20 +355,7 @@ def estimate_LXx(
             pos, vel, rot, omega = _unpack_agent_state(state_vec)
             _apply_agent_state(env_clone, -1, pos, vel, rot, omega)
 
-            obs_clone = _collect_observations_from_env(env_clone)
-            run_solo_states = solo_rnn_states.clone()
-            solo_obs = obs_clone[-1, :solo_obs_dim]
-            obs_solo_dict = {OBS_KEY: solo_obs[None, :]}
-            with torch.no_grad():
-                normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
-                solo_actor(normalized_solo, run_solo_states)
-            action_solo = argmax_actions(solo_actor.action_distribution())
-            if action_solo.dim() == 1:
-                action_solo = action_solo.unsqueeze(0)
-            action_solo = action_solo.detach().cpu().numpy()[0]
-
-            actions_multi = np.zeros((num_multi_agents, action_solo.shape[-1]), dtype=np.float32)
-            stacked_actions = np.vstack([actions_multi, action_solo[None, :]])
+            stacked_actions = np.vstack([actions_multi, base_action[None, :]])
             env_clone.step(stacked_actions)
             next_pos, next_vel, next_rot, next_omega = _extract_agent_state(env_clone.unwrapped, -1)
             return _pack_agent_state(next_pos, next_vel, next_rot, next_omega)
@@ -371,9 +372,8 @@ def estimate_LXx(
         basis[axis] = 1.0
         directions.append(basis)
         directions.append(-basis)
-    rng = np.random.default_rng()
     while len(directions) < required_samples:
-        directions.append(rng.uniform(low=-1.0, high=1.0, size=state_dim))
+        directions.append(np.random.uniform(low=-1.0, high=1.0, size=state_dim))
 
     lipschitz = 0.0
     for direction in directions:
@@ -944,6 +944,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--episode_length", type=int, default=10)
     parser.add_argument("--num_trajectories", type=int, default=200)
+    parser.add_argument("--num_multi_agents", type=int, default=-1)
     return parser.parse_args()
 
 
@@ -972,13 +973,15 @@ def main() -> None:
 
     # Load multi config early since it has some useful info
     cfg_multi = load_cfg(args.multi_train_dir, args.multi_experiment)
+    if args.num_multi_agents < 0:
+        args.num_multi_agents = cfg_multi.quads_num_agents
 
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
         "--device=cpu",
         "--quads_mode=patrol_dual_goal",
-        f"--quads_num_agents={cfg_multi.quads_num_agents + 1}",
+        f"--quads_num_agents={args.num_multi_agents + 1}",
         f"--quads_neighbor_visible_num={cfg_multi.quads_neighbor_visible_num}",
         f"--quads_neighbor_obs_type={cfg_multi.quads_neighbor_obs_type}",
         "--quads_collision_reward=8.0",
@@ -992,15 +995,13 @@ def main() -> None:
     ]
     eval_cfg = parse_swarm_cfg(eval_cli, evaluation=True)
     render_mode = "rgb_array"
-    
-    num_multi_agents = int(eval_cfg.quads_num_agents - 1)
 
     # Load in multi-agents
     env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=render_mode)
     multi_ckpt = latest_checkpoint(args.multi_train_dir, args.multi_experiment, policy_index=0)
     multi_actor = load_actor(cfg_multi, env.observation_space, env.action_space, multi_ckpt, DEVICE)
     multi_rnn_size = get_rnn_size(cfg_multi)
-    multi_rnn_states = torch.zeros((num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
+    multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
 
     # Add in ego agent
     cfg_solo = load_cfg(args.solo_train_dir, args.solo_experiment)
@@ -1017,13 +1018,13 @@ def main() -> None:
     # Finetune a predictor for each multi-agent
     # snapshot = safe_capture_env_snapshot(env)
     # temp_env = clone_env_from_snapshot(snapshot)
-    # logs = run_multi_agents(temp_env, obs, num_multi_agents, 
+    # logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
     #                 multi_actor, multi_rnn_states, 
     #                 solo_actor, solo_rnn_states, solo_obs_dim, fall_down,
     #                 deterministic=True)
-    # predictors = finetune_rnn(logs, num_multi_agents, args.predictor_checkpoint)
+    # predictors = finetune_rnn(logs, args.num_multi_agents, args.predictor_checkpoint)
     # temp_env.close()
-    predictors = [None] * num_multi_agents
+    predictors = [None] * args.num_multi_agents
 
     # Collect arm length for default radius and dt for time btn steps
     arm_len = env.quad_arm
@@ -1036,13 +1037,13 @@ def main() -> None:
     progress_bar = tqdm(range(num_episodes))
     # Init r0 to some large value that ought to be safe
     radius = 2
-    radii = np.full(num_multi_agents, radius, dtype=np.float64)
+    radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
     filter = make_cbf_filter(radii)
     # Collect histories for each agent to pass to their respective predictors
     pos, vel = extract_positions_velocities(env.unwrapped)
     histories = [] # list of pos,vel histories, each entry is a quad
     solo_collision_count = 0
-    for i in range(num_multi_agents + 1):
+    for i in range(args.num_multi_agents + 1):
         histories.append({ "position" : [pos[i]], "velocity" : [vel[i]] })
     for episode in progress_bar:
         # progress_bar.set_postfix_str("Setting radii")
@@ -1050,9 +1051,9 @@ def main() -> None:
         snapshot = safe_capture_env_snapshot(env)
         temp_env = clone_env_from_snapshot(snapshot)
         # Collect predictions of where we think they'll go using our naive predictor
-        pred_trajectories = [roll_out_predictor(histories, predictors, agent_id, args.episode_length) for agent_id in range(num_multi_agents)]
+        pred_trajectories = [roll_out_predictor(histories, predictors, agent_id, args.episode_length) for agent_id in range(args.num_multi_agents)]
         # Collect actual rollouts to compare against
-        logs = run_multi_agents(temp_env, obs, num_multi_agents, 
+        logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
                     multi_actor, multi_rnn_states, 
                     solo_actor, solo_rnn_states, solo_obs_dim, 
                     pred_trajectories, filter,
@@ -1061,26 +1062,26 @@ def main() -> None:
                     deterministic=False)
         # Set radius depending on how bad our prediction was
         perturbation_radius = 0.1
-        qj = joint_conformal_radii(logs, num_multi_agents, pred_trajectories, bar_alpha, args.episode_length, args.num_trajectories)
-        L_U = estimate_LU(temp_env, num_multi_agents)
+        qj = joint_conformal_radii(logs, args.num_multi_agents, pred_trajectories, bar_alpha, args.episode_length, args.num_trajectories)
+        L_U = estimate_LU(temp_env, args.num_multi_agents)
         L_Xx_cf = closed_form_estimate_LXx(temp_env)
-        L_Xx = estimate_LXx(temp_env, obs, num_multi_agents,
+        L_Xx = estimate_LXx(temp_env, obs, args.num_multi_agents,
             solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius,)
-        L_Xu = estimate_LXu(temp_env, obs, num_multi_agents, 
+        L_Xu = estimate_LXu(temp_env, obs, args.num_multi_agents, 
             solo_actor, solo_rnn_states, solo_obs_dim)
-        L_Yx = estimate_LYx(temp_env, obs, num_multi_agents, 
+        L_Yx = estimate_LYx(temp_env, obs, args.num_multi_agents, 
             multi_actor, multi_rnn_states, 
             solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
-        L_Yy = estimate_LYy(temp_env, obs, num_multi_agents, 
+        L_Yy = estimate_LYy(temp_env, obs, args.num_multi_agents, 
             multi_actor, multi_rnn_states,
             solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
         # L_Yu is zero, definitively
-        # L_Yu = estimate_LYu(temp_env, obs, num_multi_agents, 
+        # L_Yu = estimate_LYu(temp_env, obs, args.num_multi_agents, 
         #     multi_actor, multi_rnn_states,
         #     solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
         beta_T = calculate_beta_T(L_Xx, L_Xu, L_Yy, L_Yx, 0, args.episode_length)
         print('L_Xx', L_Xx, 'L_Xu', L_Xu, 'closed form L_Xx', L_Xx_cf)
-        print('L_Yx', L_Yx, 'L_Yy', L_Yy)
+        print('L_Yy', L_Yy, 'L_Yx', L_Yx)
         print('L_U', L_U, 'beta_T', beta_T)
 
         # Just because it gets way too big right now
@@ -1088,7 +1089,7 @@ def main() -> None:
         if not np.isfinite(beta_T) or beta_T > beta_threshold:
             beta_T = beta_threshold
         radius = explicit_radius_update(radius, qj, L_U * beta_T)
-        radii = np.full(num_multi_agents, radius, dtype=np.float64)
+        radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
         print('radius', radius, 'qj', qj)
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
@@ -1097,7 +1098,7 @@ def main() -> None:
             # Actually run the normal execution
             obs_np = np.asarray(obs)
 
-            obs_multi_dict = {OBS_KEY: obs_np[:num_multi_agents]}
+            obs_multi_dict = {OBS_KEY: obs_np[:args.num_multi_agents]}
             with torch.no_grad():
                 normalized_multi = prepare_and_normalize_obs(multi_actor, obs_multi_dict)
                 policy_multi = multi_actor(normalized_multi, multi_rnn_states)
@@ -1125,7 +1126,7 @@ def main() -> None:
             swarm_state = get_swarm_state(env.unwrapped)
             # We care about where we think they'll be next timestep: that's what
             # the conformal radius is built on
-            for agent_id in range(num_multi_agents):
+            for agent_id in range(args.num_multi_agents):
                 swarm_state.positions[agent_id, :] = pred_trajectories[agent_id][step][:3]
                 swarm_state.velocities[agent_id, :] = pred_trajectories[agent_id][step][3:]
             # Apply CBF to the ego agent based on radius determined earlier
@@ -1150,7 +1151,7 @@ def main() -> None:
                 progress_bar.set_postfix_str(f"crashes={solo_collision_count}")
             
             pos, vel = extract_positions_velocities(env.unwrapped)
-            for i in range(num_multi_agents + 1): # Save for all quads
+            for i in range(args.num_multi_agents + 1): # Save for all quads
                 histories[i]["position"].append(pos[i])
                 histories[i]["velocity"].append(vel[i])
 
