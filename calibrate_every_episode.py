@@ -949,7 +949,8 @@ def main() -> None:
     num_episodes = 1500 // args.episode_length - 1
     progress_bar = tqdm(range(num_episodes))
     # Init r0 to some large value that ought to be safe
-    radii = np.full(num_multi_agents, 2, dtype=np.float64)
+    radius = 2
+    radii = np.full(num_multi_agents, radius, dtype=np.float64)
     filter = make_cbf_filter(radii)
     # Collect histories for each agent to pass to their respective predictors
     pos, vel = extract_positions_velocities(env.unwrapped)
@@ -989,14 +990,15 @@ def main() -> None:
         # L_Yu = estimate_LYu(temp_env, obs, num_multi_agents, 
         #     multi_actor, multi_rnn_states,
         #     solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
-        beta_t = calculate_beta_T(L_Xx, L_Xu, L_Yy, L_Yx, 0, args.episode_length)
-        print('L_U', L_U, 'L_Xx', L_Xx, 'L_Xu', L_Xu, 'L_Yx', L_Yx, 'L_Yy', L_Yy, 'beta_T', beta_t)
+        beta_T = calculate_beta_T(L_Xx, L_Xu, L_Yy, L_Yx, 0, args.episode_length)
+        print('L_U', L_U, 'L_Xx', L_Xx, 'L_Xu', L_Xu, 'L_Yx', L_Yx, 'L_Yy', L_Yy, 'beta_T', beta_T)
         print('q_j', qj)
         # get Deltaj
         # get rhoj
         # set total radius
-        radii = np.full(num_multi_agents, 2 * arm_len, dtype=np.float64)
-        radii += np.ones(num_multi_agents) * qj # and Deltaj and rhoj
+        radius = explicit_radius_update(radius, qj, L_U * beta_T)
+        radii = np.full(num_multi_agents, radius, dtype=np.float64)
+        print('radius', radius)
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
         # progress_bar.set_postfix_str(f"crashes={solo_collision_count}")
