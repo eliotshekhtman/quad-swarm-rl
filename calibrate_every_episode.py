@@ -813,6 +813,25 @@ def conformal_radii(logs, num_multi_agents, pred_trajectories, alpha, episode_le
         radii[agent_id] = conformal_radius
     return radii
 
+def joint_conformal_radii(logs, num_multi_agents, pred_trajectories, alpha, episode_length, num_trajectories):
+    # pred_trajectories: num_agents x episode_length x 6
+    pred_positions = []
+    for agent_id in range(num_multi_agents):
+        pred_traj = np.stack(pred_trajectories[agent_id], axis=0)
+        pred_positions.append(pred_traj[:,:3])
+    predictions = np.concatenate(pred_positions, axis=1)
+    scores = []
+    for i in range(num_trajectories):
+        # logs: num_agents x num_trajectories x [] x episode_length x 3
+        run = np.concatenate([logs[agent_id][i]["position"] for agent_id in range(num_multi_agents)], axis=-1)
+        score = 0
+        for t in range(episode_length):
+            score = max(score, np.linalg.norm(predictions[t] - run[t]))
+        scores.append(score)
+    scores.sort()
+    conformal_radius = scores[int(np.ceil(len(scores) * (1 - alpha)) - 1)]
+    return conformal_radius
+
 def explicit_radius_update(prev_radius, conf_radius, kappa):
     if conf_radius <= prev_radius:
         return (conf_radius + kappa * prev_radius) / (1 + kappa)
@@ -955,7 +974,7 @@ def main() -> None:
                     deterministic=False)
         # Set radius depending on how bad our prediction was
         perturbation_radius = 0.1
-        qj = conformal_radii(logs, num_multi_agents, pred_trajectories, bar_alpha, args.episode_length)
+        qj = joint_conformal_radii(logs, num_multi_agents, pred_trajectories, bar_alpha, args.episode_length, args.num_trajectories)
         L_U = estimate_LU(temp_env, num_multi_agents)
         L_Xx = estimate_LXx(temp_env)
         L_Xu = estimate_LXu(temp_env, obs, num_multi_agents, 
@@ -972,11 +991,12 @@ def main() -> None:
         #     solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
         beta_t = calculate_beta_T(L_Xx, L_Xu, L_Yy, L_Yx, 0, args.episode_length)
         print('L_U', L_U, 'L_Xx', L_Xx, 'L_Xu', L_Xu, 'L_Yx', L_Yx, 'L_Yy', L_Yy, 'beta_T', beta_t)
+        print('q_j', qj)
         # get Deltaj
         # get rhoj
         # set total radius
         radii = np.full(num_multi_agents, 2 * arm_len, dtype=np.float64)
-        radii += qj # and Deltaj and rhoj
+        radii += np.ones(num_multi_agents) * qj # and Deltaj and rhoj
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
         # progress_bar.set_postfix_str(f"crashes={solo_collision_count}")
