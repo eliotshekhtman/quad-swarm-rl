@@ -311,6 +311,92 @@ def estimate_LXu(
 
     return float(lipschitz)
 
+
+def estimate_LXx(
+    temp_env,
+    obs,
+    num_multi_agents,
+    solo_actor,
+    solo_rnn_states,
+    solo_obs_dim,
+    perturbation_radius,
+) -> float:
+    """
+    Estimate a local Lipschitz constant relating solo-state perturbations to the
+    next solo state.
+    """
+    if perturbation_radius <= 0.0:
+        return 0.0
+
+    snapshot = safe_capture_env_snapshot(temp_env)
+    solo_position, solo_velocity, solo_rotation, solo_omega = _extract_agent_state(temp_env.unwrapped, -1)
+    base_state_vec = _pack_agent_state(solo_position, solo_velocity, solo_rotation, solo_omega)
+    state_dim = base_state_vec.size
+
+    def simulate_next_state(state_vec: np.ndarray) -> np.ndarray:
+        rng_backup = snapshot_rng_state()
+        restore_rng_state(snapshot.rng)
+        env_clone = clone_env_from_snapshot(snapshot)
+        try:
+            pos, vel, rot, omega = _unpack_agent_state(state_vec)
+            _apply_agent_state(env_clone, -1, pos, vel, rot, omega)
+
+            obs_clone = _collect_observations_from_env(env_clone)
+            run_solo_states = solo_rnn_states.clone()
+            solo_obs = obs_clone[-1, :solo_obs_dim]
+            obs_solo_dict = {OBS_KEY: solo_obs[None, :]}
+            with torch.no_grad():
+                normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
+                solo_actor(normalized_solo, run_solo_states)
+            action_solo = argmax_actions(solo_actor.action_distribution())
+            if action_solo.dim() == 1:
+                action_solo = action_solo.unsqueeze(0)
+            action_solo = action_solo.detach().cpu().numpy()[0]
+
+            actions_multi = np.zeros((num_multi_agents, action_solo.shape[-1]), dtype=np.float32)
+            stacked_actions = np.vstack([actions_multi, action_solo[None, :]])
+            env_clone.step(stacked_actions)
+            next_pos, next_vel, next_rot, next_omega = _extract_agent_state(env_clone.unwrapped, -1)
+            return _pack_agent_state(next_pos, next_vel, next_rot, next_omega)
+        finally:
+            env_clone.close()
+            restore_rng_state(rng_backup)
+
+    base_next_state = simulate_next_state(base_state_vec)
+
+    required_samples = max(32, 3 * state_dim)
+    directions: List[np.ndarray] = []
+    for axis in range(state_dim):
+        basis = np.zeros(state_dim, dtype=np.float64)
+        basis[axis] = 1.0
+        directions.append(basis)
+        directions.append(-basis)
+    rng = np.random.default_rng()
+    while len(directions) < required_samples:
+        directions.append(rng.uniform(low=-1.0, high=1.0, size=state_dim))
+
+    lipschitz = 0.0
+    for direction in directions:
+        norm = np.linalg.norm(direction)
+        if norm < 1e-9:
+            continue
+        perturb = (perturbation_radius * direction / norm).astype(np.float64)
+        candidate_state = base_state_vec + perturb
+        pos, vel, rot, omega = _unpack_agent_state(candidate_state)
+        rot = _project_to_so3(rot)
+        candidate_state = _pack_agent_state(pos, vel, rot, omega)
+        perturb = candidate_state - base_state_vec
+        delta_x = np.linalg.norm(perturb)
+        if delta_x < 1e-9:
+            continue
+        pert_state = simulate_next_state(candidate_state)
+        delta_y = np.linalg.norm(pert_state - base_next_state)
+        if delta_y <= 0.0:
+            continue
+        lipschitz = max(lipschitz, delta_y / delta_x)
+
+    return float(lipschitz)
+
 def estimate_LYx(
     temp_env,
     obs,
@@ -599,7 +685,7 @@ def estimate_LYy(
 
     return float(lipschitz)
 
-def estimate_LXx(temp_env):
+def closed_form_estimate_LXx(temp_env):
     dynamics = temp_env.envs[-1].dynamics
     solo_position, solo_velocity, solo_rotation, solo_omega = _extract_agent_state(temp_env.unwrapped, -1)
     cond_number = np.linalg.cond(dynamics.model.I_com, 2)
@@ -977,7 +1063,9 @@ def main() -> None:
         perturbation_radius = 0.1
         qj = joint_conformal_radii(logs, num_multi_agents, pred_trajectories, bar_alpha, args.episode_length, args.num_trajectories)
         L_U = estimate_LU(temp_env, num_multi_agents)
-        L_Xx = estimate_LXx(temp_env)
+        L_Xx_cf = closed_form_estimate_LXx(temp_env)
+        L_Xx = estimate_LXx(temp_env, obs, num_multi_agents,
+            solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius,)
         L_Xu = estimate_LXu(temp_env, obs, num_multi_agents, 
             solo_actor, solo_rnn_states, solo_obs_dim)
         L_Yx = estimate_LYx(temp_env, obs, num_multi_agents, 
@@ -991,14 +1079,17 @@ def main() -> None:
         #     multi_actor, multi_rnn_states,
         #     solo_actor, solo_rnn_states, solo_obs_dim, perturbation_radius)
         beta_T = calculate_beta_T(L_Xx, L_Xu, L_Yy, L_Yx, 0, args.episode_length)
-        print('L_U', L_U, 'L_Xx', L_Xx, 'L_Xu', L_Xu, 'L_Yx', L_Yx, 'L_Yy', L_Yy, 'beta_T', beta_T)
-        print('q_j', qj)
-        # get Deltaj
-        # get rhoj
-        # set total radius
+        print('L_Xx', L_Xx, 'L_Xu', L_Xu, 'closed form L_Xx', L_Xx_cf)
+        print('L_Yx', L_Yx, 'L_Yy', L_Yy)
+        print('L_U', L_U, 'beta_T', beta_T)
+
+        # Just because it gets way too big right now
+        beta_threshold = 100_000_000
+        if not np.isfinite(beta_T) or beta_T > beta_threshold:
+            beta_T = beta_threshold
         radius = explicit_radius_update(radius, qj, L_U * beta_T)
         radii = np.full(num_multi_agents, radius, dtype=np.float64)
-        print('radius', radius)
+        print('radius', radius, 'qj', qj)
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
         # progress_bar.set_postfix_str(f"crashes={solo_collision_count}")
