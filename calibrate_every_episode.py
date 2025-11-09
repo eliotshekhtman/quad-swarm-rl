@@ -1140,7 +1140,7 @@ def main() -> None:
             for teammate_pos in swarm_state.positions[:-1]:
                 dist = np.linalg.norm(solo_pos - teammate_pos)
                 closest_dist = min(dist, closest_dist)
-            progress_bar.set_postfix_str(f"dist>={closest_dist}")
+            progress_bar.set_postfix_str(f"dist>={closest_dist:.2f}")
 
             actions = np.vstack([actions_multi, action_solo[None, :]])
             obs, rewards, terminated, truncated, infos = env.step(actions)
