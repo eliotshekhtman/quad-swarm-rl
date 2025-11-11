@@ -39,7 +39,7 @@ from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 
 from pretrain_rnn_predictor import RNNPredictor
-from restart_utils import (
+from project_utils.restart_utils import (
     QuadState,
     deterministic_reset,
     extract_positions_velocities,
@@ -47,7 +47,7 @@ from restart_utils import (
     quad_state_to_serialisable,
 )
 
-from utils import *
+from project_utils.utils import *
 
 # ---------------------------------------------------------------------------
 # Main script

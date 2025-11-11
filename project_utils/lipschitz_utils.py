@@ -14,8 +14,8 @@ from swarm_rl.env_snapshot import (
     snapshot_rng_state,
 )
 
-from cbf_utils import CBF_K0, CBF_K1
-from utils import OBS_KEY, get_swarm_state
+from project_utils.cbf_utils import CBF_K0, CBF_K1
+from project_utils.utils import OBS_KEY, get_swarm_state
 
 
 DELTA_T = 0.015

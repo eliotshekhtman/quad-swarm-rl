@@ -17,8 +17,8 @@ from sample_factory.utils.attr_dict import AttrDict
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
-from utils import *
-from cbf_utils import make_cbf_filter
+from project_utils.utils import *
+from project_utils.cbf_utils import make_cbf_filter
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ from typing import List, Tuple
 import cvxpy as cp
 import numpy as np
 
-from utils import *
+from project_utils.utils import *
 
 CBF_K1 = 0.1
 CBF_K0 = 0.1
