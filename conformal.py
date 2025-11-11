@@ -442,7 +442,8 @@ def main() -> None:
                 episode_pred_velocities[agent_id, step, :] = env_vel
                 pred_pos = pred_trajectories[agent_id][step][:3] # Predicted next pos
                 distance = np.linalg.norm(env_pos - pred_pos)
-                left_tube[agent_id] = distance > radius # If further than radius
+                if distance > radius:
+                    left_tube[agent_id] = True
             progress_bar.set_postfix_str(f"left={sum(left_tube)}")
 
             solo_info_rewards = infos[-1].get("rewards", {})
