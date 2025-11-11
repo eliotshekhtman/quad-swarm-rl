@@ -7,11 +7,10 @@ import numpy as np
 
 from utils import *
 
-CBF_K1 = 8.0
-CBF_K0 = 2.0
+CBF_K1 = 0.1
+CBF_K0 = 0.1
 CBF_SLACK_WEIGHT = 1.0e4
-CBF_QP_DIAGONAL = np.ones(4, dtype=np.float64)
-CBF_QP_SOLVER = "OSQP"
+EPSILON = 1e-3
 
 GRAVITY_VECTOR = np.array([0.0, 0.0, -9.81], dtype=np.float64)
 
@@ -28,45 +27,64 @@ def _normalized_to_thrust(norm_cmds: np.ndarray, dynamics) -> np.ndarray:
     to map the high-level command to thrust.  We delegate the core conversion to
     ``QuadrotorDynamics.angvel2thrust`` so the QP shares the exact actuator model.
     """
-    commands = np.clip(np.asarray(norm_cmds, dtype=np.float64), 0.0, 1.0)
+    motor_tau_down = np.asarray(dynamics.motor_tau_down, dtype=np.float64)
+    motor_tau = dynamics.motor_tau_up * np.ones([4, ])
+    motor_tau[norm_cmds < dynamics.thrust_cmds_damp] = motor_tau_down
+    motor_tau[motor_tau > 1.] = 1.
+    thrust_rot = norm_cmds ** 0.5
+    thrust_rot_damp = motor_tau * (thrust_rot - dynamics.thrust_rot_damp) + dynamics.thrust_rot_damp
+    thrust_cmds_damp = thrust_rot_damp ** 2
+    
     thrust_max = np.asarray(getattr(dynamics, "thrust_max"), dtype=np.float64)
     linearity = np.asarray(getattr(dynamics, "motor_linearity", 1.0), dtype=np.float64)
-    linearity = np.broadcast_to(np.atleast_1d(linearity), commands.shape).astype(np.float64)
-    return thrust_max * dynamics.angvel2thrust(commands, linearity=linearity)
-
+    return thrust_max * dynamics.angvel2thrust(thrust_cmds_damp, linearity=linearity)
 
 def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
-    """
-    Invert ``_normalized_to_thrust`` by numerically recovering the [0, 1] motor
-    commands whose actuator model yields the requested thrust magnitudes.
-    """
-    thrusts = np.asarray(thrusts, dtype=np.float64)
-    thrust_max = np.asarray(getattr(dynamics, "thrust_max"), dtype=np.float64)
-    max_safe = np.clip(thrust_max, 1e-6, None)
-    ratio = np.clip(thrusts / max_safe, 0.0, 1.0)
-    linearity = np.asarray(getattr(dynamics, "motor_linearity", 1.0), dtype=np.float64)
-    linearity = np.broadcast_to(np.atleast_1d(linearity), ratio.shape).astype(np.float64)
-
-    def _invert_single(r: float, lin: float) -> float:
-        """
-        Use a monotone bisection driven entirely by ``angvel2thrust`` so the
-        inverse stays coupled to the simulator's actuator curves.
-        """
-        if abs(lin - 1.0) < 1e-9:
-            return r
+    def _invert_single(index):
         low, high = 0.0, 1.0
         for _ in range(30):
             mid = 0.5 * (low + high)
-            val = float(dynamics.angvel2thrust(np.array([mid]), linearity=np.array([lin]))[0])
-            if val < r:
+            test_norm = np.ones(4) * mid 
+            val = _normalized_to_thrust(test_norm, dynamics)[index]
+            if val < thrusts[index]:
                 low = mid
             else:
                 high = mid
         return 0.5 * (low + high)
+    norm_cmds = np.zeros(4)
+    for i in range(4):
+        norm_cmds[i] = _invert_single(i)
+    return norm_cmds
 
-    vectorized = np.vectorize(_invert_single, otypes=[np.float64])
-    normalized = vectorized(ratio, linearity)
-    return np.clip(normalized, 0.0, 1.0)
+# def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
+#     """
+#     Invert ``_normalized_to_thrust`` by numerically recovering the [0, 1] motor
+#     commands whose actuator model yields the requested thrust magnitudes.
+#     """
+#     thrusts = np.asarray(thrusts, dtype=np.float64)
+#     thrust_max = np.asarray(getattr(dynamics, "thrust_max"), dtype=np.float64)
+#     ratio = np.clip(thrusts / thrust_max, 0.0, 1.0)
+#     linearity = np.asarray(getattr(dynamics, "motor_linearity", 1.0), dtype=np.float64)
+#     linearity = np.broadcast_to(np.atleast_1d(linearity), ratio.shape).astype(np.float64)
+
+#     def _invert_single(r: float, lin: float) -> float:
+#         """
+#         Use a monotone bisection driven entirely by ``angvel2thrust`` so the
+#         inverse stays coupled to the simulator's actuator curves.
+#         """
+#         low, high = 0.0, 1.0
+#         for _ in range(30):
+#             mid = 0.5 * (low + high)
+#             val = float(dynamics.angvel2thrust(np.array([mid]), linearity=np.array([lin]))[0])
+#             if val < r:
+#                 low = mid
+#             else:
+#                 high = mid
+#         return 0.5 * (low + high)
+
+#     vectorized = np.vectorize(_invert_single, otypes=[np.float64])
+#     normalized = vectorized(ratio, linearity)
+#     return np.clip(normalized, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -103,23 +121,19 @@ def _ecbf_coefficients(
     velocity ``teammate_vel``.  This keeps the barrier conservative: if the
     teammate is stationary it reduces to the exact textbook form.
     """
-    z_vec = solo_pos - teammate_pos # (x-p)
-    v_rel = solo_vel - teammate_vel
-    h_value = float(np.dot(z_vec, z_vec) - radius**2) # h
-    z_dot_gravity = float(np.dot(z_vec, GRAVITY_VECTOR)) # (x-p)ᵀg
-    z_dot_v_rel = float(np.dot(z_vec, solo_vel)) # (x-p)ᵀv
-    v_rel_sq = float(np.dot(solo_vel, solo_vel)) # vᵀv
+    pos_rel = solo_pos - teammate_pos # (x-p)
+    # v_rel = solo_vel - teammate_vel
+    h_value = float(np.dot(pos_rel, pos_rel) - radius**2) # h
+    relpos_dot_gravity = float(np.dot(pos_rel, GRAVITY_VECTOR)) # (x-p)ᵀg
+    relpos_dot_v = float(np.dot(pos_rel, solo_vel)) # (x-p)ᵀv
+    v_sq = float(np.dot(solo_vel, solo_vel)) # vᵀv
     thrust_axis_world = solo_rot[:, 2] # R e₃
-    thrust_alignment = float(np.dot(z_vec, thrust_axis_world)) # (x-p)ᵀRe₃
+    thrust_alignment = float(np.dot(pos_rel, thrust_axis_world)) # (x-p)ᵀRe₃
     c_scale = (2.0 / mass) * thrust_alignment # (2/m) (x-p)ᵀRe₃
-    a_vec = c_scale * np.ones(4, dtype=np.float64) # (2/m) (x-p)ᵀRe₃ 1ᵀ
-    b_scalar = ( # 2vᵀv + 2vᵀg + a1(2(x-p)ᵀv + a0(h))
-        2.0 * v_rel_sq 
-        + 2.0 * z_dot_gravity
-        + 2.0 * CBF_K1 * z_dot_v_rel
-        + CBF_K1 * CBF_K0 * h_value
-    )
-    return a_vec, b_scalar, h_value
+    LgLfh = c_scale * np.ones(4, dtype=np.float64) # (2/m) (x-p)ᵀRe₃ 1ᵀ
+    Lf2h = 2.0 * v_sq + 2.0 * relpos_dot_gravity # 2vᵀv + 2(x-p)ᵀg
+    Lfh = 2 * relpos_dot_v # 2(x-p)ᵀv
+    return h_value, Lfh, Lf2h, LgLfh
 
 
 def _solve_cbf_qp(
@@ -129,6 +143,7 @@ def _solve_cbf_qp(
     radii: np.ndarray,
     mass: float,
     thrust_bounds: Tuple[np.ndarray, np.ndarray],
+    debug=False
 ) -> np.ndarray:
     """
     Build and solve the ECBF quadratic program described in the task statement.
@@ -140,7 +155,7 @@ def _solve_cbf_qp(
 
     Objective
     ---------
-    minimise ‖u - u_ref‖²_W + CBF_SLACK_WEIGHT · slack
+    minimise ‖u - u_ref‖² + CBF_SLACK_WEIGHT · slack²
 
     Constraints
     -----------
@@ -159,13 +174,17 @@ def _solve_cbf_qp(
     u_var = cp.Variable(4)
     slack = cp.Variable()
 
+    hdd_list = []
+    hd_list = []
+    h_list = []
+
     for teammate_idx in range(num_multi_agents):
         radius = float(radii[teammate_idx])
         if radius <= 0.0:
             continue
         teammate_pos = swarm_state.positions[teammate_idx]
         teammate_vel = swarm_state.velocities[teammate_idx]
-        a_vec, b_scalar, _ = _ecbf_coefficients(
+        h_value, Lfh, Lf2h, LgLfh = _ecbf_coefficients(
             solo_pos=solo_pos,
             solo_vel=solo_vel,
             solo_rot=solo_rot,
@@ -174,13 +193,17 @@ def _solve_cbf_qp(
             radius=radius,
             mass=mass,
         )
-        constraints.append(a_vec @ u_var >= -b_scalar - slack)
+        hdd = Lf2h + LgLfh @ u_var
+        hd = Lfh
+        hdd_list.append(hdd)
+        hd_list.append(hd)
+        h_list.append(h_value)
+        constraints.append(hdd + CBF_K1 * (hd + CBF_K0 * h_value) >= - slack) #  EPSILON
 
     if len(constraints) == 0:
         return np.clip(u_ref, u_min, u_max)
 
-    weight_matrix = np.diag(CBF_QP_DIAGONAL)
-    objective = cp.quad_form(u_var - u_ref, weight_matrix) + CBF_SLACK_WEIGHT * slack
+    objective = cp.sum_squares(u_var - u_ref) + CBF_SLACK_WEIGHT * cp.square(slack)
     constraints.extend(
         [
             u_var >= u_min,
@@ -189,16 +212,33 @@ def _solve_cbf_qp(
         ]
     )
     problem = cp.Problem(cp.Minimize(objective), constraints)
-    solver = getattr(cp, CBF_QP_SOLVER, cp.OSQP)
+
     try:
-        problem.solve(solver=solver, warm_start=True, verbose=False)
+        problem.solve(solver=cp.ECOS, warm_start=True, verbose=False)
     except cp.SolverError:
-        return np.clip(u_ref, u_min, u_max)
+        approx = u_var.value
+        if approx is None:
+            approx = u_ref # No iteratre returned
+        clipped = np.clip(approx, u_min, u_max)
+        print("QP timed out; returning last iterate:", clipped)
+        if debug:
+            return clipped, h_list, hd_list, hdd_list
+        return clipped
     if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        print('OTHER ISSUE', problem.status)
         return np.clip(u_ref, u_min, u_max)
-    # print('Slack: ', slack.value)
+    if debug:
+        for agent_id in range(num_multi_agents):
+            print('C0:', h_list[agent_id])
+            print('C1:', hd_list[agent_id] + CBF_K0 * (h_list[agent_id]))
+            print('C2:', hdd_list[agent_id].value + CBF_K1 * (hd_list[agent_id] + CBF_K0 * (h_list[agent_id])))
+        # print('Slack: ', slack.value, 'u dist:', np.linalg.norm(u_ref - u_var.value), u_var.value)
+        # print(np.linalg.norm(u_var.value - u_min), np.linalg.norm(u_var.value - u_max))
     solution = np.array(u_var.value, dtype=np.float64)
-    return np.clip(solution, u_min, u_max)
+    # solution = u_ref / np.sum(u_ref) * np.sum(solution) # 
+    if debug:
+        return solution, h_list, hd_list, hdd_list
+    return solution # np.clip(solution, u_min, u_max)
 
 
 def apply_cbf_filter(
@@ -206,6 +246,7 @@ def apply_cbf_filter(
     radii: np.ndarray,
     env_state,
     swarm_state: SwarmState,
+    debug=False
 ) -> np.ndarray:
     """
     Wrap the raw solo-policy action with the ECBF safety filter.
@@ -230,21 +271,30 @@ def apply_cbf_filter(
 
     u_min = np.zeros(4, dtype=np.float64)
     u_max = np.asarray(dynamics.thrust_max, dtype=np.float64)
-    safe_thrust = _solve_cbf_qp(
+    outputs = _solve_cbf_qp(
         u_ref_thrust=u_ref_thrust,
         swarm_state=swarm_state,
         radii=radii,
         mass=float(dynamics.mass),
         thrust_bounds=(u_min, u_max),
+        debug=debug
     )
+    if debug:
+        safe_thrust, h_list, hd_list, hdd_list = outputs
+    else:
+        safe_thrust = outputs
 
     # Convert Newton thrust back to the environment's action space.
     safe_normalized = _thrust_to_normalized(safe_thrust, dynamics)
     safe_action = 2.0 * safe_normalized - 1.0
-    return np.clip(safe_action.astype(np.float32), -1.0, 1.0)
+    clipped_action = np.clip(safe_action.astype(np.float32), -1.0, 1.0)
+    if debug:
+        return clipped_action, h_list, hd_list, hdd_list
+    else:
+        return clipped_action
 
 def make_cbf_filter(radii: np.ndarray):
-    def filter(base_action: np.ndarray, env_state, swarm_state: SwarmState):
-        return apply_cbf_filter(base_action, radii, env_state, swarm_state)
+    def filter(base_action: np.ndarray, env_state, swarm_state: SwarmState, debug=False):
+        return apply_cbf_filter(base_action, radii, env_state, swarm_state, debug=debug)
     return filter
 

@@ -30,11 +30,11 @@ def capture_initial_states(env) -> List[QuadState]:
         dynamics = quad.dynamics
         states.append(
             QuadState(
-                position=np.asarray(dynamics.pos, dtype=np.float64),
-                velocity=np.asarray(dynamics.vel, dtype=np.float64),
-                rotation=np.asarray(dynamics.rot, dtype=np.float64),
-                omega=np.asarray(dynamics.omega, dtype=np.float64),
-                goal=np.asarray(quad.goal, dtype=np.float64),
+                position=np.asarray(dynamics.pos, dtype=np.float64).copy(),
+                velocity=np.asarray(dynamics.vel, dtype=np.float64).copy(),
+                rotation=np.asarray(dynamics.rot, dtype=np.float64).copy(),
+                omega=np.asarray(dynamics.omega, dtype=np.float64).copy(),
+                goal=np.asarray(quad.goal, dtype=np.float64).copy(),
             )
         )
     return states
