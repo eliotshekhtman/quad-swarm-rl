@@ -31,8 +31,7 @@ from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.env_snapshot import *
 
-from pretrain_rnn_predictor import RNNPredictor, load_rnn_checkpoint
-
+from conformal_utils import *
 from utils import *
 from cbf_utils import (
     make_cbf_filter, 
@@ -40,11 +39,8 @@ from cbf_utils import (
     CBF_K1,
 )
 from restart_utils import (
-    QuadState,
     deterministic_reset,
     extract_positions_velocities,
-    quad_state_from_dict,
-    quad_state_to_serialisable,
 )
 
 DEVICE = torch.device("cpu")
@@ -57,21 +53,6 @@ MAX_RADIUS = 5
 # ---------------------------------------------------------------------------
 # Conformal utilities
 # ---------------------------------------------------------------------------
-
-def safe_capture_env_snapshot(env):
-    """
-    Capture a snapshot without copying OpenGL scene objects that own module references.
-    """
-    base_env = env.unwrapped
-    had_scenes = hasattr(base_env, "scenes")
-    saved_scenes = base_env.scenes if had_scenes else None
-    if had_scenes:
-        base_env.scenes = []
-    try:
-        return capture_env_snapshot(env)
-    finally:
-        if had_scenes:
-            base_env.scenes = saved_scenes
 
 def fall_down(base_action, env_state, swarm_state):
     return np.array([-1., -1., -1., -1.], dtype=np.float64)
@@ -166,34 +147,7 @@ def run_multi_agents(env, obs, num_multi_agents,
     return logs
 
 
-def get_alpha_bar(alpha, delta, num_trajectories):
-    return alpha - np.sqrt(np.log(1 / delta) / (2 * num_trajectories))
 
-def joint_conformal_radii(logs, num_multi_agents, pred_trajectories, alpha, episode_length, num_trajectories):
-    # pred_trajectories: num_agents x episode_length x 6
-    pred_positions = []
-    for agent_id in range(num_multi_agents):
-        pred_traj = np.stack(pred_trajectories[agent_id], axis=0)
-        pred_positions.append(pred_traj[:,:3])
-    predictions = np.concatenate(pred_positions, axis=1) # epsiode_length x (num_multi_agents * 3)
-    scores = []
-    for i in range(num_trajectories):
-        # logs: num_agents x num_trajectories x [] x episode_length x 3
-        run = np.concatenate([logs[agent_id][i]["position"] for agent_id in range(num_multi_agents)], axis=-1)
-        score = 0
-        for t in range(episode_length):
-            score = max(score, np.linalg.norm(predictions[t] - run[t]))
-        scores.append(score)
-    scores.sort()
-    conformal_radius = scores[int(np.ceil(len(scores) * (1 - alpha)) - 1)]
-    return conformal_radius
-
-def explicit_radius_update(prev_radius, conf_radius, kappa):
-    if conf_radius <= prev_radius:
-        radius = (conf_radius + kappa * prev_radius) / (1 + kappa)
-    else:
-        radius = (conf_radius - kappa * prev_radius) / (1 - kappa)
-    return np.clip(radius, MIN_RADIUS, MAX_RADIUS)
 
 # ---------------------------------------------------------------------------
 # Main script
@@ -201,13 +155,12 @@ def explicit_radius_update(prev_radius, conf_radius, kappa):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deterministic patrol_dual_goal data collection.")
-    parser.add_argument("--multi_train_dir", required=True, help="Directory containing the trained multi-agent policy.")
+    parser.add_argument("--multi_train_dir", default='train_dir', help="Directory containing the trained multi-agent policy.")
     parser.add_argument("--multi_experiment", required=True, help="Experiment name for the multi-agent policy.")
-    parser.add_argument("--solo_train_dir", required=True, help="Directory containing the trained single-agent policy.")
+    parser.add_argument("--solo_train_dir", default='train_dir', help="Directory containing the trained single-agent policy.")
     parser.add_argument("--solo_experiment", required=True)
-    parser.add_argument("--train_dir", required=True, help="Base directory to store the new conformal experiment.")
+    parser.add_argument("--train_dir", default='train_dir', help="Base directory to store the new conformal experiment.")
     parser.add_argument("--experiment_name", required=True, help="Subdirectory under train_dir for outputs.")
-    parser.add_argument("--predictor_checkpoint", required=True, help="Path to a pretrained RNN predictor checkpoint.")
     parser.add_argument("--seed", type=int, default=42, help="Seed applied before every reset to reproduce goals.")
     parser.add_argument("--alpha", type=float, default=0.1, help="Desired probability of conformal error")
     parser.add_argument("--delta", type=float, default=0.1, help="Desired probability of a bad draw")
@@ -355,7 +308,9 @@ def main() -> None:
                     num_runs=args.num_trajectories, 
                     deterministic=True)
         # Set radius depending on how bad our prediction was
-        qj = joint_conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length, args.num_trajectories)
+        # qj = joint_conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length, args.num_trajectories)
+        qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
+        qj = np.max(qj)
         new_radius = explicit_radius_update(radius, qj, KAPPA)
         delta_r = np.abs(new_radius - radius) # How different is it this time
         print('radius', radius, 'qj', qj, 'new radius', new_radius)

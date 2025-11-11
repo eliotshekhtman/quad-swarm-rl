@@ -126,3 +126,19 @@ def snapshot_rng_state() -> RNGSnapshot:
 def restore_rng_state(rng_snapshot: RNGSnapshot) -> None:
     """Public helper that restores previously captured RNG streams."""
     _restore_rng(rng_snapshot)
+
+
+def safe_capture_env_snapshot(env):
+    """
+    Capture a snapshot without copying OpenGL scene objects that own module references.
+    """
+    base_env = env.unwrapped
+    had_scenes = hasattr(base_env, "scenes")
+    saved_scenes = base_env.scenes if had_scenes else None
+    if had_scenes:
+        base_env.scenes = []
+    try:
+        return capture_env_snapshot(env)
+    finally:
+        if had_scenes:
+            base_env.scenes = saved_scenes
