@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 """
-Actually run this open-loop
+Open-loop conformal
+
+Supercharged predictor: true collected trajectories from a run without interaction.
+    Because of intense variation, predictions re-collected from last run's interaction.
+Collect trajectories for qj using last episode's ego agent policy/radius.
+Adjust new radius, but use a kappa that we set.
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
-import json
 import os
-import random
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch import nn
-from gymnasium import spaces
 from tqdm import tqdm
 
-from sample_factory.algo.learning.learner import Learner
 from sample_factory.algo.utils.action_distributions import argmax_actions
 from sample_factory.algo.utils.rl_utils import prepare_and_normalize_obs
-from sample_factory.model.actor_critic import create_actor_critic
 from sample_factory.model.model_utils import get_rnn_size
 from sample_factory.utils.attr_dict import AttrDict
 from sample_factory.huggingface.huggingface_utils import generate_replay_video
@@ -505,6 +503,9 @@ def main() -> None:
         generate_replay_video(video_dir, video_frames, args.video_fps, video_cfg)
         final_path = os.path.abspath(os.path.join(video_dir, video_file))
         print(f"[conformal_enjoy] Video saved to {final_path}")
+    
+    print('Number of total crashes:', sum(num_crashes_per_episode))
+    print('Number of total crashes outside of conformal tubes:', sum(num_bad_crashes_per_episode))
 
     
 
