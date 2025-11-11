@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
 """
-Collect quadrotor trajectories in the patrol_dual_goal scenario with deterministic resets.
-
-This script mirrors the evaluation flow of ``mixed_enjoy.py`` while enforcing:
-    * A user-specified random seed that is re-applied before every environment reset so the
-      patrol scenario regenerates the same goals each episode.
-    * Manual restoration of the initial quad states (position, velocity, rotation, body rates)
-      after every reset, ensuring agents respawn exactly where they started on the first episode.
-    * Per-timestep logging of each quad's position and velocity to an ``NPZ`` archive.
-    * Loading of a pretrained recurrent predictor (unused for control, but instantiated and ready).
-
-Initial states detected on the first episode are persisted to ``initial_states.json`` inside the
-output experiment directory so subsequent runs can reproduce the exact spawn configuration.
+Closed-loop episodes
 """
 
 from __future__ import annotations
@@ -698,7 +687,6 @@ def closed_form_estimate_LXx(temp_env):
     return 2 * max([L_x, L_v, L_R, L_omega])
 
 def estimate_LU(temp_env, num_multi_agents):
-    # NOT UNIFORM: need to set a minimum radius???
     dynamics = temp_env.envs[-1].dynamics
     solo_position, solo_velocity, solo_rotation, solo_omega = _extract_agent_state(temp_env.unwrapped, -1)
     swarm_state = get_swarm_state(temp_env.unwrapped)
@@ -905,7 +893,7 @@ def joint_conformal_radii(logs, num_multi_agents, pred_trajectories, alpha, epis
     for agent_id in range(num_multi_agents):
         pred_traj = np.stack(pred_trajectories[agent_id], axis=0)
         pred_positions.append(pred_traj[:,:3])
-    predictions = np.concatenate(pred_positions, axis=1)
+    predictions = np.concatenate(pred_positions, axis=1) # epsiode_length x (num_multi_agents * 3)
     scores = []
     for i in range(num_trajectories):
         # logs: num_agents x num_trajectories x [] x episode_length x 3
@@ -1062,6 +1050,8 @@ def main() -> None:
                     deterministic=False)
         # Set radius depending on how bad our prediction was
         perturbation_radius = 0.1
+        # Empirically, joint qj seems to be around 2x the largest old qj
+        # old_qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, bar_alpha, args.episode_length)
         qj = joint_conformal_radii(logs, args.num_multi_agents, pred_trajectories, bar_alpha, args.episode_length, args.num_trajectories)
         L_U = estimate_LU(temp_env, args.num_multi_agents)
         L_Xx_cf = closed_form_estimate_LXx(temp_env)
@@ -1090,7 +1080,7 @@ def main() -> None:
             beta_T = beta_threshold
         radius = explicit_radius_update(radius, qj, L_U * beta_T)
         radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-        print('radius', radius, 'qj', qj)
+        print('radius', radius, 'qj', qj) # , 'old qj', np.max(old_qj)
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
         # progress_bar.set_postfix_str(f"crashes={solo_collision_count}")

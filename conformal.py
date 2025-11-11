@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
 """
-Collect quadrotor trajectories in the patrol_dual_goal scenario with deterministic resets.
-
-This script mirrors the evaluation flow of ``mixed_enjoy.py`` while enforcing:
-    * A user-specified random seed that is re-applied before every environment reset so the
-      patrol scenario regenerates the same goals each episode.
-    * Manual restoration of the initial quad states (position, velocity, rotation, body rates)
-      after every reset, ensuring agents respawn exactly where they started on the first episode.
-    * Per-timestep logging of each quad's position and velocity to an ``NPZ`` archive.
-    * Loading of a pretrained recurrent predictor (unused for control, but instantiated and ready).
-
-Initial states detected on the first episode are persisted to ``initial_states.json`` inside the
-output experiment directory so subsequent runs can reproduce the exact spawn configuration.
+Actually run this open-loop
 """
 
 from __future__ import annotations
