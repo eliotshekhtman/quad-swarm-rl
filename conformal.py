@@ -23,6 +23,7 @@ import os
 import random
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import nn
@@ -337,7 +338,9 @@ def main() -> None:
     num_bad_crashes_per_episode = [] # Crash outside of a tube
     prev_actions = [np.array([0.0, 0.0, 0.0, 0.0])] * args.episode_length
     max_action_diff = 4 # Instantiating to a "big" number
-    max_action_diff_per_epsiode = []
+    max_action_diff_per_episode = []
+    qj_per_episode: List[float] = []
+    radius_per_episode: List[float] = []
 
     # While the radius hasn't converged
     for episode in range(20):
@@ -369,12 +372,16 @@ def main() -> None:
         print('radius', radius, 'qj', qj, 'new radius', new_radius)
         radius = new_radius
         radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
+        qj_per_episode.append(qj)
+        radius_per_episode.append(radius)
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
 
         # Doublechecking that everything's reset
         obs, stored_states = deterministic_reset(env, args.seed, stored_states)
         max_action_diff = 0
+        episode_pred_positions = np.zeros((args.num_multi_agents, args.episode_length, 3), dtype=np.float32)
+        episode_pred_velocities = np.zeros_like(episode_pred_positions)
 
         progress_bar = tqdm(range(args.episode_length))
         for step in progress_bar:
@@ -437,10 +444,13 @@ def main() -> None:
             actions = np.vstack([actions_multi, action_solo[None, :]])
             obs, rewards, terminated, truncated, infos = env.step(actions)
 
-            # After a step, check if everyone's in their tubes
+            # After a step, check if everyone's in their tubes and cache actual rollouts
             swarm_state = get_swarm_state(env.unwrapped)
             for agent_id in range(args.num_multi_agents):
                 env_pos = swarm_state.positions[agent_id] # Actual next pos
+                env_vel = swarm_state.velocities[agent_id]
+                episode_pred_positions[agent_id, step, :] = env_pos
+                episode_pred_velocities[agent_id, step, :] = env_vel
                 pred_pos = pred_trajectories[agent_id][step][:3] # Predicted next pos
                 distance = np.linalg.norm(env_pos - pred_pos)
                 left_tube[agent_id] = distance > radius # If further than radius
@@ -470,14 +480,79 @@ def main() -> None:
             # if frame is not None:
             #     video_frames.append(frame.copy())
         
+        pred_trajectories = [
+            np.concatenate([episode_pred_positions[agent_id], episode_pred_velocities[agent_id]], axis=1)
+            for agent_id in range(args.num_multi_agents)
+        ]
         # Things I'm recording every episode
         left_tubes_per_episode.append(sum(left_tube))
         delta_r_per_episode.append(delta_r)
         num_crashes_per_episode.append(num_crashes)
         num_bad_crashes_per_episode.append(num_bad_crashes)
-        max_action_diff_per_epsiode.append(max_action_diff)
-        print('radius', radius, 'delta_r', delta_r, 'max_action_diff', max_action_diff)
+        max_action_diff_per_episode.append(max_action_diff)
+        print(f'Episode {episode}: qj={qj:.3f}, rj={radius:.3f}, delta_r={delta_r:.3f}, max_action_diff={max_action_diff:.3f}')
         print('how many left', sum(left_tube), 'num crashes', num_crashes, 'num crashes outside of traj', num_bad_crashes)
+    plots_dir = os.path.join(experiment_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    episodes = np.arange(len(qj_per_episode))
+    plot_paths = {}
+    if len(episodes) > 0:
+        # Plot 1: Radius convergence
+        fig, ax = plt.subplots()
+        ax.plot(episodes, radius_per_episode, label="rj")
+        ax.plot(episodes, qj_per_episode, label="qj")
+        ax.set_title("Radius Convergence")
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Radius")
+        ax.legend()
+        radius_plot_path = os.path.join(plots_dir, "radius_convergence.png")
+        fig.savefig(radius_plot_path, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths["radius_convergence"] = radius_plot_path
+
+        # Plot 2: Empirical safety coverage
+        coverage_pct = (1 - (np.array(left_tubes_per_episode) / args.num_multi_agents)) * 100.0
+        target_pct = (1 - args.alpha) * 100.0
+        fig, ax = plt.subplots()
+        ax.plot(episodes, coverage_pct, label="Coverage")
+        ax.axhline(target_pct, linestyle="--", color="gray", label="Target=1-alpha%")
+        ax.set_title("Empirical Safety Coverage (per Episode)")
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Safety Coverage (%)")
+        ax.legend()
+        coverage_plot_path = os.path.join(plots_dir, "empirical_safety_coverage.png")
+        fig.savefig(coverage_plot_path, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths["coverage"] = coverage_plot_path
+
+        # Plot 3: Safety performance
+        fig, ax = plt.subplots()
+        ax.plot(episodes, num_bad_crashes_per_episode, label="Bad Crashes")
+        ax.set_title("Empirical Safety Performance")
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Number of crashes due to poor coverage")
+        ax.legend()
+        safety_plot_path = os.path.join(plots_dir, "empirical_safety_performance.png")
+        fig.savefig(safety_plot_path, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths["safety_performance"] = safety_plot_path
+
+        # Plot 4: Convergence metrics
+        fig, ax = plt.subplots()
+        ax.plot(episodes, max_action_diff_per_episode, label="max_action_diff")
+        ax.plot(episodes, delta_r_per_episode, label="delta_r")
+        ax.set_title("Convergence")
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Value")
+        ax.legend()
+        convergence_plot_path = os.path.join(plots_dir, "convergence_metrics.png")
+        fig.savefig(convergence_plot_path, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths["convergence"] = convergence_plot_path
+
+    for plot_name, plot_path in plot_paths.items():
+        print(f"[conformal] Saved {plot_name} plot to {plot_path}")
+
     env.close()
 
     if len(video_frames) > 0:
