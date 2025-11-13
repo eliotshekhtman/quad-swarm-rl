@@ -144,8 +144,10 @@ def run_multi_agents(env, obs, num_multi_agents,
 
     return logs
 
-
-
+# record distance to goal position / reward / max reward/mindist over episodes?
+# what happens if you don't update, if you do aggressive adversarial CP: want to highlight that all the steps are important
+# ablations ^^ 
+# full explanation of what each step does currently, what's my plan for next teps, what's their feedback
 
 # ---------------------------------------------------------------------------
 # Main script
@@ -167,6 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode_length", type=int, default=10)
     parser.add_argument("--num_trajectories", type=int, default=200)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
+    parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
     return parser.parse_args()
 
 
@@ -422,11 +425,11 @@ def main() -> None:
             # frame = env.render()
             # if frame is not None:
             #     video_frames.append(frame.copy())
-        
-        pred_trajectories = [
-            np.concatenate([episode_pred_positions[agent_id], episode_pred_velocities[agent_id]], axis=1)
-            for agent_id in range(args.num_multi_agents)
-        ]
+        if args.update_predictions:
+            pred_trajectories = [
+                np.concatenate([episode_pred_positions[agent_id], episode_pred_velocities[agent_id]], axis=1)
+                for agent_id in range(args.num_multi_agents)
+            ]
         # Things I'm recording every episode
         left_tubes_per_episode.append(sum(left_tube))
         delta_r_per_episode.append(delta_r)
