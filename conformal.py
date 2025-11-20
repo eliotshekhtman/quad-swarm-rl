@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
 import matplotlib.pyplot as plt
@@ -44,7 +45,7 @@ from project_utils.restart_utils import (
 DEVICE = torch.device("cpu")
 DELTA_T = 0.015
 MIN_RADIUS = 0
-MAX_RADIUS = 5
+MAX_RADIUS = 8
 
 
 
@@ -59,38 +60,34 @@ def run_multi_agents(env, obs, num_multi_agents,
                     multi_actor, multi_rnn_states, 
                     solo_actor, solo_rnn_states, solo_obs_dim, 
                     pred_trajectories, solo_action_fn,
-                    max_steps=1500, num_runs=1, deterministic=False):
+                    max_steps=1500, num_runs=1, deterministic=False,
+                    num_threads=1):
     '''
     Run the environment for [max_steps] steps, where the multi agents act like normal
     but the solo agent plays a fixed action, and return positions and velocities.
     Does not log the initial state.
     '''
     snapshot = safe_capture_env_snapshot(env)
-    # rng_backup = snapshot_rng_state() # restore_rng_state(rng_backup)
-
     # logs: num_multi_agents x num_runs x [pos or vel] x max_steps x 3
-    logs = {}
-    for i in range(num_multi_agents):
-        logs[i] = []
+    logs = {i: [None] * num_runs for i in range(num_multi_agents)}
+    max_workers = max(1, min(num_threads, num_runs))
     
-    max_dist = 0
-    progress_bar = tqdm(range(num_runs))
-    for run in progress_bar:
-        # Start logging the new run
-        for i in range(num_multi_agents):
-            logs[i].append({ "position" : [], "velocity" : [] })
-        # Make sure I spin up a new env and obs
+    def _run_single_episode(run_idx: int):
+        run_logs = {agent_id: {"position": [], "velocity": []} for agent_id in range(num_multi_agents)}
         env_run = clone_env_from_snapshot(snapshot)
         obs_run = np.array(obs, copy=True, dtype=np.float32)
         done = False
         step_num = 0
         run_multi_rnn_states = multi_rnn_states.clone()
         run_solo_rnn_states = solo_rnn_states.clone()
-        
+        run_max_dist = 0.0
+
+        scenario = env_run.unwrapped.scenario
+        print("Active goals:", scenario.goals)
+        print(env_run.envs[0].sense_noise.bypass, env_run.envs[0].dynamics.thrust_noise_ratio)
+        print(env_run.envs[-1].sense_noise.bypass, env_run.envs[-1].dynamics.thrust_noise_ratio)
+
         while not done and step_num < max_steps:
-            # scenario = env_run.unwrapped.scenario
-            # print("Active goals:", scenario.goals)
-            # print("Goal pairs:", scenario.goal_pairs)
             obs_multi_dict = {OBS_KEY: obs_run[:num_multi_agents]}
             with torch.no_grad():
                 normalized_obs = prepare_and_normalize_obs(multi_actor, obs_multi_dict)
@@ -115,8 +112,7 @@ def run_multi_agents(env, obs, num_multi_agents,
                 action_solo = action_solo.unsqueeze(0)
             action_solo = action_solo.detach().cpu().numpy()[0]
             swarm_state = get_swarm_state(env_run.unwrapped)
-            # We care about where we think they'll be next timestep: that's what
-            # the conformal radius is built on
+            # Conformal radius uses predicted next timestep states
             for agent_id in range(num_multi_agents):
                 swarm_state.positions[agent_id, :] = pred_trajectories[agent_id][step_num][:3]
                 swarm_state.velocities[agent_id, :] = pred_trajectories[agent_id][step_num][3:]
@@ -132,15 +128,27 @@ def run_multi_agents(env, obs, num_multi_agents,
             obs_run = np.array(obs_run, dtype=np.float32)
 
             pos, vel = extract_positions_velocities(env_run.unwrapped)
-            for i in range(num_multi_agents):
-                logs[i][-1]["position"].append(pos[i])
-                logs[i][-1]["velocity"].append(vel[i])
-                # How far is i from where we predicted
-                max_dist = max(max_dist, np.linalg.norm(pos[i] - swarm_state.positions[i, :]))
-            progress_bar.set_postfix_str(f"max dist={max_dist:.3f}")
+            for agent_id in range(num_multi_agents):
+                run_logs[agent_id]["position"].append(pos[agent_id])
+                run_logs[agent_id]["velocity"].append(vel[agent_id])
+                run_max_dist = max(run_max_dist, np.linalg.norm(pos[agent_id] - swarm_state.positions[agent_id, :]))
             done = np.all(dones)
             step_num += 1
         env_run.close()
+        return run_idx, run_logs, run_max_dist
+
+    max_dist = 0.0
+    progress_bar = tqdm(total=num_runs)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_run_single_episode, run_idx) for run_idx in range(num_runs)]
+        for future in as_completed(futures):
+            run_idx, run_logs, run_max_dist = future.result()
+            for agent_id in range(num_multi_agents):
+                logs[agent_id][run_idx] = run_logs[agent_id]
+            max_dist = max(max_dist, run_max_dist)
+            progress_bar.update(1)
+            progress_bar.set_postfix_str(f"max dist={max_dist:.3f}")
+    progress_bar.close()
 
     return logs
 
@@ -170,6 +178,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_trajectories", type=int, default=200)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
     parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
+    parser.add_argument("--num_threads", type=int, default=None, help="Max worker threads for parallel rollouts (default: CPU count).")
     return parser.parse_args()
 
 
@@ -184,6 +193,7 @@ def main() -> None:
 
     torch.set_grad_enabled(False)
     register_swarm_components()
+    max_threads = args.num_threads if args.num_threads and args.num_threads > 0 else (os.cpu_count() or 1)
 
     if os.path.isabs(args.video_name):
         video_dir = os.path.dirname(args.video_name) or "."
@@ -253,7 +263,8 @@ def main() -> None:
                     solo_actor, solo_rnn_states, solo_obs_dim, 
                     pred_trajectories=dummy_pred_traj,
                     solo_action_fn=fall_down,
-                    deterministic=True, max_steps=args.episode_length)
+                    deterministic=True, max_steps=args.episode_length,
+                    num_threads=max_threads)
     temp_env.close()
     pred_trajectories = []
     for agent_id in range(args.num_multi_agents):
@@ -264,7 +275,7 @@ def main() -> None:
     # Collect arm length for default radius and dt for time btn steps
     arm_len = env.quad_arm
     DELTA_T = env.control_dt
-    MIN_RADIUS = arm_len
+    MIN_RADIUS = arm_len * 2
     KAPPA = 0.6 # Tune to desired
     alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
 
@@ -284,6 +295,7 @@ def main() -> None:
     max_action_diff_per_episode = []
     qj_per_episode: List[float] = []
     radius_per_episode: List[float] = []
+    progress_per_episode: List[float] = []
 
     # While the radius hasn't converged
     for episode in range(20):
@@ -304,10 +316,11 @@ def main() -> None:
         logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
                     multi_actor, multi_rnn_states, 
                     solo_actor, solo_rnn_states, solo_obs_dim, 
-                    pred_trajectories, filter,
+                    pred_trajectories, fall_down, # filter,
                     max_steps=args.episode_length, 
                     num_runs=args.num_trajectories, 
-                    deterministic=True)
+                    deterministic=True,
+                    num_threads=max_threads)
         # Set radius depending on how bad our prediction was
         # qj = joint_conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length, args.num_trajectories)
         qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
@@ -327,6 +340,10 @@ def main() -> None:
         max_action_diff = 0
         episode_pred_positions = np.zeros((args.num_multi_agents, args.episode_length, 3), dtype=np.float32)
         episode_pred_velocities = np.zeros_like(episode_pred_positions)
+        per_step_progress = 0.0
+        prev_goal_distance = None
+        prev_goal_vector = None
+        prev_active_goal_idx = None
 
         progress_bar = tqdm(range(args.episode_length))
         for step in progress_bar:
@@ -391,6 +408,36 @@ def main() -> None:
 
             # After a step, check if everyone's in their tubes and cache actual rollouts
             swarm_state = get_swarm_state(env.unwrapped)
+            solo_pos = swarm_state.positions[-1]
+            solo_env = env.unwrapped.envs[-1]
+            solo_goal = getattr(solo_env, "goal", None)
+            scenario = getattr(env.unwrapped, "scenario", None)
+            solo_active_goal_idx = None
+            if scenario is not None:
+                active_indices = getattr(scenario, "active_goal_index", None)
+                if active_indices is not None and len(active_indices) > 0:
+                    solo_active_goal_idx = active_indices[-1]
+            if solo_goal is not None:
+                current_goal_distance = np.linalg.norm(solo_goal - solo_pos)
+                goal_changed = (
+                    prev_goal_vector is None
+                    or not np.allclose(prev_goal_vector, solo_goal)
+                    or (
+                        prev_active_goal_idx is not None
+                        and solo_active_goal_idx is not None
+                        and solo_active_goal_idx != prev_active_goal_idx
+                    )
+                )
+                if goal_changed or prev_goal_distance is None:
+                    prev_goal_distance = current_goal_distance
+                    prev_goal_vector = np.array(solo_goal, copy=True)
+                else:
+                    delta_progress = prev_goal_distance - current_goal_distance
+                    if delta_progress > 0:
+                        per_step_progress += delta_progress
+                    prev_goal_distance = current_goal_distance
+            prev_active_goal_idx = solo_active_goal_idx
+
             for agent_id in range(args.num_multi_agents):
                 env_pos = swarm_state.positions[agent_id] # Actual next pos
                 env_vel = swarm_state.velocities[agent_id]
@@ -436,6 +483,7 @@ def main() -> None:
         num_crashes_per_episode.append(num_crashes)
         num_bad_crashes_per_episode.append(num_bad_crashes)
         max_action_diff_per_episode.append(max_action_diff)
+        progress_per_episode.append(per_step_progress)
         print(f'Episode {episode}: qj={qj:.3f}, rj={radius:.3f}, delta_r={delta_r:.3f}, max_action_diff={max_action_diff:.3f}')
         print('how many left', sum(left_tube), 'num crashes', num_crashes, 'num crashes outside of traj', num_bad_crashes)
     plots_dir = os.path.join(experiment_dir, "plots")
@@ -495,6 +543,18 @@ def main() -> None:
         fig.savefig(convergence_plot_path, bbox_inches="tight")
         plt.close(fig)
         plot_paths["convergence"] = convergence_plot_path
+
+        # Plot 5: Aggregate per-step progress
+        fig, ax = plt.subplots()
+        ax.plot(episodes, progress_per_episode, label="aggregate_progress")
+        ax.set_title("Aggregate Per-step Progress (Solo)")
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Progress (meters)")
+        ax.legend()
+        progress_plot_path = os.path.join(plots_dir, "aggregate_progress.png")
+        fig.savefig(progress_plot_path, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths["aggregate_progress"] = progress_plot_path
 
     for plot_name, plot_path in plot_paths.items():
         print(f"[conformal] Saved {plot_name} plot to {plot_path}")
