@@ -46,7 +46,7 @@ def joint_conformal_radii(logs, num_multi_agents, pred_trajectories, alpha, epis
     conformal_radius = scores[int(np.ceil(len(scores) * (1 - alpha)) - 1)]
     return conformal_radius
 
-def explicit_radius_update(prev_radius, conf_radius, kappa):
+def explicit_radius_update(prev_radius, conf_radius, kappa, MIN_RADIUS, MAX_RADIUS):
     if conf_radius <= prev_radius:
         radius = (conf_radius + kappa * prev_radius) / (1 + kappa)
     else:

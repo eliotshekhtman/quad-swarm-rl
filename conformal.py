@@ -68,12 +68,12 @@ def run_multi_agents(env, obs, num_multi_agents,
     Does not log the initial state.
     '''
     snapshot = safe_capture_env_snapshot(env)
-    # logs: num_multi_agents x num_runs x [pos or vel] x max_steps x 3
-    logs = {i: [None] * num_runs for i in range(num_multi_agents)}
+    # logs: num_multi_agents + 1 x num_runs x [pos or vel] x max_steps x 3
+    logs = {i: [None] * num_runs for i in range(num_multi_agents + 1)}
     max_workers = max(1, min(num_threads, num_runs))
     
     def _run_single_episode(run_idx: int):
-        run_logs = {agent_id: {"position": [], "velocity": []} for agent_id in range(num_multi_agents)}
+        run_logs = {agent_id: {"position": [], "velocity": [], "goal_dist": [], "goal_swap": []} for agent_id in range(num_multi_agents + 1)}
         env_run = clone_env_from_snapshot(snapshot)
         obs_run = np.array(obs, copy=True, dtype=np.float32)
         done = False
@@ -83,9 +83,14 @@ def run_multi_agents(env, obs, num_multi_agents,
         run_max_dist = 0.0
 
         scenario = env_run.unwrapped.scenario
-        print("Active goals:", scenario.goals)
-        print(env_run.envs[0].sense_noise.bypass, env_run.envs[0].dynamics.thrust_noise_ratio)
-        print(env_run.envs[-1].sense_noise.bypass, env_run.envs[-1].dynamics.thrust_noise_ratio)
+        goals = []
+        for agent_id in range(num_multi_agents + 1):
+            active = scenario.active_goal_index[agent_id]
+            target = scenario.goal_pairs[agent_id, active]
+            goals.append(target)
+        print("Active starting goals:", goals)
+        # print(env_run.envs[0].sense_noise.bypass, env_run.envs[0].dynamics.thrust_noise_ratio)
+        # print(env_run.envs[-1].sense_noise.bypass, env_run.envs[-1].dynamics.thrust_noise_ratio)
 
         while not done and step_num < max_steps:
             obs_multi_dict = {OBS_KEY: obs_run[:num_multi_agents]}
@@ -94,7 +99,7 @@ def run_multi_agents(env, obs, num_multi_agents,
                 policy_output = multi_actor(normalized_obs, run_multi_rnn_states)
             actions_multi = policy_output["actions"]
             run_multi_rnn_states = policy_output["new_rnn_states"]
-            if deterministic:
+            if deterministic or run_idx == 0: # First run always deterministic
                 actions_multi = argmax_actions(multi_actor.action_distribution())
             if actions_multi.dim() == 1:
                 actions_multi = actions_multi.unsqueeze(-1)
@@ -128,9 +133,18 @@ def run_multi_agents(env, obs, num_multi_agents,
             obs_run = np.array(obs_run, dtype=np.float32)
 
             pos, vel = extract_positions_velocities(env_run.unwrapped)
-            for agent_id in range(num_multi_agents):
+            for agent_id in range(num_multi_agents + 1):
+                active = scenario.active_goal_index[agent_id]
+                target = scenario.goal_pairs[agent_id, active]
+                dist = np.linalg.norm(pos[agent_id] - target)
                 run_logs[agent_id]["position"].append(pos[agent_id])
                 run_logs[agent_id]["velocity"].append(vel[agent_id])
+                run_logs[agent_id]["goal_dist"].append(dist)
+                if not np.allclose(target, goals[agent_id]):
+                    run_logs[agent_id]["goal_swap"].append(True)
+                    goals[agent_id] = target 
+                else:
+                    run_logs[agent_id]["goal_swap"].append(False)
                 run_max_dist = max(run_max_dist, np.linalg.norm(pos[agent_id] - swarm_state.positions[agent_id, :]))
             done = np.all(dones)
             step_num += 1
@@ -143,7 +157,7 @@ def run_multi_agents(env, obs, num_multi_agents,
         futures = [executor.submit(_run_single_episode, run_idx) for run_idx in range(num_runs)]
         for future in as_completed(futures):
             run_idx, run_logs, run_max_dist = future.result()
-            for agent_id in range(num_multi_agents):
+            for agent_id in range(num_multi_agents + 1):
                 logs[agent_id][run_idx] = run_logs[agent_id]
             max_dist = max(max_dist, run_max_dist)
             progress_bar.update(1)
@@ -176,9 +190,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--episode_length", type=int, default=10)
     parser.add_argument("--num_trajectories", type=int, default=200)
+    parser.add_argument("--num_eval_trajs", type=int, default=100)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
     parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
     parser.add_argument("--num_threads", type=int, default=None, help="Max worker threads for parallel rollouts (default: CPU count).")
+    parser.add_argument("--num_episodes", type=int, default=10)
     return parser.parse_args()
 
 
@@ -211,6 +227,7 @@ def main() -> None:
     if args.num_multi_agents < 0:
         args.num_multi_agents = cfg_multi.quads_num_agents
 
+    quads_collision_hitbox_radius = 2.5
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
@@ -220,7 +237,7 @@ def main() -> None:
         f"--quads_neighbor_visible_num={cfg_multi.quads_neighbor_visible_num}",
         f"--quads_neighbor_obs_type={cfg_multi.quads_neighbor_obs_type}",
         "--quads_collision_reward=8.0",
-        "--quads_collision_hitbox_radius=2.5",
+        f"--quads_collision_hitbox_radius={quads_collision_hitbox_radius}",
         "--quads_collision_falloff_radius=5.0",
         "--quads_collision_smooth_max_penalty=12.0",
         "--quads_use_numba=False",
@@ -275,36 +292,28 @@ def main() -> None:
     # Collect arm length for default radius and dt for time btn steps
     arm_len = env.quad_arm
     DELTA_T = env.control_dt
-    MIN_RADIUS = arm_len * 2
+    MIN_RADIUS = arm_len * quads_collision_hitbox_radius
     KAPPA = 0.6 # Tune to desired
     alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
 
     # Init r0 to some large value that ought to be safe
-    delta_r = 2 # Difference between this radius and last radius
     radius = MAX_RADIUS
     radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
     filter = make_cbf_filter(radii)
 
     # Running list: every entry is how many env agents left their tubes that episode
-    left_tubes_per_episode = []
-    delta_r_per_episode = []
-    num_crashes_per_episode = [] # All crashes: including when CBF fails
-    num_bad_crashes_per_episode = [] # Crash outside of a tube
-    prev_actions = [np.array([0.0, 0.0, 0.0, 0.0])] * args.episode_length
-    max_action_diff = 4 # Instantiating to a "big" number
-    max_action_diff_per_episode = []
-    qj_per_episode: List[float] = []
-    radius_per_episode: List[float] = []
-    progress_per_episode: List[float] = []
+    tube_coverage_per_episode = []
+    crashes_per_episode = [] # All crashes: including when CBF fails
+    bad_crashes_per_episode = [] # Crash outside of a tube
+    qj_per_episode = []
+    radius_per_episode = []
+    cumulative_reward_per_episode = []
 
     # While the radius hasn't converged
-    for episode in range(20):
+    for episode in range(args.num_episodes):
         print('EPISODE', episode)
-        # Whether an agent left the tube this episode
-        left_tube = [False] * args.num_multi_agents
-        num_crashes = 0
-        num_bad_crashes = 0
 
+        ##### SETTING THE RADIUS FOR THIS EPISODE #####
         # Find qj using old pi_j
         # Make sure the environment is reset for rollout collection
         multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
@@ -316,259 +325,118 @@ def main() -> None:
         logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
                     multi_actor, multi_rnn_states, 
                     solo_actor, solo_rnn_states, solo_obs_dim, 
-                    pred_trajectories, fall_down, # filter,
+                    pred_trajectories, filter,
                     max_steps=args.episode_length, 
                     num_runs=args.num_trajectories, 
-                    deterministic=True,
                     num_threads=max_threads)
         # Set radius depending on how bad our prediction was
-        # qj = joint_conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length, args.num_trajectories)
         qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
         qj = np.max(qj)
-        new_radius = explicit_radius_update(radius, qj, KAPPA)
+        new_radius = explicit_radius_update(radius, qj, KAPPA, MIN_RADIUS, MAX_RADIUS)
         delta_r = np.abs(new_radius - radius) # How different is it this time
         print('radius', radius, 'qj', qj, 'new radius', new_radius)
         radius = new_radius
         radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-        qj_per_episode.append(qj)
-        radius_per_episode.append(radius)
         filter = make_cbf_filter(radii) # pi_{j+1}
         temp_env.close()
 
-        # Doublechecking that everything's reset
+        ##### COLLECTING THE DATA FOR THIS EPISODE #####
+        # Do a full reset before collecting rollouts
+        multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
+        solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
         obs, stored_states = deterministic_reset(env, args.seed, stored_states)
-        max_action_diff = 0
-        episode_pred_positions = np.zeros((args.num_multi_agents, args.episode_length, 3), dtype=np.float32)
-        episode_pred_velocities = np.zeros_like(episode_pred_positions)
-        per_step_progress = 0.0
-        prev_goal_distance = None
-        prev_goal_vector = None
-        prev_active_goal_idx = None
+        snapshot = safe_capture_env_snapshot(env)
+        temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
+        # Collect actual rollouts to compare against (with current radius)
+        logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
+                    multi_actor, multi_rnn_states, 
+                    solo_actor, solo_rnn_states, solo_obs_dim, 
+                    pred_trajectories, filter,
+                    max_steps=args.episode_length, 
+                    num_runs=args.num_eval_trajs, 
+                    num_threads=max_threads)
+        temp_env.close()
 
-        progress_bar = tqdm(range(args.episode_length))
-        for step in progress_bar:
-            # scenario = env.unwrapped.scenario
-            # print("Active goals:", scenario.goals)
-            # print("Goal pairs:", scenario.goal_pairs)
-            # Actually run the normal execution
-            obs_np = np.asarray(obs)
-
-            obs_multi_dict = {OBS_KEY: obs_np[:args.num_multi_agents]}
-            with torch.no_grad():
-                normalized_multi = prepare_and_normalize_obs(multi_actor, obs_multi_dict)
-                policy_multi = multi_actor(normalized_multi, multi_rnn_states)
-            actions_multi = policy_multi["actions"]
-            multi_rnn_states = policy_multi["new_rnn_states"]
-            # Running the actual execution as deterministic
-            actions_multi = argmax_actions(multi_actor.action_distribution())
-            if actions_multi.dim() == 1:
-                actions_multi = actions_multi.unsqueeze(-1)
-            actions_multi = actions_multi.detach().cpu().numpy()
-
-            obs_solo_self = obs_np[-1, :solo_obs_dim]
-            obs_solo_dict = {OBS_KEY: obs_solo_self[None, :]}
-            with torch.no_grad():
-                normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
-                policy_solo = solo_actor(normalized_solo, solo_rnn_states)
-            action_solo = policy_solo["actions"]
-            solo_rnn_states = policy_solo["new_rnn_states"]
-            # Running the actual execution as deterministic
-            action_solo = argmax_actions(solo_actor.action_distribution())
-            if action_solo.dim() == 1:
-                action_solo = action_solo.unsqueeze(0)
-            action_solo = action_solo.detach().cpu().numpy()[0]
-
-            swarm_state = get_swarm_state(env.unwrapped)
-            # We care about where we think they'll be next timestep: that's what
-            # the conformal radius is built on
-            for agent_id in range(args.num_multi_agents):
-                swarm_state.positions[agent_id, :] = pred_trajectories[agent_id][step][:3]
-                swarm_state.velocities[agent_id, :] = pred_trajectories[agent_id][step][3:]
-            # Apply CBF to the ego agent based on radius determined earlier
-            action_solo = filter(
-                base_action=action_solo,
-                env_state=env.unwrapped,
-                swarm_state=swarm_state
-            )
-
-            # Biggest change in action across timesteps in this episode
-            max_action_diff = max(max_action_diff, np.linalg.norm(action_solo - prev_actions[step]))
-            prev_actions[step] = action_solo # Next episode, comparing against this action
-
-            # Checking how far I am from the nearest env quad
-            # closest_dist = 100 # arbitrarily big
-            # solo_pos = swarm_state.positions[-1]
-            # for env_pos in swarm_state.positions[:-1]:
-            #     dist = np.linalg.norm(solo_pos - env_pos)
-            #     closest_dist = min(dist, closest_dist)
-            # progress_bar.set_postfix_str(f"dist>={closest_dist:.2f}")
-
-            actions = np.vstack([actions_multi, action_solo[None, :]])
-            obs, rewards, terminated, truncated, infos = env.step(actions)
-
-            # After a step, check if everyone's in their tubes and cache actual rollouts
-            swarm_state = get_swarm_state(env.unwrapped)
-            solo_pos = swarm_state.positions[-1]
-            solo_env = env.unwrapped.envs[-1]
-            solo_goal = getattr(solo_env, "goal", None)
-            scenario = getattr(env.unwrapped, "scenario", None)
-            solo_active_goal_idx = None
-            if scenario is not None:
-                active_indices = getattr(scenario, "active_goal_index", None)
-                if active_indices is not None and len(active_indices) > 0:
-                    solo_active_goal_idx = active_indices[-1]
-            if solo_goal is not None:
-                current_goal_distance = np.linalg.norm(solo_goal - solo_pos)
-                goal_changed = (
-                    prev_goal_vector is None
-                    or not np.allclose(prev_goal_vector, solo_goal)
-                    or (
-                        prev_active_goal_idx is not None
-                        and solo_active_goal_idx is not None
-                        and solo_active_goal_idx != prev_active_goal_idx
-                    )
-                )
-                if goal_changed or prev_goal_distance is None:
-                    prev_goal_distance = current_goal_distance
-                    prev_goal_vector = np.array(solo_goal, copy=True)
-                else:
-                    delta_progress = prev_goal_distance - current_goal_distance
-                    if delta_progress > 0:
-                        per_step_progress += delta_progress
-                    prev_goal_distance = current_goal_distance
-            prev_active_goal_idx = solo_active_goal_idx
-
-            for agent_id in range(args.num_multi_agents):
-                env_pos = swarm_state.positions[agent_id] # Actual next pos
-                env_vel = swarm_state.velocities[agent_id]
-                episode_pred_positions[agent_id, step, :] = env_pos
-                episode_pred_velocities[agent_id, step, :] = env_vel
-                pred_pos = pred_trajectories[agent_id][step][:3] # Predicted next pos
-                distance = np.linalg.norm(env_pos - pred_pos)
-                if distance > radius:
-                    left_tube[agent_id] = True
-            progress_bar.set_postfix_str(f"left={sum(left_tube)}")
-
-            solo_info_rewards = infos[-1].get("rewards", {})
-            if solo_info_rewards.get("rewraw_quadcol", 0.0) < 0.0:
-                num_crashes += 1 
-                # Want to check if the agent we crashed into was in their tube
-                solo_pos = swarm_state.positions[-1]
-                closest_dist = 100
-                closest_oot = False
+        ##### DIGEST DATA FOR THIS EPISODE #####
+        cumulative_reward_per_run = []
+        tube_coverage_per_run = []
+        num_crashes_per_run = []
+        num_bad_crashes_per_run = []
+        for run_id in range(args.num_eval_trajs):
+            num_nonswap_steps = 0
+            cumulative_reward = 0
+            in_tube = [True] * args.num_multi_agents
+            num_crashes = 0
+            num_bad_crashes = 0
+            # Skip first step so we can do comparisons with the earlier step
+            # Also no chance of crashes or leaving tube in the first step
+            for step in range(1, args.episode_length):
+                # If, at this step, the goal didn't change wrt last step
+                if not logs[-1][run_id]['goal_swap'][step]:
+                    num_nonswap_steps += 1
+                    # Should have a smaller distance this step than last step if same goal
+                    delta_distance = logs[-1][run_id]['goal_dist'][step - 1] - logs[-1][run_id]['goal_dist'][step]
+                    cumulative_reward += delta_distance
+                solo_loc = logs[-1][run_id]['position'][step]
                 for agent_id in range(args.num_multi_agents):
-                    env_pos = swarm_state.positions[agent_id]
-                    dist = np.linalg.norm(env_pos - solo_pos)
-                    if dist <= closest_dist:
-                        closest_dist = dist 
-                        closest_oot = left_tube[agent_id]
-                if closest_oot: # Register if closest env quad was out of tube
-                    num_bad_crashes += 1
+                    agent_loc = logs[agent_id][run_id]['position'][step]
+                    pred_loc = pred_trajectories[agent_id][step][:3]
+                    # If outside of tube, set in_tube to False: can't become True
+                    if np.linalg.norm(agent_loc - pred_loc) > radius:
+                        in_tube[agent_id] = False
+                    # Record a crash if below the minimum radius
+                    if np.linalg.norm(solo_loc - agent_loc) <= MIN_RADIUS:
+                        num_crashes += 1
+                        # If crashed and that agent wasn't in their tube, presumably avoidable
+                        if not in_tube[agent_id]:
+                            num_bad_crashes += 1
+            # Don't want to be penalized for the number of times the goal swaps since that's good
+            cumulative_reward_per_run.append(cumulative_reward / num_nonswap_steps * (args.episode_length - 1))
+            # Make agnostic to the number of multi agents
+            tube_coverage_per_run.append(sum(in_tube) / args.num_multi_agents)
+            num_crashes_per_run.append(num_crashes)
+            num_bad_crashes_per_run.append(num_bad_crashes)
+        # Take average over evaluation runs
+        cumulative_reward_per_episode.append(sum(cumulative_reward_per_run) / args.num_eval_trajs)
+        tube_coverage_per_episode.append(sum(tube_coverage_per_run) / args.num_eval_trajs)
+        crashes_per_episode.append(sum(num_crashes_per_run) / args.num_eval_trajs)
+        bad_crashes_per_episode.append(sum(num_bad_crashes_per_run) / args.num_eval_trajs)
+        # Radius updates don't change across eval runs so just append normally
+        qj_per_episode.append(qj)
+        radius_per_episode.append(radius)
 
-            terminated = np.asarray(terminated)
-            truncated = np.asarray(truncated)
-            dones = np.logical_or(terminated, truncated)
+        ##### SET UP PRED_TRAJECTORIES FOR NEXT EPISODE #####
+        for step in range(args.episode_length):
+            for agent_id in range(args.num_multi_agents):
+                pred_trajectories[agent_id][step][:3] = logs[agent_id][0]['position'][step]
+                pred_trajectories[agent_id][step][3:] = logs[agent_id][0]['velocity'][step]
 
-            # frame = env.render()
-            # if frame is not None:
-            #     video_frames.append(frame.copy())
-        if args.update_predictions:
-            pred_trajectories = [
-                np.concatenate([episode_pred_positions[agent_id], episode_pred_velocities[agent_id]], axis=1)
-                for agent_id in range(args.num_multi_agents)
-            ]
-        # Things I'm recording every episode
-        left_tubes_per_episode.append(sum(left_tube))
-        delta_r_per_episode.append(delta_r)
-        num_crashes_per_episode.append(num_crashes)
-        num_bad_crashes_per_episode.append(num_bad_crashes)
-        max_action_diff_per_episode.append(max_action_diff)
-        progress_per_episode.append(per_step_progress)
-        print(f'Episode {episode}: qj={qj:.3f}, rj={radius:.3f}, delta_r={delta_r:.3f}, max_action_diff={max_action_diff:.3f}')
-        print('how many left', sum(left_tube), 'num crashes', num_crashes, 'num crashes outside of traj', num_bad_crashes)
-    plots_dir = os.path.join(experiment_dir, "plots")
-    os.makedirs(plots_dir, exist_ok=True)
+    # Persist per-episode metrics for offline plotting
     episodes = np.arange(len(qj_per_episode))
-    plot_paths = {}
-    if len(episodes) > 0:
-        # Plot 1: Radius convergence
-        fig, ax = plt.subplots()
-        ax.plot(episodes, radius_per_episode, label="rj")
-        ax.plot(episodes, qj_per_episode, label="qj")
-        ax.set_title("Radius Convergence")
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Radius")
-        ax.legend()
-        radius_plot_path = os.path.join(plots_dir, "radius_convergence.png")
-        fig.savefig(radius_plot_path, bbox_inches="tight")
-        plt.close(fig)
-        plot_paths["radius_convergence"] = radius_plot_path
-
-        # Plot 2: Empirical safety coverage
-        coverage_pct = (1 - (np.array(left_tubes_per_episode) / args.num_multi_agents)) * 100.0
-        target_pct = (1 - args.alpha) * 100.0
-        fig, ax = plt.subplots()
-        ax.plot(episodes, coverage_pct, label="Coverage")
-        ax.axhline(target_pct, linestyle="--", color="gray", label="Target=1-alpha%")
-        ax.set_title("Empirical Safety Coverage (per Episode)")
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Safety Coverage (%)")
-        ax.legend()
-        coverage_plot_path = os.path.join(plots_dir, "empirical_safety_coverage.png")
-        fig.savefig(coverage_plot_path, bbox_inches="tight")
-        plt.close(fig)
-        plot_paths["coverage"] = coverage_plot_path
-
-        # Plot 3: Safety performance
-        fig, ax = plt.subplots()
-        ax.plot(episodes, num_bad_crashes_per_episode, label="Bad Crashes")
-        ax.set_title("Empirical Safety Performance")
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Number of crashes due to poor coverage")
-        ax.legend()
-        safety_plot_path = os.path.join(plots_dir, "empirical_safety_performance.png")
-        fig.savefig(safety_plot_path, bbox_inches="tight")
-        plt.close(fig)
-        plot_paths["safety_performance"] = safety_plot_path
-
-        # Plot 4: Convergence metrics
-        fig, ax = plt.subplots()
-        ax.plot(episodes, max_action_diff_per_episode, label="max_action_diff")
-        ax.plot(episodes, delta_r_per_episode, label="delta_r")
-        ax.set_title("Convergence")
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Value")
-        ax.legend()
-        convergence_plot_path = os.path.join(plots_dir, "convergence_metrics.png")
-        fig.savefig(convergence_plot_path, bbox_inches="tight")
-        plt.close(fig)
-        plot_paths["convergence"] = convergence_plot_path
-
-        # Plot 5: Aggregate per-step progress
-        fig, ax = plt.subplots()
-        ax.plot(episodes, progress_per_episode, label="aggregate_progress")
-        ax.set_title("Aggregate Per-step Progress (Solo)")
-        ax.set_xlabel("Episode")
-        ax.set_ylabel("Progress (meters)")
-        ax.legend()
-        progress_plot_path = os.path.join(plots_dir, "aggregate_progress.png")
-        fig.savefig(progress_plot_path, bbox_inches="tight")
-        plt.close(fig)
-        plot_paths["aggregate_progress"] = progress_plot_path
-
-    for plot_name, plot_path in plot_paths.items():
-        print(f"[conformal] Saved {plot_name} plot to {plot_path}")
-
+    metrics_path = os.path.join(experiment_dir, "conformal_metrics.npz")
+    np.savez(
+        metrics_path,
+        episodes=episodes,
+        qj_per_episode=np.asarray(qj_per_episode, dtype=np.float32),
+        radius_per_episode=np.asarray(radius_per_episode, dtype=np.float32),
+        tube_coverage_per_episode=np.asarray(tube_coverage_per_episode, dtype=np.float32),
+        crashes_per_episode=np.asarray(crashes_per_episode, dtype=np.float32),
+        bad_crashes_per_episode=np.asarray(bad_crashes_per_episode, dtype=np.float32),
+        cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
+        alpha=args.alpha,
+        delta=args.delta,
+    )
+    print(f"[conformal] Saved per-episode metrics to {metrics_path}")
     env.close()
 
     if len(video_frames) > 0:
         video_cfg = AttrDict(video_name=video_file)
         generate_replay_video(video_dir, video_frames, args.video_fps, video_cfg)
         final_path = os.path.abspath(os.path.join(video_dir, video_file))
-        print(f"[conformal_enjoy] Video saved to {final_path}")
+        print(f"[conformal] Video saved to {final_path}")
     
-    print('Number of total crashes:', sum(num_crashes_per_episode))
-    print('Number of total crashes outside of conformal tubes:', sum(num_bad_crashes_per_episode))
+    print('Number of total crashes:', sum(crashes_per_episode))
+    print('Number of total crashes outside of conformal tubes:', sum(bad_crashes_per_episode))
 
     
 
