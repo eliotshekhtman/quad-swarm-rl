@@ -11,6 +11,7 @@ Adjust new radius, but use a kappa that we set.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
@@ -189,7 +190,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delta", type=float, default=0.1, help="Desired probability of a bad draw")
     parser.add_argument("--video_name", default="conformal_replay.mp4")
     parser.add_argument("--video_fps", type=int, default=30)
-    parser.add_argument("--episode_length", type=int, default=10)
+    parser.add_argument("--episode_length", type=int, default=1500)
     parser.add_argument("--num_trajectories", type=int, default=200)
     parser.add_argument("--num_eval_trajs", type=int, default=100)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
@@ -223,6 +224,9 @@ def main() -> None:
     video_frames: List[np.ndarray] = []
 
     experiment_dir = ensure_experiment_dir(args.train_dir, args.experiment_name)
+    args_path = os.path.join(experiment_dir, "conformal_args.json")
+    with open(args_path, "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2, sort_keys=True)
 
     # Load multi config early since it has some useful info
     cfg_multi = load_cfg(args.multi_train_dir, args.multi_experiment)
@@ -311,6 +315,7 @@ def main() -> None:
     qj_per_episode = []
     radius_per_episode = []
     cumulative_reward_per_episode = []
+    agent_locs_per_episode = [] # Save positions during one run per episode for plotting
 
     # While the radius hasn't converged
     for episode in range(args.num_episodes):
@@ -382,7 +387,10 @@ def main() -> None:
                     num_nonswap_steps += 1
                     # Should have a smaller distance this step than last step if same goal
                     delta_distance = logs[solo_agent_id][run_id]['goal_dist'][step - 1] - logs[solo_agent_id][run_id]['goal_dist'][step]
-                    cumulative_reward += delta_distance
+                    # if run_id == 0:
+                    #     print(logs[solo_agent_id][run_id]['goal_dist'][step - 1], logs[solo_agent_id][run_id]['goal_dist'][step])
+                    if delta_distance > 0:
+                        cumulative_reward += delta_distance
                 solo_loc = logs[solo_agent_id][run_id]['position'][step]
                 for agent_id in range(args.num_multi_agents):
                     agent_loc = logs[agent_id][run_id]['position'][step]
@@ -414,11 +422,14 @@ def main() -> None:
         radius_per_episode.append(radius)
 
         ##### SET UP PRED_TRAJECTORIES FOR NEXT EPISODE #####
-        if args.update_predictions:
+        agent_locs = []
+        for agent_id in range(args.num_multi_agents + 1):
             for step in range(args.episode_length):
-                for agent_id in range(args.num_multi_agents):
+                if args.update_predictions and agent_id < solo_agent_id:
                     pred_trajectories[agent_id][step][:3] = logs[agent_id][0]['position'][step]
                     pred_trajectories[agent_id][step][3:] = logs[agent_id][0]['velocity'][step]
+            agent_locs.append(logs[agent_id][0]['position'])
+        agent_locs_per_episode.append(agent_locs) # episodes x agents x steps x 3
         print(f'Cum rew: {cumulative_reward_per_episode[-1]} Tube cov: {tube_coverage_per_episode[-1]} Crashes: {crashes_per_episode[-1]} Bad crashes: {bad_crashes_per_episode[-1]}')
 
     # Persist per-episode metrics for offline plotting
@@ -433,6 +444,7 @@ def main() -> None:
         bad_crashes_per_episode=np.asarray(bad_crashes_per_episode, dtype=np.float32),
         safety_per_episode=np.asarray(safety_per_episode, dtype=np.float32),
         cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
+        agent_locs_per_episode=np.asarray(agent_locs_per_episode, dtype=np.float32),
         alpha=args.alpha,
         delta=args.delta,
         bar_alpha=alpha,
