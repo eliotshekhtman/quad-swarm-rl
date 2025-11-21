@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
+import warnings
 import cvxpy as cp
 import numpy as np
 
@@ -271,14 +272,16 @@ def apply_cbf_filter(
 
     u_min = np.zeros(4, dtype=np.float64)
     u_max = np.asarray(dynamics.thrust_max, dtype=np.float64)
-    outputs = _solve_cbf_qp(
-        u_ref_thrust=u_ref_thrust,
-        swarm_state=swarm_state,
-        radii=radii,
-        mass=float(dynamics.mass),
-        thrust_bounds=(u_min, u_max),
-        debug=debug
-    )
+    # Hopefully stop the "Solution may be innacurate" warnings since they're unactionable
+    with warnings.catch_warnings(action='ignore'):
+        outputs = _solve_cbf_qp(
+            u_ref_thrust=u_ref_thrust,
+            swarm_state=swarm_state,
+            radii=radii,
+            mass=float(dynamics.mass),
+            thrust_bounds=(u_min, u_max),
+            debug=debug
+        )
     if debug:
         safe_thrust, h_list, hd_list, hdd_list = outputs
     else:

@@ -88,7 +88,7 @@ def run_multi_agents(env, obs, num_multi_agents,
             active = scenario.active_goal_index[agent_id]
             target = scenario.goal_pairs[agent_id, active]
             goals.append(target)
-        print("Active starting goals:", goals)
+        # print("Active starting goals:", goals)
         # print(env_run.envs[0].sense_noise.bypass, env_run.envs[0].dynamics.thrust_noise_ratio)
         # print(env_run.envs[-1].sense_noise.bypass, env_run.envs[-1].dynamics.thrust_noise_ratio)
 
@@ -145,7 +145,8 @@ def run_multi_agents(env, obs, num_multi_agents,
                     goals[agent_id] = target 
                 else:
                     run_logs[agent_id]["goal_swap"].append(False)
-                run_max_dist = max(run_max_dist, np.linalg.norm(pos[agent_id] - swarm_state.positions[agent_id, :]))
+                if agent_id < num_multi_agents: # Don't care how far solo quad deviates
+                    run_max_dist = max(run_max_dist, np.linalg.norm(pos[agent_id] - swarm_state.positions[agent_id, :]))
             done = np.all(dones)
             step_num += 1
         env_run.close()
@@ -195,6 +196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
     parser.add_argument("--num_threads", type=int, default=None, help="Max worker threads for parallel rollouts (default: CPU count).")
     parser.add_argument("--num_episodes", type=int, default=10)
+    parser.add_argument("--deterministic", action="store_true")
     return parser.parse_args()
 
 
@@ -292,7 +294,7 @@ def main() -> None:
     # Collect arm length for default radius and dt for time btn steps
     arm_len = env.quad_arm
     DELTA_T = env.control_dt
-    MIN_RADIUS = arm_len * quads_collision_hitbox_radius
+    MIN_RADIUS = arm_len * quads_collision_hitbox_radius # Internally used for detecting crashes
     KAPPA = 0.6 # Tune to desired
     alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
 
@@ -303,6 +305,7 @@ def main() -> None:
 
     # Running list: every entry is how many env agents left their tubes that episode
     tube_coverage_per_episode = []
+    safety_per_episode = []
     crashes_per_episode = [] # All crashes: including when CBF fails
     bad_crashes_per_episode = [] # Crash outside of a tube
     qj_per_episode = []
@@ -328,6 +331,7 @@ def main() -> None:
                     pred_trajectories, filter,
                     max_steps=args.episode_length, 
                     num_runs=args.num_trajectories, 
+                    deterministic=args.deterministic,
                     num_threads=max_threads)
         # Set radius depending on how bad our prediction was
         qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
@@ -354,6 +358,7 @@ def main() -> None:
                     pred_trajectories, filter,
                     max_steps=args.episode_length, 
                     num_runs=args.num_eval_trajs, 
+                    deterministic=args.deterministic,
                     num_threads=max_threads)
         temp_env.close()
 
@@ -362,6 +367,7 @@ def main() -> None:
         tube_coverage_per_run = []
         num_crashes_per_run = []
         num_bad_crashes_per_run = []
+        solo_agent_id = args.num_multi_agents
         for run_id in range(args.num_eval_trajs):
             num_nonswap_steps = 0
             cumulative_reward = 0
@@ -372,12 +378,12 @@ def main() -> None:
             # Also no chance of crashes or leaving tube in the first step
             for step in range(1, args.episode_length):
                 # If, at this step, the goal didn't change wrt last step
-                if not logs[-1][run_id]['goal_swap'][step]:
+                if not logs[solo_agent_id][run_id]['goal_swap'][step]:
                     num_nonswap_steps += 1
                     # Should have a smaller distance this step than last step if same goal
-                    delta_distance = logs[-1][run_id]['goal_dist'][step - 1] - logs[-1][run_id]['goal_dist'][step]
+                    delta_distance = logs[solo_agent_id][run_id]['goal_dist'][step - 1] - logs[solo_agent_id][run_id]['goal_dist'][step]
                     cumulative_reward += delta_distance
-                solo_loc = logs[-1][run_id]['position'][step]
+                solo_loc = logs[solo_agent_id][run_id]['position'][step]
                 for agent_id in range(args.num_multi_agents):
                     agent_loc = logs[agent_id][run_id]['position'][step]
                     pred_loc = pred_trajectories[agent_id][step][:3]
@@ -401,30 +407,35 @@ def main() -> None:
         tube_coverage_per_episode.append(sum(tube_coverage_per_run) / args.num_eval_trajs)
         crashes_per_episode.append(sum(num_crashes_per_run) / args.num_eval_trajs)
         bad_crashes_per_episode.append(sum(num_bad_crashes_per_run) / args.num_eval_trajs)
+        safety = 1 - sum([crashes > 0 for crashes in num_bad_crashes_per_run]) / args.num_eval_trajs
+        safety_per_episode.append(safety)
         # Radius updates don't change across eval runs so just append normally
         qj_per_episode.append(qj)
         radius_per_episode.append(radius)
 
         ##### SET UP PRED_TRAJECTORIES FOR NEXT EPISODE #####
-        for step in range(args.episode_length):
-            for agent_id in range(args.num_multi_agents):
-                pred_trajectories[agent_id][step][:3] = logs[agent_id][0]['position'][step]
-                pred_trajectories[agent_id][step][3:] = logs[agent_id][0]['velocity'][step]
+        if args.update_predictions:
+            for step in range(args.episode_length):
+                for agent_id in range(args.num_multi_agents):
+                    pred_trajectories[agent_id][step][:3] = logs[agent_id][0]['position'][step]
+                    pred_trajectories[agent_id][step][3:] = logs[agent_id][0]['velocity'][step]
+        print(f'Cum rew: {cumulative_reward_per_episode[-1]} Tube cov: {tube_coverage_per_episode[-1]} Crashes: {crashes_per_episode[-1]} Bad crashes: {bad_crashes_per_episode[-1]}')
 
     # Persist per-episode metrics for offline plotting
-    episodes = np.arange(len(qj_per_episode))
     metrics_path = os.path.join(experiment_dir, "conformal_metrics.npz")
     np.savez(
         metrics_path,
-        episodes=episodes,
+        episodes=np.arange(args.num_episodes),
         qj_per_episode=np.asarray(qj_per_episode, dtype=np.float32),
         radius_per_episode=np.asarray(radius_per_episode, dtype=np.float32),
         tube_coverage_per_episode=np.asarray(tube_coverage_per_episode, dtype=np.float32),
         crashes_per_episode=np.asarray(crashes_per_episode, dtype=np.float32),
         bad_crashes_per_episode=np.asarray(bad_crashes_per_episode, dtype=np.float32),
+        safety_per_episode=np.asarray(safety_per_episode, dtype=np.float32),
         cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
         alpha=args.alpha,
         delta=args.delta,
+        bar_alpha=alpha,
     )
     print(f"[conformal] Saved per-episode metrics to {metrics_path}")
     env.close()
