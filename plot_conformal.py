@@ -41,22 +41,24 @@ def main() -> None:
         radius_arr = data["radius_per_episode"]
         qj_arr = data["qj_per_episode"]
         tube_coverage_arr = data["tube_coverage_per_episode"]
+        crashes_arr = data["crashes_per_episode"]
         bad_crashes_arr = data["bad_crashes_per_episode"]
         cumulative_reward_arr = data["cumulative_reward_per_episode"]
         safety_arr = data["safety_per_episode"]
         alpha = float(data.get("alpha"))
         bar_alpha = float(data.get("bar_alpha"))
+    print(crashes_arr)
 
     plot_paths = {}
     if len(episodes) > 0:
-        tick_step = 2 if len(episodes) % 2 == 0 else 1
-        x_ticks = np.arange(0, len(episodes) + 1, tick_step)
-        x_lim = (0, len(episodes))
+        # tick_step = 2 if len(episodes) % 2 == 0 else 1
+        x_ticks = np.arange(0, len(episodes), 1)
+        x_lim = (0, len(episodes) - 1)
 
         # Plot A: Radius across episodes (rj and qj)
         fig, ax = plt.subplots()
-        ax.plot(episodes, radius_arr, label=r"$r_j$")
-        ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)")
+        ax.plot(episodes, radius_arr, label=r"$r_j$", marker='s')
+        ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker='o')
         ax.set_title(r"Radius Across Episodes")
         ax.set_xlabel(r"Episode ($j$)")
         ax.set_xlim(*x_lim)
@@ -70,13 +72,13 @@ def main() -> None:
 
         # Plot B: Performance across episodes (cumulative reward)
         fig, ax = plt.subplots()
-        ax.plot(episodes, cumulative_reward_arr, label=r"Cumulative reward")
+        ax.plot(episodes, cumulative_reward_arr, label=r"Cumulative progress towards goal", marker='s')
         ax.set_title(r"Performance Across Episodes")
         ax.set_xlabel(r"Episode ($j$)")
         ax.set_xlim(*x_lim)
         ax.set_xticks(x_ticks)
         ax.set_ylabel(r"Cumulative reward ($m$)")
-        ax.legend()
+        ax.legend(loc='center right')
         perf_plot_path = os.path.join(output_dir, "performance_cumulative_reward.png")
         fig.savefig(perf_plot_path, bbox_inches="tight")
         plt.close(fig)
@@ -84,14 +86,14 @@ def main() -> None:
 
         # Plot C: Empirical tube coverage
         fig, ax = plt.subplots()
-        ax.plot(episodes, tube_coverage_arr, label=r"Tube coverage")
+        ax.plot(episodes, tube_coverage_arr, label=r"Tube coverage", marker='s')
         target_line = (1 - alpha)
         ax.axhline(target_line, linestyle="--", color="gray", label=r"Target $(1 - \alpha)$")
         ax.set_title(r"Empirical Tube Coverage")
         ax.set_xlabel(r"Episode ($j$)")
         ax.set_xlim(*x_lim)
         ax.set_xticks(x_ticks)
-        ax.set_ylabel(r"Coverage (%)")
+        ax.set_ylabel(r"Coverage (\%)")
         ax.legend()
         tube_plot_path = os.path.join(output_dir, "tube_coverage.png")
         fig.savefig(tube_plot_path, bbox_inches="tight")
@@ -100,12 +102,13 @@ def main() -> None:
 
         # Plot D: Empirical safety coverage (bad crashes)
         fig, ax = plt.subplots()
-        ax.plot(episodes, safety_arr, label=r"Bad crashes")
+        ax.plot(episodes, safety_arr, label=r"Empirical safety", marker='s')
+        ax.axhline(target_line, linestyle="--", color="gray", label=r"Target $(1 - \alpha)$")
         ax.set_title(r"Empirical Safety Coverage")
         ax.set_xlabel(r"Episode ($j$)")
         ax.set_xlim(*x_lim)
         ax.set_xticks(x_ticks)
-        ax.set_ylabel(r"Coverage (%)")
+        ax.set_ylabel(r"Coverage (\%)")
         ax.legend()
         safety_plot_path = os.path.join(output_dir, "empirical_safety_coverage.png")
         fig.savefig(safety_plot_path, bbox_inches="tight")
