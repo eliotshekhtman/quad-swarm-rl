@@ -8,6 +8,7 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # Enable LaTeX rendering for labels and legends if available.
 plt.rcParams.update({
@@ -47,7 +48,9 @@ def main() -> None:
         safety_arr = data["safety_per_episode"]
         alpha = float(data.get("alpha"))
         bar_alpha = float(data.get("bar_alpha"))
+        agent_locs_per_episode = data.get("agent_locs_per_episode", None)
     print(crashes_arr)
+    print([np.max(agent_locs_per_episode[0, agent_id] - agent_locs_per_episode[9, agent_id]) for agent_id in range(5)])
 
     plot_paths = {}
     if len(episodes) > 0:
@@ -114,6 +117,33 @@ def main() -> None:
         fig.savefig(safety_plot_path, bbox_inches="tight")
         plt.close(fig)
         plot_paths["safety"] = safety_plot_path
+
+        # Plot E: 3D trajectories for a chosen episode (if available)
+        ep_idx_list = [0, len(episodes) // 2, len(episodes) - 1]
+        for episode_idx in ep_idx_list:
+            if 0 <= episode_idx < agent_locs_per_episode.shape[0]:
+                trajs = agent_locs_per_episode[episode_idx]
+                num_agents, num_steps, _ = trajs.shape
+                solo_idx = num_agents - 1
+
+                fig = plt.figure()
+                ax = fig.add_subplot(111, projection="3d")
+                for agent_id in range(num_agents):
+                    traj = trajs[agent_id]
+                    color = "tab:red" if agent_id == solo_idx else None
+                    label = "Solo" if agent_id == solo_idx else f"Agent {agent_id}"
+                    ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], label=label, color=color)
+                ax.set_title(rf"3D Trajectories (Episode {episode_idx})")
+                ax.set_xlabel(r"$x$ (m)")
+                ax.set_ylabel(r"$y$ (m)")
+                ax.set_zlabel(r"$z$ (m)")
+                ax.legend()
+                traj_plot_path = os.path.join(output_dir, f"trajectories_episode_{episode_idx}.png")
+                fig.savefig(traj_plot_path, bbox_inches="tight")
+                plt.close(fig)
+                plot_paths[f"trajectories_{episode_idx}"] = traj_plot_path
+            else:
+                print(f"[plot_conformal] episode_idx {episode_idx} out of range for trajectories; skipping 3D plot")
 
     print(f"[plot_conformal] Loaded data from {data_path}")
     for plot_name, plot_path in plot_paths.items():
