@@ -49,6 +49,7 @@ def main() -> None:
         alpha = float(data.get("alpha"))
         bar_alpha = float(data.get("bar_alpha"))
         agent_locs_per_episode = data.get("agent_locs_per_episode", None)
+        predicted_traj_per_episode = data["predicted_traj_per_episode"]
     print(crashes_arr)
     print([np.max(agent_locs_per_episode[0, agent_id] - agent_locs_per_episode[9, agent_id]) for agent_id in range(5)])
 
@@ -133,6 +134,19 @@ def main() -> None:
                     color = "tab:red" if agent_id == solo_idx else None
                     label = "Solo" if agent_id == solo_idx else f"Agent {agent_id}"
                     ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], label=label, color=color)
+                # Overlay predicted trajectories for the multi agents (dotted lines)
+                pred_all = predicted_traj_per_episode[episode_idx]  # shape: num_multi_agents x steps x 6
+                num_pred_agents = pred_all.shape[0]
+                for agent_id in range(min(num_agents - 1, num_pred_agents)):
+                    pred_traj = pred_all[agent_id]
+                    ax.plot(
+                        pred_traj[:, 0],
+                        pred_traj[:, 1],
+                        pred_traj[:, 2],
+                        linestyle=":",
+                        color="tab:blue",
+                        label="Predicted (multi)" if agent_id == 0 else None,
+                    )
                 ax.set_title(rf"3D Trajectories (Episode {episode_idx})")
                 ax.set_xlabel(r"$x$ (m)")
                 ax.set_ylabel(r"$y$ (m)")
