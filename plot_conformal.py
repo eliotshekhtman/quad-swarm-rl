@@ -131,7 +131,7 @@ def main() -> None:
                 for agent_id in range(num_agents):
                     traj = trajs[agent_id]
                     color = "tab:red" if agent_id == solo_idx else None
-                    label = f"Ego (radius {radius_arr[episode_idx]})" if agent_id == solo_idx else f"Agent {agent_id}"
+                    label = f"Ego (radius {radius_arr[episode_idx]:.3g})" if agent_id == solo_idx else f"Agent {agent_id}"
                     ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], label=label, color=color)
                 # Overlay predicted trajectories for the multi agents (dotted lines)
                 pred_all = predicted_traj_per_episode[episode_idx]  # shape: num_multi_agents x steps x 6
