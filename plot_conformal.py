@@ -51,7 +51,7 @@ def main() -> None:
         agent_locs_per_episode = data.get("agent_locs_per_episode", None)
         predicted_traj_per_episode = data["predicted_traj_per_episode"]
     print(crashes_arr)
-    print([np.max(agent_locs_per_episode[0, agent_id] - agent_locs_per_episode[9, agent_id]) for agent_id in range(5)])
+    print([np.max(agent_locs_per_episode[0, agent_id] - agent_locs_per_episode[len(episodes) - 1, agent_id]) for agent_id in range(5)])
 
     plot_paths = {}
     if len(episodes) > 0:
@@ -120,8 +120,7 @@ def main() -> None:
         plot_paths["safety"] = safety_plot_path
 
         # Plot E: 3D trajectories for a chosen episode (if available)
-        ep_idx_list = [0, len(episodes) // 2, len(episodes) - 1]
-        for episode_idx in ep_idx_list:
+        for episode_idx in episodes:
             if 0 <= episode_idx < agent_locs_per_episode.shape[0]:
                 trajs = agent_locs_per_episode[episode_idx]
                 num_agents, num_steps, _ = trajs.shape
@@ -132,7 +131,7 @@ def main() -> None:
                 for agent_id in range(num_agents):
                     traj = trajs[agent_id]
                     color = "tab:red" if agent_id == solo_idx else None
-                    label = "Solo" if agent_id == solo_idx else f"Agent {agent_id}"
+                    label = f"Ego (radius {radius_arr[episode_idx]})" if agent_id == solo_idx else f"Agent {agent_id}"
                     ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], label=label, color=color)
                 # Overlay predicted trajectories for the multi agents (dotted lines)
                 pred_all = predicted_traj_per_episode[episode_idx]  # shape: num_multi_agents x steps x 6
