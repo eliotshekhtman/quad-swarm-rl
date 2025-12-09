@@ -316,6 +316,7 @@ def main() -> None:
     radius_per_episode = []
     cumulative_reward_per_episode = []
     agent_locs_per_episode = [] # Save positions during one run per episode for plotting
+    predicted_traj_per_episode = [] # Store predicted trajectories used each episode (agents x steps x 6)
 
     # While the radius hasn't converged
     for episode in range(args.num_episodes):
@@ -420,6 +421,8 @@ def main() -> None:
         # Radius updates don't change across eval runs so just append normally
         qj_per_episode.append(qj)
         radius_per_episode.append(radius)
+        # Cache predicted trajectories used this episode
+        predicted_traj_per_episode.append(np.asarray(pred_trajectories, dtype=np.float32))
 
         ##### SET UP PRED_TRAJECTORIES FOR NEXT EPISODE #####
         agent_locs = []
@@ -445,6 +448,7 @@ def main() -> None:
         safety_per_episode=np.asarray(safety_per_episode, dtype=np.float32),
         cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
         agent_locs_per_episode=np.asarray(agent_locs_per_episode, dtype=np.float32),
+        predicted_traj_per_episode=np.asarray(predicted_traj_per_episode, dtype=np.float32),
         alpha=args.alpha,
         delta=args.delta,
         bar_alpha=alpha,
