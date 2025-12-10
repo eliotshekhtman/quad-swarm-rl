@@ -195,6 +195,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_eval_trajs", type=int, default=100)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
     parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
+    parser.add_argument("--keep_conformal_radius", action="store_true", help="Don't update the conformal radius")
     parser.add_argument("--num_threads", type=int, default=None, help="Max worker threads for parallel rollouts (default: CPU count).")
     parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--deterministic", action="store_true")
@@ -323,27 +324,34 @@ def main() -> None:
         print('EPISODE', episode)
 
         ##### SETTING THE RADIUS FOR THIS EPISODE #####
-        # Find qj using old pi_j
-        # Make sure the environment is reset for rollout collection
-        multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
-        solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
-        obs, stored_states = deterministic_reset(env, args.seed, stored_states)
-        snapshot = safe_capture_env_snapshot(env)
-        temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
-        # Collect actual rollouts to compare against (with current radius)
-        logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
-                    multi_actor, multi_rnn_states, 
-                    solo_actor, solo_rnn_states, solo_obs_dim, 
-                    pred_trajectories, filter,
-                    max_steps=args.episode_length, 
-                    num_runs=args.num_trajectories, 
-                    deterministic=args.deterministic,
-                    num_threads=max_threads)
-        # Set radius depending on how bad our prediction was
-        qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
-        qj = np.max(qj)
-        new_radius = explicit_radius_update(radius, qj, KAPPA, MIN_RADIUS, MAX_RADIUS)
-        delta_r = np.abs(new_radius - radius) # How different is it this time
+        if not args.keep_conformal_radius or episode == 0:
+            # Find qj using old pi_j
+            # Make sure the environment is reset for rollout collection
+            multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
+            solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
+            obs, stored_states = deterministic_reset(env, args.seed, stored_states)
+            snapshot = safe_capture_env_snapshot(env)
+            temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
+            # Collect actual rollouts to compare against (with current radius)
+            logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
+                        multi_actor, multi_rnn_states, 
+                        solo_actor, solo_rnn_states, solo_obs_dim, 
+                        pred_trajectories, filter,
+                        max_steps=args.episode_length, 
+                        num_runs=args.num_trajectories, 
+                        deterministic=args.deterministic,
+                        num_threads=max_threads)
+            # Set radius depending on how bad our prediction was
+            qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
+            qj = np.max(qj)
+            if args.keep_conformal_radius: # Must mean that it's episode 0
+                new_radius = qj
+                delta_r = np.abs(new_radius - radius)
+            else:
+                new_radius = explicit_radius_update(radius, qj, KAPPA, MIN_RADIUS, MAX_RADIUS)
+        if args.keep_conformal_radius and episode > 0: # Old method had rho_j = Ls kappa |rj - rj-1|
+            new_radius = qj + KAPPA * delta_r 
+            delta_r = np.abs(new_radius - radius) # How different is it this time
         print('radius', radius, 'qj', qj, 'new radius', new_radius)
         radius = new_radius
         radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
