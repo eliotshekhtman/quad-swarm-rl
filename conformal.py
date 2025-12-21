@@ -315,6 +315,7 @@ def main() -> None:
     bad_crashes_per_episode = [] # Crash outside of a tube
     qj_per_episode = []
     radius_per_episode = []
+    cumulative_reward_runs_per_episode = []
     cumulative_reward_per_episode = []
     agent_locs_per_episode = [] # Save positions during one run per episode for plotting
     predicted_traj_per_episode = [] # Store predicted trajectories used each episode (agents x steps x 6)
@@ -426,6 +427,7 @@ def main() -> None:
         bad_crashes_per_episode.append(sum(num_bad_crashes_per_run) / args.num_eval_trajs)
         safety = 1 - sum([crashes > 0 for crashes in num_bad_crashes_per_run]) / args.num_eval_trajs
         safety_per_episode.append(safety)
+        cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
         # Radius updates don't change across eval runs so just append normally
         qj_per_episode.append(qj)
         radius_per_episode.append(radius)
@@ -455,6 +457,7 @@ def main() -> None:
         bad_crashes_per_episode=np.asarray(bad_crashes_per_episode, dtype=np.float32),
         safety_per_episode=np.asarray(safety_per_episode, dtype=np.float32),
         cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
+        cumulative_reward_per_run=np.asarray(cumulative_reward_runs_per_episode, dtype=np.float32),
         agent_locs_per_episode=np.asarray(agent_locs_per_episode, dtype=np.float32),
         predicted_traj_per_episode=np.asarray(predicted_traj_per_episode, dtype=np.float32),
         alpha=args.alpha,
