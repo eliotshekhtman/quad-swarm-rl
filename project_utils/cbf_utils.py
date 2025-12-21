@@ -8,8 +8,8 @@ import numpy as np
 
 from project_utils.utils import *
 
-CBF_K1 = 0.1
-CBF_K0 = 0.1
+CBF_K1 = 1
+CBF_K0 = 1
 CBF_SLACK_WEIGHT = 1.0e4
 EPSILON = 1e-3
 
@@ -181,7 +181,7 @@ def _solve_cbf_qp(
 
     for teammate_idx in range(num_multi_agents):
         radius = float(radii[teammate_idx])
-        if radius <= 0.0:
+        if radius < 0.0:
             continue
         teammate_pos = swarm_state.positions[teammate_idx]
         teammate_vel = swarm_state.velocities[teammate_idx]
