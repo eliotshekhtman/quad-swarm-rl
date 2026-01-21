@@ -349,6 +349,28 @@ def main() -> None:
     filter = make_cbf_filter(radii) # pi_{j+1}
     temp_env.close()
 
+    # Find q0 using r0
+    # Make sure the environment is reset for rollout collection
+    multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
+    solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
+    obs, stored_states = deterministic_reset(env, args.seed, stored_states)
+    snapshot = safe_capture_env_snapshot(env)
+    temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
+    # Collect actual rollouts to compare against (with current radius)
+    logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
+                multi_actor, multi_rnn_states, 
+                solo_actor, solo_rnn_states, solo_obs_dim, 
+                pred_trajectories, filter,
+                max_steps=args.episode_length, 
+                num_runs=args.num_trajectories, 
+                deterministic=args.deterministic,
+                num_threads=max_threads)
+    # Set radius depending on how bad our prediction was
+    qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
+    qj = np.max(qj) # Not actually updating radius based on qj, just wanted to know
+    print('radius', radius, 'qj', qj, 'new radius', new_radius)
+    temp_env.close()
+
     ##### COLLECTING THE DATA FOR THIS EPISODE #####
     # Do a full reset before collecting rollouts
     multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
