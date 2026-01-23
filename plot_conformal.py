@@ -5,6 +5,7 @@ Generate conformal experiment plots from saved metrics.
 
 import argparse
 import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,7 +26,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output_dir",
-        help="Directory to save plots (default: <plot_data_dir>/plots).",
+        help="Directory to save plots.",
+    )
+    parser.add_argument(
+        "--tube_agent",
+        required=True,
+        type=int,
+        help="Which agent to plot for the tube plots."
     )
     parser.add_argument(
         "--alpha",
@@ -53,8 +60,8 @@ def draw_circle(ax, center, radius, color, label=None):
 def main() -> None:
     args = parse_args()
     data_path = os.path.abspath(args.plot_data)
-    data_dir = os.path.dirname(data_path)
-    output_dir = args.output_dir or os.path.join(data_dir, "plots")
+    exp_name = Path(data_path).stem
+    output_dir = args.output_dir or os.path.join("./", "plots", exp_name)
     os.makedirs(output_dir, exist_ok=True)
 
     with np.load(data_path) as data:
@@ -71,9 +78,9 @@ def main() -> None:
         bar_alpha = float(data["bar_alpha"])
         agent_locs_per_episode = data.get("agent_locs_per_episode", None)
         predicted_traj_per_episode = data["predicted_traj_per_episode"]
-    print(crashes_arr)
-    print([np.max(agent_locs_per_episode[0, agent_id] - agent_locs_per_episode[len(episodes) - 1, agent_id]) for agent_id in range(5)])
-    print([min([min([np.linalg.norm(agent_locs_per_episode[ep, aid, step] - agent_locs_per_episode[ep, -1, step]) for step in range(300)]) for aid in range(5)]) for ep in episodes])
+    print(radius_arr)
+    print(qj_arr)
+    print(cumulative_reward_arr)
     num_episodes = len(episodes) + 1
 
     plot_paths = {}
@@ -84,6 +91,8 @@ def main() -> None:
     # Plot A: Radius across episodes (rj and qj)
     fig, ax = plt.subplots()
     shifted_radius_arr = np.insert(radius_arr, 0, 8)[:-1] # r0 is MAX_RADIUS
+    noninteractive_radius = 0.33648095
+    ax.axhline(noninteractive_radius, linestyle="--", color="gray", label=r"Non-interactive $1 - \bar \alpha$ quantile")
     ax.plot(episodes, shifted_radius_arr, label=r"$r_j$", marker='s')
     ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker='o')
     ax.set_title(r"Radius Across Episodes")
@@ -92,8 +101,8 @@ def main() -> None:
     ax.set_xticks(x_ticks)
     ax.set_ylabel(r"Radius ($m$)")
     ax.legend()
-    radius_plot_path = os.path.join(output_dir, "radius_across_episodes.png")
-    fig.savefig(radius_plot_path, bbox_inches="tight")
+    radius_plot_path = os.path.join(output_dir, "radius_across_episodes.pdf")
+    fig.savefig(radius_plot_path, bbox_inches="tight", format='pdf')
     plt.close(fig)
     plot_paths["radius"] = radius_plot_path
 
@@ -127,8 +136,8 @@ def main() -> None:
     ax.set_xticks(x_ticks)
     ax.set_ylabel(r"Cumulative reward ($m$)")
     ax.legend(loc='center right')
-    perf_plot_path = os.path.join(output_dir, "performance_cumulative_reward.png")
-    fig.savefig(perf_plot_path, bbox_inches="tight")
+    perf_plot_path = os.path.join(output_dir, "performance_cumulative_reward.pdf")
+    fig.savefig(perf_plot_path, bbox_inches="tight", format='pdf')
     plt.close(fig)
     plot_paths["performance"] = perf_plot_path
 
@@ -144,8 +153,8 @@ def main() -> None:
     ax.set_xticks(x_ticks)
     ax.set_ylabel(r"Coverage (\%)")
     ax.legend()
-    tube_plot_path = os.path.join(output_dir, "tube_coverage.png")
-    fig.savefig(tube_plot_path, bbox_inches="tight")
+    tube_plot_path = os.path.join(output_dir, "tube_coverage.pdf")
+    fig.savefig(tube_plot_path, bbox_inches="tight", format='pdf')
     plt.close(fig)
     plot_paths["tube_coverage"] = tube_plot_path
 
@@ -159,8 +168,8 @@ def main() -> None:
     ax.set_xticks(x_ticks)
     ax.set_ylabel(r"Coverage (\%)")
     ax.legend()
-    safety_plot_path = os.path.join(output_dir, "empirical_safety_coverage.png")
-    fig.savefig(safety_plot_path, bbox_inches="tight")
+    safety_plot_path = os.path.join(output_dir, "empirical_safety_coverage.pdf")
+    fig.savefig(safety_plot_path, bbox_inches="tight", format='pdf')
     plt.close(fig)
     plot_paths["safety"] = safety_plot_path
 
@@ -197,14 +206,15 @@ def main() -> None:
         ax.set_xlabel(r"$x$ (m)")
         ax.set_ylabel(r"$y$ (m)")
         ax.set_zlabel(r"$z$ (m)")
-        ax.legend()
-        traj_plot_path = os.path.join(output_dir, f"trajectories_episode_{episode_idx + 1}.png")
-        fig.savefig(traj_plot_path, bbox_inches="tight")
+        if episode_idx == 0:
+            ax.legend()
+        traj_plot_path = os.path.join(output_dir, f"trajectories_episode_{episode_idx + 1}.pdf")
+        fig.savefig(traj_plot_path, bbox_inches="tight", format='pdf')
         plt.close(fig)
         plot_paths[f"trajectories_{episode_idx + 1}"] = traj_plot_path
         
     # Plot F: Make a trajectory plot for one agent with a tube
-    agent_idx = 2
+    agent_idx = args.tube_agent
     axes_lim = None
     for episode_idx in episodes:
         trajs = agent_locs_per_episode[episode_idx]
@@ -251,9 +261,10 @@ def main() -> None:
             ax.set_xlim(*axes_lim['x'])
             ax.set_ylim(*axes_lim['y'])
             ax.set_zlim(*axes_lim['z'])
-        ax.legend(handles, labels)
-        traj_plot_path = os.path.join(output_dir, f"tube_{episode_idx + 1}.png")
-        fig.savefig(traj_plot_path, bbox_inches="tight")
+        if episode_idx == 0:
+            ax.legend(handles, labels)
+        traj_plot_path = os.path.join(output_dir, f"tube_{episode_idx + 1}.pdf")
+        fig.savefig(traj_plot_path, bbox_inches="tight", format='pdf')
         plt.close(fig)
         plot_paths[f"tube_{episode_idx + 1}"] = traj_plot_path
         if axes_lim is None:
