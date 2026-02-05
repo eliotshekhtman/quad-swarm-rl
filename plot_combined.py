@@ -80,44 +80,50 @@ def main() -> None:
     if len(naive["episodes"]) != len(base_episodes):
         raise ValueError("Naive run episode count does not match Robust run.")
 
-    # Map calibrate-once arrays: first value -> episode 0, second -> episode 1..end.
-    def map_calibrate_once(arr: np.ndarray) -> np.ndarray:
+    # Calibrate-once: radius/q need length num_episodes-1 (episodes 0..N-2); perf/tube/safety need length num_episodes (0..N-1).
+    def map_calibrate_radius_q(arr: np.ndarray) -> np.ndarray:
         return np.concatenate(([arr[0]], np.full(num_episodes - 2, arr[1])))
+
+    def map_calibrate_perf_like(arr: np.ndarray) -> np.ndarray:
+        return np.concatenate(([arr[0]], np.full(num_episodes - 1, arr[1])))
 
     def map_calibrate_once_runs(arr: np.ndarray) -> np.ndarray:
         arr = np.asarray(arr)
         first = np.expand_dims(arr[0], axis=0)
         second = np.expand_dims(arr[1], axis=0)
-        return np.concatenate([first, np.repeat(second, num_episodes - 2, axis=0)], axis=0)
+        return np.concatenate([first, np.repeat(second, num_episodes - 1, axis=0)], axis=0)
 
-    cal_once_radius = map_calibrate_once(calibrate_once["radius"])
-    cal_once_qj = map_calibrate_once(calibrate_once["qj"])
-    cal_once_tube = map_calibrate_once(calibrate_once["tube"])
-    cal_once_safety = map_calibrate_once(calibrate_once["safety"])
-    cal_once_perf = map_calibrate_once(calibrate_once["cumulative_reward"])
+    cal_once_radius = map_calibrate_radius_q(calibrate_once["radius"])
+    cal_once_qj = map_calibrate_radius_q(calibrate_once["qj"])
+    cal_once_tube = map_calibrate_perf_like(calibrate_once["tube"])
+    cal_once_safety = map_calibrate_perf_like(calibrate_once["safety"])
+    cal_once_perf = map_calibrate_perf_like(calibrate_once["cumulative_reward"])
     cal_once_runs = map_calibrate_once_runs(calibrate_once["cumulative_reward_runs"]) if calibrate_once["cumulative_reward_runs"] is not None else None
 
-    # Broadcast single-episode non-interactive data across episodes.
-    def broadcast(arr: np.ndarray) -> np.ndarray:
+    # Broadcast single-episode non-interactive data across episodes (0..num_episodes-1).
+    def broadcast_perf_like(arr: np.ndarray) -> np.ndarray:
+        return np.full(num_episodes, float(arr[0]))
+
+    def broadcast_radius_q(arr: np.ndarray) -> np.ndarray:
         return np.full(num_episodes - 1, float(arr[0]))
 
     def broadcast_runs(arr: np.ndarray) -> np.ndarray:
         arr = np.asarray(arr)
         first = np.expand_dims(arr[0], axis=0)
-        return np.repeat(first, num_episodes - 1, axis=0)
+        return np.repeat(first, num_episodes, axis=0)
 
-    single_radius = broadcast(non_int_single_run["radius"])
-    single_qj = broadcast(non_int_single_run["qj"])
-    single_tube = broadcast(non_int_single_run["tube"])
-    single_safety = broadcast(non_int_single_run["safety"])
-    single_perf = broadcast(non_int_single_run["cumulative_reward"])
+    single_radius = broadcast_radius_q(non_int_single_run["radius"])
+    single_qj = broadcast_radius_q(non_int_single_run["qj"])
+    single_tube = broadcast_perf_like(non_int_single_run["tube"])
+    single_safety = broadcast_perf_like(non_int_single_run["safety"])
+    single_perf = broadcast_perf_like(non_int_single_run["cumulative_reward"])
     single_runs = broadcast_runs(non_int_single_run["cumulative_reward_runs"]) if non_int_single_run["cumulative_reward_runs"] is not None else None
     non_int_single = float(single_perf[0])
 
     # Prepare x-axes: conformal runs start at episode 1; calibrate/non-interactive start at 0.
     x_radius = base_episodes  # 0..(N-1)
-    x_conformal = np.arange(1, num_episodes)  # 1..N
-    x_calib = np.arange(0, num_episodes - 1)  # 0..N-2
+    x_conformal = np.arange(1, num_episodes)          # 1..N-1
+    x_calib = np.arange(0, num_episodes)              # 0..N-1
     x_lim_radius = (0, num_episodes - 2)
     x_lim_perf = (0, num_episodes - 1)
 
@@ -130,10 +136,10 @@ def main() -> None:
 
     # Prepare radius and q_j series.
     series_radius = [
-        {"label": "Robust $r_j$", "y": prepare_conformal_radius(robust["radius"]), "style": {"color": colors["robust"], "marker": "P"}},
-        {"label": "Naive $r_j$", "y": prepare_conformal_radius(naive["radius"]), "style": {"color": colors["naive"], "marker": "P"}},
-        {"label": "Calibrate-once $r_j$", "y": cal_once_radius, "style": {"color": colors["cal_once"], "marker": "P"}},
-        {"label": "Non-interactive $r_j$", "y": single_radius, "style": {"color": colors["non_int"], "marker": "P"}},
+        {"label": "Robust $r_j$", "y": prepare_conformal_radius(robust["radius"]), "style": {"color": colors["robust"], "marker": "s"}},
+        {"label": "Naive $r_j$", "y": prepare_conformal_radius(naive["radius"]), "style": {"color": colors["naive"], "marker": "s"}},
+        {"label": "Calibrate-once $r_j$", "y": cal_once_radius, "style": {"color": colors["cal_once"], "marker": "s"}},
+        {"label": "Non-interactive $r_j$", "y": single_radius, "style": {"color": colors["non_int"], "marker": "s"}},
     ]
     series_q = [
         {"label": "Robust $q_j$", "y": robust["qj"], "style": {"color": colors["robust"], "marker": "x"}},
