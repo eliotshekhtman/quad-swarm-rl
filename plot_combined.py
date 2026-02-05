@@ -84,26 +84,40 @@ def main() -> None:
     def map_calibrate_once(arr: np.ndarray) -> np.ndarray:
         return np.concatenate(([arr[0]], np.full(num_episodes - 2, arr[1])))
 
+    def map_calibrate_once_runs(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr)
+        first = np.expand_dims(arr[0], axis=0)
+        second = np.expand_dims(arr[1], axis=0)
+        return np.concatenate([first, np.repeat(second, num_episodes - 2, axis=0)], axis=0)
+
     cal_once_radius = map_calibrate_once(calibrate_once["radius"])
     cal_once_qj = map_calibrate_once(calibrate_once["qj"])
     cal_once_tube = map_calibrate_once(calibrate_once["tube"])
     cal_once_safety = map_calibrate_once(calibrate_once["safety"])
     cal_once_perf = map_calibrate_once(calibrate_once["cumulative_reward"])
+    cal_once_runs = map_calibrate_once_runs(calibrate_once["cumulative_reward_runs"]) if calibrate_once["cumulative_reward_runs"] is not None else None
 
     # Broadcast single-episode non-interactive data across episodes.
     def broadcast(arr: np.ndarray) -> np.ndarray:
         return np.full(num_episodes - 1, float(arr[0]))
+
+    def broadcast_runs(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr)
+        first = np.expand_dims(arr[0], axis=0)
+        return np.repeat(first, num_episodes - 1, axis=0)
 
     single_radius = broadcast(non_int_single_run["radius"])
     single_qj = broadcast(non_int_single_run["qj"])
     single_tube = broadcast(non_int_single_run["tube"])
     single_safety = broadcast(non_int_single_run["safety"])
     single_perf = broadcast(non_int_single_run["cumulative_reward"])
+    single_runs = broadcast_runs(non_int_single_run["cumulative_reward_runs"]) if non_int_single_run["cumulative_reward_runs"] is not None else None
     non_int_single = float(single_perf[0])
 
-    # Prepare x-axes matching plot_conformal conventions.
+    # Prepare x-axes: conformal runs start at episode 1; calibrate/non-interactive start at 0.
     x_radius = base_episodes  # 0..(N-1)
-    x_perf = np.arange(1, num_episodes)  # 1..N
+    x_conformal = np.arange(1, num_episodes)  # 1..N
+    x_calib = np.arange(0, num_episodes - 1)  # 0..N-2
     x_lim_radius = (0, num_episodes - 2)
     x_lim_perf = (0, num_episodes - 1)
 
@@ -135,40 +149,44 @@ def main() -> None:
             "label": "Robust performance",
             "y": robust["cumulative_reward"],
             "runs": robust["cumulative_reward_runs"],
+            "x": x_conformal,
             "style": {"color": "tab:blue", "marker": "s"},
         },
         {
             "label": "Naive performance",
             "y": naive["cumulative_reward"],
             "runs": naive["cumulative_reward_runs"],
+            "x": x_conformal,
             "style": {"color": "tab:orange", "marker": "o"},
         },
         {
             "label": "Calibrate-once performance",
             "y": cal_once_perf,
-            "runs": None,
+            "runs": cal_once_runs,
+            "x": x_calib,
             "style": {"color": "tab:green", "marker": "^"},
         },
         {
             "label": "Non-interactive performance",
             "y": single_perf,
-            "runs": None,
+            "runs": single_runs,
+            "x": x_calib,
             "style": {"color": "tab:red", "marker": "v"},
         },
     ]
 
     # Tube and safety series.
     tube_series = [
-        {"label": "Robust tube", "y": robust["tube"], "style": {"color": "tab:blue", "marker": "s"}},
-        {"label": "Naive tube", "y": naive["tube"], "style": {"color": "tab:orange", "marker": "o"}},
-        {"label": "Calibrate-once tube", "y": cal_once_tube, "style": {"color": "tab:green", "marker": "^"}},
-        {"label": "Non-interactive tube", "y": single_tube, "style": {"color": "tab:red", "marker": "v"}},
+        {"label": "Robust tube", "y": robust["tube"], "x": x_conformal, "style": {"color": "tab:blue", "marker": "s"}},
+        {"label": "Naive tube", "y": naive["tube"], "x": x_conformal, "style": {"color": "tab:orange", "marker": "o"}},
+        {"label": "Calibrate-once tube", "y": cal_once_tube, "x": x_calib, "style": {"color": "tab:green", "marker": "^"}},
+        {"label": "Non-interactive tube", "y": single_tube, "x": x_calib, "style": {"color": "tab:red", "marker": "v"}},
     ]
     safety_series = [
-        {"label": "Robust safety", "y": robust["safety"], "style": {"color": "tab:blue", "marker": "s"}},
-        {"label": "Naive safety", "y": naive["safety"], "style": {"color": "tab:orange", "marker": "o"}},
-        {"label": "Calibrate-once safety", "y": cal_once_safety, "style": {"color": "tab:green", "marker": "^"}},
-        {"label": "Non-interactive safety", "y": single_safety, "style": {"color": "tab:red", "marker": "v"}},
+        {"label": "Robust safety", "y": robust["safety"], "x": x_conformal, "style": {"color": "tab:blue", "marker": "s"}},
+        {"label": "Naive safety", "y": naive["safety"], "x": x_conformal, "style": {"color": "tab:orange", "marker": "o"}},
+        {"label": "Calibrate-once safety", "y": cal_once_safety, "x": x_calib, "style": {"color": "tab:green", "marker": "^"}},
+        {"label": "Non-interactive safety", "y": single_safety, "x": x_calib, "style": {"color": "tab:red", "marker": "v"}},
     ]
 
     # Output directory.
@@ -207,9 +225,9 @@ def main() -> None:
                 np.maximum(y - lower, 0),
                 np.maximum(upper - y, 0),
             ])
-            ax.errorbar(x_perf, y, yerr=yerr, label=s["label"], capsize=4, **s["style"])
+            ax.errorbar(s["x"], y, yerr=yerr, label=s["label"], capsize=4, **s["style"])
         else:
-            ax.plot(x_perf, y, label=s["label"], **s["style"])
+            ax.plot(s["x"], y, label=s["label"], **s["style"])
     ax.set_title(r"Performance Across Episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_lim_perf)
@@ -226,7 +244,7 @@ def main() -> None:
     target_line = 1 - (robust["alpha"] if robust["alpha"] is not None else 0.1)
     ax.axhline(target_line, linestyle="--", color="gray", label=r"Target $(1 - \alpha)$")
     for s in tube_series:
-        ax.plot(x_perf, s["y"], label=s["label"], **s["style"])
+        ax.plot(s["x"], s["y"], label=s["label"], **s["style"])
     ax.set_title(r"Empirical Tube Coverage")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_lim_perf)
@@ -242,7 +260,7 @@ def main() -> None:
     fig, ax = plt.subplots()
     ax.axhline(target_line, linestyle="--", color="gray", label=r"Target $(1 - \alpha)$")
     for s in safety_series:
-        ax.plot(x_perf, s["y"], label=s["label"], **s["style"])
+        ax.plot(s["x"], s["y"], label=s["label"], **s["style"])
     ax.set_title(r"Empirical Safety Coverage")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_lim_perf)
