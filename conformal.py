@@ -194,6 +194,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_trajectories", type=int, default=200)
     parser.add_argument("--num_eval_trajs", type=int, default=100)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
+    parser.add_argument("--predictions_dir", default='train_dir', help="Directory containing the initial predicted trajectories.")
+    parser.add_argument("--init_predictions", default=None, help="Experiment name for initial predicted trajectories if provided.")
     parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
     parser.add_argument("--keep_conformal_radius", action="store_true", help="Don't update the conformal radius")
     parser.add_argument("--num_threads", type=int, default=None, help="Max worker threads for parallel rollouts (default: CPU count).")
@@ -276,25 +278,33 @@ def main() -> None:
     # Save initial state so we can return to it later
     obs, stored_states = deterministic_reset(env, args.seed, None)
 
-    # Collect predicted trajectory
-    print('Predicting trajectories')
-    obs, stored_states = deterministic_reset(env, args.seed, stored_states)
-    snapshot = safe_capture_env_snapshot(env)
-    temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
-    dummy_pred_traj = np.zeros((args.num_multi_agents, args.episode_length, 6))
-    logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
-                    multi_actor, multi_rnn_states, 
-                    solo_actor, solo_rnn_states, solo_obs_dim, 
-                    pred_trajectories=dummy_pred_traj,
-                    solo_action_fn=fall_down,
-                    deterministic=True, max_steps=args.episode_length,
-                    num_threads=max_threads)
-    temp_env.close()
-    pred_trajectories = []
-    for agent_id in range(args.num_multi_agents):
-        positions = logs[agent_id][0]["position"] # episode_length x 3
-        velocities = logs[agent_id][0]["velocity"]
-        pred_trajectories.append(np.concatenate([positions, velocities], axis=1))
+    if args.init_predictions is None:
+        # Collect predicted trajectory
+        print('Predicting trajectories')
+        obs, stored_states = deterministic_reset(env, args.seed, stored_states)
+        snapshot = safe_capture_env_snapshot(env)
+        temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
+        dummy_pred_traj = np.zeros((args.num_multi_agents, args.episode_length, 6))
+        logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
+                        multi_actor, multi_rnn_states, 
+                        solo_actor, solo_rnn_states, solo_obs_dim, 
+                        pred_trajectories=dummy_pred_traj,
+                        solo_action_fn=fall_down,
+                        deterministic=True, max_steps=args.episode_length,
+                        num_threads=max_threads)
+        temp_env.close()
+        pred_trajectories = []
+        for agent_id in range(args.num_multi_agents):
+            positions = logs[agent_id][0]["position"] # episode_length x 3
+            velocities = logs[agent_id][0]["velocity"]
+            pred_trajectories.append(np.concatenate([positions, velocities], axis=1))
+    else:
+        pred_path = os.path.join(args.predictions_dir, args.init_predictions, "pred_trajectories.npz")
+        pred_data = np.load(pred_path)
+        pred_trajectories = pred_data["pred_trajectories"].astype(np.float32)
+        # Keep the format conformal.py expects: list of (episode_length x 6) arrays
+        pred_trajectories = [pred_trajectories[i] for i in range(pred_trajectories.shape[0])]
+
 
     # Collect arm length for default radius and dt for time btn steps
     arm_len = env.quad_arm
