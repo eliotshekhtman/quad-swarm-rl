@@ -64,6 +64,15 @@ def prepare_conformal_radius(radius: np.ndarray) -> np.ndarray:
     return np.insert(radius, 0, MAX_RADIUS)[:-1]
 
 
+def pad_repeat(arr: np.ndarray, target_len: int) -> np.ndarray:
+    """Copy arr to length target_len, repeating the last element as needed."""
+    arr = np.asarray(arr)
+    if arr.shape[0] >= target_len:
+        return arr[:target_len]
+    pad = np.repeat(arr[-1:], target_len - arr.shape[0], axis=0)
+    return np.concatenate([arr, pad], axis=0)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -80,44 +89,21 @@ def main() -> None:
     if len(naive["episodes"]) != len(base_episodes):
         raise ValueError("Naive run episode count does not match Robust run.")
 
-    # Calibrate-once: radius/q need length num_episodes-1 (episodes 0..N-2); perf/tube/safety need length num_episodes (0..N-1).
-    def map_calibrate_radius_q(arr: np.ndarray) -> np.ndarray:
-        return np.concatenate(([arr[0]], np.full(num_episodes - 2, arr[1])))
+    # Calibrate-once: pad/repeat to required lengths.
+    cal_once_radius = pad_repeat(calibrate_once["radius"], num_episodes - 1)
+    cal_once_qj = pad_repeat(calibrate_once["qj"], num_episodes - 1)
+    cal_once_tube = pad_repeat(calibrate_once["tube"], num_episodes)
+    cal_once_safety = pad_repeat(calibrate_once["safety"], num_episodes)
+    cal_once_perf = pad_repeat(calibrate_once["cumulative_reward"], num_episodes)
+    cal_once_runs = pad_repeat(calibrate_once["cumulative_reward_runs"], num_episodes) if calibrate_once["cumulative_reward_runs"] is not None else None
 
-    def map_calibrate_perf_like(arr: np.ndarray) -> np.ndarray:
-        return np.concatenate(([arr[0]], np.full(num_episodes - 1, arr[1])))
-
-    def map_calibrate_once_runs(arr: np.ndarray) -> np.ndarray:
-        arr = np.asarray(arr)
-        first = np.expand_dims(arr[0], axis=0)
-        second = np.expand_dims(arr[1], axis=0)
-        return np.concatenate([first, np.repeat(second, num_episodes - 1, axis=0)], axis=0)
-
-    cal_once_radius = map_calibrate_radius_q(calibrate_once["radius"])
-    cal_once_qj = map_calibrate_radius_q(calibrate_once["qj"])
-    cal_once_tube = map_calibrate_perf_like(calibrate_once["tube"])
-    cal_once_safety = map_calibrate_perf_like(calibrate_once["safety"])
-    cal_once_perf = map_calibrate_perf_like(calibrate_once["cumulative_reward"])
-    cal_once_runs = map_calibrate_once_runs(calibrate_once["cumulative_reward_runs"]) if calibrate_once["cumulative_reward_runs"] is not None else None
-
-    # Broadcast single-episode non-interactive data across episodes (0..num_episodes-1).
-    def broadcast_perf_like(arr: np.ndarray) -> np.ndarray:
-        return np.full(num_episodes, float(arr[0]))
-
-    def broadcast_radius_q(arr: np.ndarray) -> np.ndarray:
-        return np.full(num_episodes - 1, float(arr[0]))
-
-    def broadcast_runs(arr: np.ndarray) -> np.ndarray:
-        arr = np.asarray(arr)
-        first = np.expand_dims(arr[0], axis=0)
-        return np.repeat(first, num_episodes, axis=0)
-
-    single_radius = broadcast_radius_q(non_int_single_run["radius"])
-    single_qj = broadcast_radius_q(non_int_single_run["qj"])
-    single_tube = broadcast_perf_like(non_int_single_run["tube"])
-    single_safety = broadcast_perf_like(non_int_single_run["safety"])
-    single_perf = broadcast_perf_like(non_int_single_run["cumulative_reward"])
-    single_runs = broadcast_runs(non_int_single_run["cumulative_reward_runs"]) if non_int_single_run["cumulative_reward_runs"] is not None else None
+    # Non-interactive: pad/repeat to required lengths.
+    single_radius = pad_repeat(non_int_single_run["radius"], num_episodes - 1)
+    single_qj = pad_repeat(non_int_single_run["qj"], num_episodes - 1)
+    single_tube = pad_repeat(non_int_single_run["tube"], num_episodes)
+    single_safety = pad_repeat(non_int_single_run["safety"], num_episodes)
+    single_perf = pad_repeat(non_int_single_run["cumulative_reward"], num_episodes)
+    single_runs = pad_repeat(non_int_single_run["cumulative_reward_runs"], num_episodes) if non_int_single_run["cumulative_reward_runs"] is not None else None
     non_int_single = float(single_perf[0])
 
     # Prepare x-axes: conformal runs start at episode 1; calibrate/non-interactive start at 0.
