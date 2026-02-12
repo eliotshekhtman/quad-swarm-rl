@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init_predictions", default=None, help="Experiment name for initial predicted trajectories if provided.")
     parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
     parser.add_argument("--keep_conformal_radius", action="store_true", help="Don't update the conformal radius")
-    parser.add_argument("--num_threads", type=int, default=None, help="Max worker threads for parallel rollouts (default: CPU count).")
+    parser.add_argument("--num_threads", type=int, default=1, help="Max worker threads for parallel rollouts (default: CPU count).")
     parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--deterministic", action="store_true")
     return parser.parse_args()
@@ -330,7 +330,7 @@ def main() -> None:
         agent_locs = []
         for agent_id in range(args.num_multi_agents + 1):
             for step in range(args.episode_length):
-                if args.update_predictions and agent_id < solo_agent_id:
+                if args.update_predictions and agent_id < solo_agent_id and episode == 0: # Only update first episode
                     pred_trajectories[agent_id][step][:3] = logs[agent_id][0]['position'][step]
                     pred_trajectories[agent_id][step][3:] = logs[agent_id][0]['velocity'][step]
             agent_locs.append(logs[agent_id][0]['position'])

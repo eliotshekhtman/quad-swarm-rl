@@ -78,8 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_multi_agents", type=int, default=-1)
     parser.add_argument("--predictions_dir", default='train_dir', help="Directory containing the initial predicted trajectories.")
     parser.add_argument("--init_predictions", default=None, help="Experiment name for initial predicted trajectories if provided.")
-    parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
-    parser.add_argument("--num_threads", type=int, default=None, help="Max worker threads for parallel rollouts (default: CPU count).")
+    parser.add_argument("--num_threads", type=int, default=1, help="Max worker threads for parallel rollouts (default: CPU count).")
     parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--deterministic", action="store_true")
     return parser.parse_args()
@@ -193,11 +192,6 @@ def main() -> None:
     KAPPA = 0.6 # Tune to desired
     alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
 
-    # Init r0 to some large value that ought to be safe
-    radius = MAX_RADIUS
-    radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-    filter = make_cbf_filter(radii)
-
     # Running list: every entry is how many env agents left their tubes that episode
     tube_coverage_per_episode = []
     safety_per_episode = []
@@ -210,9 +204,13 @@ def main() -> None:
     agent_locs_per_episode = [] # Save positions during one run per episode for plotting
     predicted_traj_per_episode = [] # Store predicted trajectories used each episode (agents x steps x 6)
 
+    ##### EPISODE 0 #####
+    # Init r0 to some large value that ought to be safe
+    radius = MAX_RADIUS
+    radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
+    filter = make_cbf_filter(radii)
 
-    ##### SETTING THE RADIUS FOR EPISODE 0 #####
-    episode = 0
+    ##### COLLECTING q0 #####
     # Find qj using old pi_j
     # Make sure the environment is reset for rollout collection
     multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
@@ -224,45 +222,19 @@ def main() -> None:
     logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
                 multi_actor, multi_rnn_states, 
                 solo_actor, solo_rnn_states, solo_obs_dim, 
-                pred_trajectories, fall_down, # qj is to be based on non-interactive dynamics
+                pred_trajectories, filter, # set q0 based on MAX_RADIUS
                 max_steps=args.episode_length, 
                 num_runs=args.num_trajectories, 
                 deterministic=args.deterministic,
                 num_threads=max_threads)
     # Set radius depending on how bad our prediction was
-    qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
-    qj = np.max(qj)
-    new_radius = qj # Run with normal conformal radius
+    q0 = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
+    q0 = np.max(q0)
+    new_radius = q0 # Run with normal conformal radius
     delta_r = np.abs(new_radius - radius)
-    print('radius', radius, 'qj', qj, 'new radius', new_radius)
-    radius = new_radius
-    radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-    filter = make_cbf_filter(radii) # pi_{j+1}
-    temp_env.close()
 
-    # Find q0 using r0
-    # Make sure the environment is reset for rollout collection
-    multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
-    solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
-    obs, stored_states = deterministic_reset(env, args.seed, stored_states)
-    snapshot = safe_capture_env_snapshot(env)
-    temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
-    # Collect actual rollouts to compare against (with current radius)
-    logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
-                multi_actor, multi_rnn_states, 
-                solo_actor, solo_rnn_states, solo_obs_dim, 
-                pred_trajectories, filter,
-                max_steps=args.episode_length, 
-                num_runs=args.num_trajectories, 
-                deterministic=args.deterministic,
-                num_threads=max_threads)
-    # Set radius depending on how bad our prediction was
-    qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
-    qj = np.max(qj) # Not actually updating radius based on qj, just wanted to know
-    print('radius', radius, 'qj', qj, 'new radius', new_radius)
-    temp_env.close()
-
-    ##### COLLECTING THE DATA FOR THIS EPISODE #####
+    ### COLLECTING DATA FOR EPISODE 0 ###
+    episode = 0
     # Do a full reset before collecting rollouts
     multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
     solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
@@ -332,25 +304,129 @@ def main() -> None:
     safety_per_episode.append(safety)
     cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
     # Radius updates don't change across eval runs so just append normally
-    qj_per_episode.append(qj)
+    qj_per_episode.append(q0) # Save q0 here
     radius_per_episode.append(radius)
     # Cache predicted trajectories used this episode
     predicted_traj_per_episode.append(np.asarray(pred_trajectories, dtype=np.float32))
-
-    ##### SET UP PRED_TRAJECTORIES FOR NEXT EPISODE #####
     agent_locs = []
     for agent_id in range(args.num_multi_agents + 1):
-        for step in range(args.episode_length):
-            if args.update_predictions and agent_id < solo_agent_id:
-                pred_trajectories[agent_id][step][:3] = logs[agent_id][0]['position'][step]
-                pred_trajectories[agent_id][step][3:] = logs[agent_id][0]['velocity'][step]
         agent_locs.append(logs[agent_id][0]['position'])
     agent_locs_per_episode.append(agent_locs) # episodes x agents x steps x 3
-    print(f'Cum rew: {cumulative_reward_per_episode[-1]} Tube cov: {tube_coverage_per_episode[-1]} Crashes: {crashes_per_episode[-1]} Bad crashes: {bad_crashes_per_episode[-1]}')
+
+
+    ##### EPISODE 1 #####
+    ### UPDATING TO r1 ###
+    print('r0', radius, 'q0', q0, 'r1', new_radius)
+    radius = new_radius
+    radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
+    filter = make_cbf_filter(radii) # pi_{j+1}
+    temp_env.close()
+
+    ### COLLECTING q1 FOR POSTERITY ###
+    # Make sure the environment is reset for rollout collection
+    multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
+    solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
+    obs, stored_states = deterministic_reset(env, args.seed, stored_states)
+    snapshot = safe_capture_env_snapshot(env)
+    temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
+    # Collect actual rollouts to compare against (with current radius)
+    logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
+                multi_actor, multi_rnn_states, 
+                solo_actor, solo_rnn_states, solo_obs_dim, 
+                pred_trajectories, filter,
+                max_steps=args.episode_length, 
+                num_runs=args.num_trajectories, 
+                deterministic=args.deterministic,
+                num_threads=max_threads)
+    # Set radius depending on how bad our prediction was
+    q1 = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
+    q1 = np.max(q1) # Not actually updating radius based on q1, just wanted to know
+    print('r1', radius, 'q1', q1)
+    temp_env.close()
+
+    ##### COLLECTING THE DATA FOR EPISODE 1 #####
+    episode = 1
+    # Do a full reset before collecting rollouts
+    multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
+    solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
+    obs, stored_states = deterministic_reset(env, args.seed, stored_states)
+    snapshot = safe_capture_env_snapshot(env)
+    temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
+    # Collect actual rollouts to compare against (with current radius)
+    logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
+                multi_actor, multi_rnn_states, 
+                solo_actor, solo_rnn_states, solo_obs_dim, 
+                pred_trajectories, filter,
+                max_steps=args.episode_length, 
+                num_runs=args.num_eval_trajs, 
+                deterministic=args.deterministic,
+                num_threads=max_threads)
+    temp_env.close()
+
+    ##### DIGEST DATA FOR THIS EPISODE #####
+    cumulative_reward_per_run = []
+    tube_coverage_per_run = []
+    num_crashes_per_run = []
+    num_bad_crashes_per_run = []
+    solo_agent_id = args.num_multi_agents
+    for run_id in range(args.num_eval_trajs):
+        num_nonswap_steps = 0
+        cumulative_reward = 0
+        in_tube = [True] * args.num_multi_agents
+        num_crashes = 0
+        num_bad_crashes = 0
+        # Skip first step so we can do comparisons with the earlier step
+        # Also no chance of crashes or leaving tube in the first step
+        for step in range(1, args.episode_length):
+            # If, at this step, the goal didn't change wrt last step
+            if not logs[solo_agent_id][run_id]['goal_swap'][step]:
+                num_nonswap_steps += 1
+                # Should have a smaller distance this step than last step if same goal
+                delta_distance = logs[solo_agent_id][run_id]['goal_dist'][step - 1] - logs[solo_agent_id][run_id]['goal_dist'][step]
+                # if run_id == 0:
+                #     print(logs[solo_agent_id][run_id]['goal_dist'][step - 1], logs[solo_agent_id][run_id]['goal_dist'][step])
+                if delta_distance > 0:
+                    cumulative_reward += delta_distance
+            solo_loc = logs[solo_agent_id][run_id]['position'][step]
+            for agent_id in range(args.num_multi_agents):
+                agent_loc = logs[agent_id][run_id]['position'][step]
+                pred_loc = pred_trajectories[agent_id][step][:3]
+                # If outside of tube, set in_tube to False: can't become True
+                if np.linalg.norm(agent_loc - pred_loc) > radius:
+                    in_tube[agent_id] = False
+                # Record a crash if below the minimum radius
+                if np.linalg.norm(solo_loc - agent_loc) <= MIN_RADIUS:
+                    num_crashes += 1
+                    # If crashed and that agent wasn't in their tube, presumably avoidable
+                    if not in_tube[agent_id]:
+                        num_bad_crashes += 1
+        # Don't want to be penalized for the number of times the goal swaps since that's good
+        cumulative_reward_per_run.append(cumulative_reward / num_nonswap_steps * (args.episode_length - 1))
+        # Make agnostic to the number of multi agents
+        tube_coverage_per_run.append(sum(in_tube) / args.num_multi_agents)
+        num_crashes_per_run.append(num_crashes)
+        num_bad_crashes_per_run.append(num_bad_crashes)
+    # Take average over evaluation runs
+    cumulative_reward_per_episode.append(sum(cumulative_reward_per_run) / args.num_eval_trajs)
+    tube_coverage_per_episode.append(sum(tube_coverage_per_run) / args.num_eval_trajs)
+    crashes_per_episode.append(sum(num_crashes_per_run) / args.num_eval_trajs)
+    bad_crashes_per_episode.append(sum(num_bad_crashes_per_run) / args.num_eval_trajs)
+    safety = 1 - sum([crashes > 0 for crashes in num_bad_crashes_per_run]) / args.num_eval_trajs
+    safety_per_episode.append(safety)
+    cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
+    # Radius updates don't change across eval runs so just append normally
+    qj_per_episode.append(q1) # Save q1 but don't use for anything
+    radius_per_episode.append(radius)
+    # Cache predicted trajectories used this episode
+    predicted_traj_per_episode.append(np.asarray(pred_trajectories, dtype=np.float32))
+    agent_locs = []
+    for agent_id in range(args.num_multi_agents + 1):
+        agent_locs.append(logs[agent_id][0]['position'])
+    agent_locs_per_episode.append(agent_locs) # episodes x agents x steps x 3
 
     ##### SETTING THE RADIUS FOR EPISODE num_episodes #####
     for i in range(args.num_episodes):
-        new_radius = qj + KAPPA * delta_r 
+        new_radius = q0 + KAPPA * delta_r 
         delta_r = np.abs(new_radius - radius) # How different is it this time
         radius = new_radius
     radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
@@ -375,10 +451,11 @@ def main() -> None:
     # Set radius depending on how bad our prediction was
     qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
     qj = np.max(qj) # Not actually updating radius based on qj, just wanted to know
-    print('radius', radius, 'qj', qj, 'new radius', new_radius)
+    print('radius', radius, 'qj', qj)
     temp_env.close()
 
     ##### COLLECTING THE DATA FOR THIS EPISODE #####
+    episode = args.num_episodes + 1
     # Do a full reset before collecting rollouts
     multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
     solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
@@ -452,12 +529,16 @@ def main() -> None:
     radius_per_episode.append(radius)
     # Cache predicted trajectories used this episode
     predicted_traj_per_episode.append(np.asarray(pred_trajectories, dtype=np.float32))
+    agent_locs = []
+    for agent_id in range(args.num_multi_agents + 1):
+        agent_locs.append(logs[agent_id][0]['position'])
+    agent_locs_per_episode.append(agent_locs) # episodes x agents x steps x 3
 
     # Persist per-episode metrics for offline plotting
     metrics_path = os.path.join(experiment_dir, "conformal_metrics.npz")
     np.savez(
         metrics_path,
-        episodes=np.array([0, args.num_episodes]),
+        episodes=np.array([0, 1, args.num_episodes + 1]),
         qj_per_episode=np.asarray(qj_per_episode, dtype=np.float32),
         radius_per_episode=np.asarray(radius_per_episode, dtype=np.float32),
         tube_coverage_per_episode=np.asarray(tube_coverage_per_episode, dtype=np.float32),
