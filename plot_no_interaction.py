@@ -216,7 +216,7 @@ def main() -> None:
                 color="tab:blue",
                 label="Predicted (multi)" if agent_id == 0 else None,
             )
-        ax.set_title(rf"3D Trajectories (Episode {episode + 1})")
+        ax.set_title(rf"3D Trajectories (Episode {episode})")
         if len(episodes) == 1:
             ax.set_title(rf"3D Trajectories (Non-interactive)")
         ax.set_xlabel(r"$x$ (m)")
@@ -224,7 +224,7 @@ def main() -> None:
         ax.set_zlabel(r"$z$ (m)")
         if episode_idx == 0:
             ax.legend()
-        traj_plot_path = os.path.join(output_dir, f"trajectories_episode_{episode + 1}.pdf")
+        traj_plot_path = os.path.join(output_dir, f"trajectories_episode_{episode}.pdf")
         fig.savefig(traj_plot_path, bbox_inches="tight", format='pdf')
         plt.close(fig)
         plot_paths[f"trajectories_{episode + 1}"] = traj_plot_path
@@ -241,7 +241,7 @@ def main() -> None:
 
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
-        ax.view_init(elev=20, azim=45)  # tweak these to taste
+        ax.view_init(elev=20, azim=45)  # tweak these to taste elev=20, azim=45
 
         for agent_id in [agent_idx, num_agents - 1]:
             traj = trajs[agent_id]
@@ -271,7 +271,7 @@ def main() -> None:
         ax.scatter([agent_start[0]], [agent_start[1]], [agent_start[2]], color="tab:blue", marker="o", s=30)
         # Build legend without Poly3DCollection handles from spheres
         handles, labels = ax.get_legend_handles_labels()
-        ax.set_title(rf"Conformal Tube: Episode \#{episode + 1}, Radius {radius_arr[episode_idx]:.3g} (m)")
+        ax.set_title(rf"Conformal Tube: Episode \#{episode}, Radius {radius_arr[episode_idx]:.3g} (m)")
         if len(episodes) == 1:
             ax.set_title(rf"Conformal Tube: Non-interactive, Radius {radius_arr[episode_idx]:.3g} (m)")
         ax.set_xlabel(r"$x$ (m)")
@@ -283,10 +283,10 @@ def main() -> None:
             ax.set_zlim(*axes_lim['z'])
         if episode_idx == 0:
             ax.legend(handles, labels)
-        traj_plot_path = os.path.join(output_dir, f"tube_{episode + 1}.pdf")
+        traj_plot_path = os.path.join(output_dir, f"tube_{episode}.pdf")
         fig.savefig(traj_plot_path, bbox_inches="tight", format='pdf')
         plt.close(fig)
-        plot_paths[f"tube_{episode + 1}"] = traj_plot_path
+        plot_paths[f"tube_{episode}"] = traj_plot_path
         if axes_lim is None:
             axes_lim = {}
             axes_lim['x'] = ax.get_xlim()
