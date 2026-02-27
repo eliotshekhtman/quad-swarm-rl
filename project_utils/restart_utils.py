@@ -84,6 +84,9 @@ def apply_initial_states(env, states: List[QuadState]) -> List[np.ndarray]:
     obs = [quad.state_vector(quad) for quad in env.envs]
     if env.num_use_neighbor_obs > 0:
         obs = env.add_neighborhood_obs(obs)
+    # Keep obstacle observations consistent with regular env.step()/env.reset() paths.
+    if getattr(env, "use_obstacles", False):
+        obs = env.obstacles.step(obs=obs, quads_pos=env.pos)
     return obs
 
 

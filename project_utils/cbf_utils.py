@@ -17,10 +17,29 @@ GRAVITY_VECTOR = np.array([0.0, 0.0, -9.81], dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------
+# Local vector helpers (avoid dependency on quadrotor_dynamics imports)
+# ---------------------------------------------------------------------------
+
+def _cross(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.cross(np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64))
+
+
+def _cross_mx4(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+    return np.cross(np.asarray(v1, dtype=np.float64), np.asarray(v2, dtype=np.float64))
+
+
+def _cross_vec_mx4(v: np.ndarray, mx4: np.ndarray) -> np.ndarray:
+    mx4_arr = np.asarray(mx4, dtype=np.float64)
+    v_arr = np.asarray(v, dtype=np.float64)
+    tiled_v = np.tile(v_arr.reshape(1, 3), (mx4_arr.shape[0], 1))
+    return np.cross(tiled_v, mx4_arr)
+
+
+# ---------------------------------------------------------------------------
 # Motor command conversions
 # ---------------------------------------------------------------------------
 
-def _normalized_to_thrust(norm_cmds: np.ndarray, dynamics) -> np.ndarray:
+def _normalized_to_thrust(norm_cmds: np.ndarray, dynamics, give_damped_cmds=False) -> np.ndarray:
     """
     Convert environment actions in [0, 1] into per-rotor thrust magnitudes (Newtons).
 
@@ -38,7 +57,15 @@ def _normalized_to_thrust(norm_cmds: np.ndarray, dynamics) -> np.ndarray:
     
     thrust_max = np.asarray(getattr(dynamics, "thrust_max"), dtype=np.float64)
     linearity = np.asarray(getattr(dynamics, "motor_linearity", 1.0), dtype=np.float64)
-    return thrust_max * dynamics.angvel2thrust(thrust_cmds_damp, linearity=linearity)
+    thrusts = thrust_max * dynamics.angvel2thrust(thrust_cmds_damp, linearity=linearity)
+
+    torques = dynamics.prop_crossproducts * thrusts[:, None]  
+    torques[:, 2] += dynamics.torque_max * dynamics.prop_ccw * thrust_cmds_damp
+
+    if give_damped_cmds:
+        return thrusts, torques, thrust_cmds_damp
+    else:
+        return thrusts, torques
 
 def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
     def _invert_single(index):
@@ -46,7 +73,8 @@ def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
         for _ in range(30):
             mid = 0.5 * (low + high)
             test_norm = np.ones(4) * mid 
-            val = _normalized_to_thrust(test_norm, dynamics)[index]
+            test_thrusts, _ = _normalized_to_thrust(test_norm, dynamics)
+            val = test_thrusts[index]
             if val < thrusts[index]:
                 low = mid
             else:
@@ -57,35 +85,115 @@ def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
         norm_cmds[i] = _invert_single(i)
     return norm_cmds
 
-# def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
-#     """
-#     Invert ``_normalized_to_thrust`` by numerically recovering the [0, 1] motor
-#     commands whose actuator model yields the requested thrust magnitudes.
-#     """
-#     thrusts = np.asarray(thrusts, dtype=np.float64)
-#     thrust_max = np.asarray(getattr(dynamics, "thrust_max"), dtype=np.float64)
-#     ratio = np.clip(thrusts / thrust_max, 0.0, 1.0)
-#     linearity = np.asarray(getattr(dynamics, "motor_linearity", 1.0), dtype=np.float64)
-#     linearity = np.broadcast_to(np.atleast_1d(linearity), ratio.shape).astype(np.float64)
+def cbf_dynamics(norm_cmds, dynamics, dt):
+    thrusts, torques = _normalized_to_thrust(norm_cmds, dynamics)
 
-#     def _invert_single(r: float, lin: float) -> float:
-#         """
-#         Use a monotone bisection driven entirely by ``angvel2thrust`` so the
-#         inverse stays coupled to the simulator's actuator curves.
-#         """
-#         low, high = 0.0, 1.0
-#         for _ in range(30):
-#             mid = 0.5 * (low + high)
-#             val = float(dynamics.angvel2thrust(np.array([mid]), linearity=np.array([lin]))[0])
-#             if val < r:
-#                 low = mid
-#             else:
-#                 high = mid
-#         return 0.5 * (low + high)
+    torque = np.sum(torques, axis=0)
+    thrust = np.array([0, 0, np.sum(thrusts)])
 
-#     vectorized = np.vectorize(_invert_single, otypes=[np.float64])
-#     normalized = vectorized(ratio, linearity)
-#     return np.clip(normalized, 0.0, 1.0)
+    # ROTATIONAL DYNAMICS
+    # Integrating rotations (based on current values)
+    omega_vec = np.matmul(dynamics.rot, dynamics.omega)  # Change from body to world frame
+    wx, wy, wz = omega_vec
+    omega_norm = np.linalg.norm(omega_vec)
+    if omega_norm != 0:
+        # See [7]
+        K = np.array([[0, -wz, wy], [wz, 0, -wx], [-wy, wx, 0]]) / omega_norm
+        rot_angle = omega_norm * dt
+        dRdt = np.eye(3) + np.sin(rot_angle) * K + (1. - np.cos(rot_angle)) * (K @ K)
+        rot = dRdt @ dynamics.rot
+    else:
+        rot = dynamics.rot
+
+    # COMPUTING OMEGA UPDATE
+    omega_dot = ((1.0 / dynamics.inertia) * (_cross(-dynamics.omega, dynamics.inertia * dynamics.omega) + torque))
+    omega = dynamics.omega + dt * omega_dot
+    omega = np.clip(omega, a_min=-dynamics.omega_max, a_max=dynamics.omega_max)
+
+    # TRANSLATIONAL DYNAMICS
+    # Computing position
+    pos = dynamics.pos + dt * dynamics.vel
+    force = np.matmul(rot, thrust)
+    acc = [0., 0., -9.81] + (1.0 / dynamics.mass) * force
+
+    # Computing velocities
+    vel = dynamics.vel + dt * acc
+    return pos, vel, rot, omega # What I'm determining to be the state
+
+def real_dynamics(norm_cmds, dynamics, dt):
+    thrusts, torques, thrust_cmds_damp = _normalized_to_thrust(norm_cmds, dynamics, True)
+
+    thrust_torque = np.sum(torques, axis=0)
+
+    # Rotor drag and Rolling forces and moments
+    # See Ref[1] Sec:2.1 for details
+    if dynamics.C_rot_drag != 0 or dynamics.C_rot_roll != 0:
+        vel_body = dynamics.rot.T @ dynamics.vel
+        v_rotor = vel_body + _cross_vec_mx4(dynamics.omega, dynamics.model.prop_pos)
+        v_rotor[:, 2] = 0.  # Projection to the rotor plane
+
+        # Drag/Roll of rotors (both in body frame)
+        rotor_drag_fi = - dynamics.C_rot_drag * np.sqrt(thrust_cmds_damp)[:, None] * v_rotor
+        rotor_drag_force = np.sum(rotor_drag_fi, axis=0)
+        rotor_drag_ti = _cross_mx4(rotor_drag_fi, dynamics.model.prop_pos)
+        rotor_drag_torque = np.sum(rotor_drag_ti, axis=0)
+
+        rotor_roll_torque = \
+            - dynamics.C_rot_roll * dynamics.prop_ccw[:, None] * np.sqrt(thrust_cmds_damp)[:, None] * v_rotor
+        rotor_roll_torque = np.sum(rotor_roll_torque, axis=0)
+        rotor_visc_torque = rotor_drag_torque + rotor_roll_torque
+
+        # Constraints (prevent numerical instabilities)
+        vel_norm = np.linalg.norm(vel_body)
+        rdf_norm = np.linalg.norm(rotor_drag_force)
+        rdf_norm_clip = np.clip(rdf_norm, a_min=0., a_max=vel_norm * dynamics.mass / (2 * dt))
+        if rdf_norm > EPS:
+            rotor_drag_force = (rotor_drag_force / rdf_norm) * rdf_norm_clip
+
+        # omega_norm = np.linalg.norm(dynamics.omega)
+        rvt_norm = np.linalg.norm(rotor_visc_torque)
+        rvt_norm_clipped = np.clip(rvt_norm, a_min=0., a_max=np.linalg.norm(dynamics.omega * dynamics.inertia) / (2 * dt))
+        if rvt_norm > EPS:
+            rotor_visc_torque = (rotor_visc_torque / rvt_norm) * rvt_norm_clipped
+    else:
+        rotor_visc_torque = rotor_drag_force = np.zeros(3)
+
+    # (Square) Damping using torques (in case we would like to add damping using torques)
+    # damping_torque = - 0.3 * dynamics.omega * np.fabs(dynamics.omega)
+    torque = thrust_torque + rotor_visc_torque
+    thrust = np.array([0, 0, np.sum(thrusts)])
+
+    # ROTATIONAL DYNAMICS
+    # Integrating rotations (based on current values)
+    omega_vec = np.matmul(dynamics.rot, dynamics.omega)  # Change from body to world frame
+    wx, wy, wz = omega_vec
+    omega_norm = np.linalg.norm(omega_vec)
+    if omega_norm != 0:
+        # See [7]
+        K = np.array([[0, -wz, wy], [wz, 0, -wx], [-wy, wx, 0]]) / omega_norm
+        rot_angle = omega_norm * dt
+        dRdt = np.eye(3) + np.sin(rot_angle) * K + (1. - np.cos(rot_angle)) * (K @ K)
+        rot = dRdt @ dynamics.rot
+    else:
+        rot = dynamics.rot
+
+    # COMPUTING OMEGA UPDATE
+    omega_dot = ((1.0 / dynamics.inertia) * (_cross(-dynamics.omega, dynamics.inertia * dynamics.omega) + torque))
+    # Quadratic damping
+    # 0.03 corresponds to roughly 1 revolution per sec
+    omega_damp_quadratic = np.clip(dynamics.damp_omega_quadratic * dynamics.omega ** 2, a_min=0.0, a_max=1.0)
+    omega = dynamics.omega + (1.0 - omega_damp_quadratic) * dt * omega_dot
+    omega = np.clip(omega, a_min=-dynamics.omega_max, a_max=dynamics.omega_max)
+
+    # TRANSLATIONAL DYNAMICS
+    # Computing position
+    pos = dynamics.pos + dt * dynamics.vel
+    force = np.matmul(rot, thrust)
+    acc = [0., 0., -9.81] + (1.0 / dynamics.mass) * force
+
+    # Computing velocities
+    vel = (1.0 - dynamics.vel_damp) * dynamics.vel + dt * acc
+    return pos, vel, rot, omega # What I'm determining to be the state
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +376,7 @@ def apply_cbf_filter(
     # Action space conversions: [-1, 1] → [0, 1] → Newton thrusts.
     base_action = np.asarray(base_action, dtype=np.float64)
     normalized = np.clip(0.5 * (base_action + 1.0), 0.0, 1.0)
-    u_ref_thrust = _normalized_to_thrust(normalized, dynamics)
+    u_ref_thrust, _ = _normalized_to_thrust(normalized, dynamics)
 
     u_min = np.zeros(4, dtype=np.float64)
     u_max = np.asarray(dynamics.thrust_max, dtype=np.float64)
@@ -300,4 +408,3 @@ def make_cbf_filter(radii: np.ndarray):
     def filter(base_action: np.ndarray, env_state, swarm_state: SwarmState, debug=False):
         return apply_cbf_filter(base_action, radii, env_state, swarm_state, debug=debug)
     return filter
-
