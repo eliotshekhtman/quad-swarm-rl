@@ -504,6 +504,12 @@ def collect_lipschitz(
 
         # Initial reset/snapshot to establish deterministic baseline state buffers.
         obs, stored_states = deterministic_reset(env, seed, None)
+        print(
+            f"[collect_lipschitz] quad inertia (diag): "
+            f"{np.asarray(env.unwrapped.envs[0].dynamics.inertia, dtype=np.float64).tolist()}, "
+            f"mass: {float(env.unwrapped.envs[0].dynamics.mass):.6f}, "
+            f"dt: {float(env.unwrapped.control_dt):.6f}"
+        )
         if geometry is not None:
             _apply_fixed_obstacle_geometry(env, geometry)
         obs = _set_single_agent_start_goal(env, start_point, goal_point)
@@ -526,7 +532,7 @@ def collect_lipschitz(
         traj_ids = np.empty(num_total_samples, dtype=np.int32)
         step_ids = np.empty(num_total_samples, dtype=np.int32)
         policy_actions_unit = np.empty((num_total_samples, action_dim), dtype=np.float32)
-        policy_thrusts = np.empty((num_total_samples, action_dim), dtype=np.float32)
+        policy_thrusts = np.empty((num_total_samples, 16), dtype=np.float32)
         actual_actions_unit = np.empty((num_total_samples, action_dim), dtype=np.float32)
 
         real_next_actual = np.empty((num_total_samples, 18), dtype=np.float32)
@@ -582,7 +588,7 @@ def collect_lipschitz(
 
                 dynamics = env.unwrapped.envs[0].dynamics
                 base_action_unit = _action_to_unit(base_action_raw, action_low, action_high)
-                base_thrust, _ = _normalized_to_thrust(base_action_unit, dynamics)
+                base_thrust, base_torque = _normalized_to_thrust(base_action_unit, dynamics)
 
                 # Snapshot current simulator state x_t before stepping.
                 current_state = _pack_state(dynamics.pos, dynamics.vel, dynamics.rot, dynamics.omega)
@@ -658,7 +664,7 @@ def collect_lipschitz(
                 traj_ids[sample_idx] = traj
                 step_ids[sample_idx] = step
                 policy_actions_unit[sample_idx] = base_action_unit.astype(np.float32)
-                policy_thrusts[sample_idx] = base_thrust.astype(np.float32)
+                policy_thrusts[sample_idx] = np.concatenate((base_thrust, base_torque.flatten()), axis=0)
                 actual_actions_unit[sample_idx] = actual_action_unit.astype(np.float32)
 
                 real_next_actual[sample_idx] = real_bank[0].astype(np.float32)
