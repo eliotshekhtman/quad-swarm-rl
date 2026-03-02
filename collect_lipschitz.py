@@ -5,7 +5,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,7 +15,7 @@ from sample_factory.algo.utils.action_distributions import argmax_actions
 from sample_factory.algo.utils.rl_utils import prepare_and_normalize_obs
 from sample_factory.model.model_utils import get_rnn_size
 
-from project_utils.cbf_utils import cbf_dynamics, real_dynamics
+from project_utils.cbf_utils import _normalized_to_thrust, apply_cbf_filter, cbf_dynamics, real_dynamics
 from project_utils.restart_utils import deterministic_reset
 from project_utils.utils import OBS_KEY, latest_checkpoint, load_actor, load_cfg
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
@@ -23,6 +23,7 @@ from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
 DEVICE = torch.device("cpu")
 EPS = 1e-6
+INFEASIBLE_EQ_TOL = 1e-6
 
 def _pack_state(position: np.ndarray, velocity: np.ndarray, rotation: np.ndarray, omega: np.ndarray) -> np.ndarray:
     """
@@ -101,11 +102,13 @@ def _set_single_agent_start_goal(env, start_point: np.ndarray, goal_point: np.nd
     obs = [quad.state_vector(quad)]
     if getattr(base_env, "num_use_neighbor_obs", 0) > 0:
         obs = base_env.add_neighborhood_obs(obs)
+    if getattr(base_env, "use_obstacles", False) and getattr(base_env, "obstacles", None) is not None:
+        obs = base_env.obstacles.step(obs=obs, quads_pos=base_env.pos)
     return np.asarray(obs, dtype=np.float32)
 
 
 def _compute_pairwise_action_lipschitz(
-    actions_unit: np.ndarray,
+    actions_thrust: np.ndarray,
     real_next: np.ndarray,
     residual_next: np.ndarray,
     ratios_u: np.ndarray,
@@ -121,9 +124,9 @@ def _compute_pairwise_action_lipschitz(
 
     Results are appended into preallocated buffers for efficiency.
     """
-    pair_i, pair_j = np.triu_indices(actions_unit.shape[0], k=1)
+    pair_i, pair_j = np.triu_indices(actions_thrust.shape[0], k=1)
 
-    delta_u = np.linalg.norm(actions_unit[pair_i] - actions_unit[pair_j], axis=1)
+    delta_u = np.linalg.norm(actions_thrust[pair_i] - actions_thrust[pair_j], axis=1)
     valid = delta_u >= EPS
     if not np.any(valid):
         return write_u, write_eu
@@ -139,6 +142,37 @@ def _compute_pairwise_action_lipschitz(
     ratios_u[write_u : write_u + count] = (delta_real / delta_u).astype(np.float32)
     ratios_eu[write_eu : write_eu + count] = (delta_resid / delta_u).astype(np.float32)
     return write_u + count, write_eu + count
+
+
+def _compute_pairwise_r_lipschitz(
+    r_values: np.ndarray,
+    thrusts_for_r: np.ndarray,
+    ratios_U: np.ndarray,
+    write_U: int,
+) -> int:
+    """For one fixed state/base action, compute ||u(r_i)-u(r_j)|| / |r_i-r_j| across r pairs."""
+    pair_i, pair_j = np.triu_indices(r_values.shape[0], k=1)
+    delta_r = np.abs(r_values[pair_i] - r_values[pair_j])
+    valid = delta_r >= EPS
+    if not np.any(valid):
+        return write_U
+    pair_i = pair_i[valid]
+    pair_j = pair_j[valid]
+    delta_r = delta_r[valid]
+    delta_u = np.linalg.norm(thrusts_for_r[pair_i] - thrusts_for_r[pair_j], axis=1)
+    count = delta_r.shape[0]
+    ratios_U[write_U : write_U + count] = (delta_u / delta_r).astype(np.float32)
+    return write_U + count
+
+
+def _is_infeasible_proxy(filtered_action: np.ndarray, nominal_action: np.ndarray) -> bool:
+    """User-requested proxy: treat filtered==nominal as an infeasible fallback."""
+    return np.allclose(
+        np.asarray(filtered_action, dtype=np.float64),
+        np.asarray(nominal_action, dtype=np.float64),
+        atol=INFEASIBLE_EQ_TOL,
+        rtol=0.0,
+    )
 
 
 def _stats_from_ratios(values: np.ndarray) -> Dict[str, float]:
@@ -243,7 +277,7 @@ def _compute_state_based_lipschitz(
     step_ids: np.ndarray,
     real_next_random: np.ndarray,
     residual_random: np.ndarray,
-    policy_actions: np.ndarray,
+    policy_thrusts: np.ndarray,
     unperturbed_mask: np.ndarray,
     same_traj_window: int,
     cross_traj_window: int,
@@ -256,7 +290,7 @@ def _compute_state_based_lipschitz(
     Compute state-conditioned Lipschitz constants:
     - L_x: real dynamics sensitivity to state (fixed action).
     - L_ex: residual sensitivity to state (fixed action).
-    - L_pi: policy sensitivity to state (unperturbed rollouts only).
+    - L_pi: policy thrust sensitivity to state (unperturbed rollouts only).
     """
     i_all, j_all = _build_state_pairs(
         traj_ids=traj_ids,
@@ -326,7 +360,7 @@ def _compute_state_based_lipschitz(
         j_u = j_u[valid_pi]
         dx_pi = dx_pi[valid_pi]
         if i_u.size > 0:
-            du = np.linalg.norm(policy_actions[i_u] - policy_actions[j_u], axis=1)
+            du = np.linalg.norm(policy_thrusts[i_u] - policy_thrusts[j_u], axis=1)
             ratios_pi = (du / dx_pi).astype(np.float32)
         else:
             ratios_pi = np.empty(0, dtype=np.float32)
@@ -348,6 +382,63 @@ class CollectionResult:
     metrics_path: str
 
 
+@dataclass
+class EnvironmentGeometry:
+    """Fixed rollout geometry loaded from conformal_obstacles environment export."""
+    start_point: np.ndarray
+    goal_point: np.ndarray
+    obstacle_positions: np.ndarray
+    obstacle_radius: float
+
+
+def _load_conformal_environment_geometry(path: str) -> EnvironmentGeometry:
+    """Load single fixed geometry from conformal_obstacles_environment.json."""
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    return EnvironmentGeometry(
+        start_point=np.asarray(payload["start_point"], dtype=np.float64),
+        goal_point=np.asarray(payload["goal_point"], dtype=np.float64),
+        obstacle_positions=np.asarray(payload.get("obstacle_positions", []), dtype=np.float64),
+        obstacle_radius=float(payload["obstacle_radius"]),
+    )
+
+
+def _apply_fixed_obstacle_geometry(env, geometry: EnvironmentGeometry) -> None:
+    """
+    Override obstacle positions/radius in the live env after reset.
+    """
+    base_env = env.unwrapped
+    if not getattr(base_env, "use_obstacles", False) or getattr(base_env, "obstacles", None) is None:
+        raise ValueError("Environment does not have obstacles enabled, cannot apply fixed obstacle geometry.")
+
+    obstacles = base_env.obstacles
+    obstacles.pos_arr = np.asarray(geometry.obstacle_positions, dtype=np.float64).copy()
+    obstacles.obstacle_radius = float(geometry.obstacle_radius)
+    obstacles.size = float(2.0 * geometry.obstacle_radius)
+    base_env.num_obstacles = int(obstacles.pos_arr.shape[0])
+    base_env.obst_size = float(2.0 * geometry.obstacle_radius)
+
+
+def _build_obstacle_list(env) -> list:
+    """Build obstacle list in the format expected by apply_cbf_filter."""
+    base_env = env.unwrapped
+    if not getattr(base_env, "use_obstacles", False) or getattr(base_env, "obstacles", None) is None:
+        return []
+    centers = np.asarray(base_env.obstacles.pos_arr, dtype=np.float64)
+    if centers.size == 0:
+        return []
+    radius = float(base_env.obstacles.obstacle_radius)
+    return [
+        {
+            "position": np.asarray(c, dtype=np.float64),
+            "velocity": np.zeros(3, dtype=np.float64),
+            "radius": radius,
+        }
+        for c in centers
+    ]
+
+
 def collect_lipschitz(
     perturbation_scale: float,
     start_point: np.ndarray,
@@ -363,6 +454,8 @@ def collect_lipschitz(
     max_state_pairs: int,
     state_close_radius: float,
     output_dir: str,
+    cbf_gamma: float,
+    geometry: Optional[EnvironmentGeometry] = None,
 ) -> CollectionResult:
     """
     Execute rollouts, evaluate next-state models, and estimate empirical constants.
@@ -377,21 +470,21 @@ def collect_lipschitz(
     """
     if not (0.0 <= perturbation_scale <= 1.0):
         raise ValueError("perturbation_scale must be in [0, 1]")
+    if not (0.0 < cbf_gamma <= 1.0):
+        raise ValueError("cbf_gamma must satisfy 0 < cbf_gamma <= 1")
 
     register_swarm_components()
 
     cfg_solo = load_cfg(solo_train_dir, solo_experiment)
 
     # Match conformal-style evaluation setup with patrol_dual_goal, but single agent only.
-    # We pick episode duration long enough to cover the requested fixed horizon.
-    control_dt_guess = 0.015
-    required_seconds = max(15.0, episode_length * control_dt_guess + 1.0)
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
         "--device=cpu",
-        "--quads_mode=patrol_dual_goal",
+        "--quads_mode=o_static_same_goal" if geometry is not None else "--quads_mode=patrol_dual_goal",
         "--quads_num_agents=1",
+        f"--quads_use_obstacles={str(geometry is not None)}",
         f"--quads_neighbor_visible_num={cfg_solo.quads_neighbor_visible_num}",
         f"--quads_neighbor_obs_type={cfg_solo.quads_neighbor_obs_type}",
         "--quads_use_numba=False",
@@ -403,11 +496,16 @@ def collect_lipschitz(
 
     try:
         solo_ckpt = latest_checkpoint(solo_train_dir, solo_experiment, policy_index=0)
-        solo_actor = load_actor(cfg_solo, env.observation_space, env.action_space, solo_ckpt, DEVICE)
+        solo_env = make_quadrotor_env("quadrotor_multi", cfg=cfg_solo, render_mode=None)
+        solo_actor = load_actor(cfg_solo, solo_env.observation_space, solo_env.action_space, solo_ckpt, DEVICE)
+        solo_obs_dim = int(solo_env.observation_space.shape[0])
+        solo_env.close()
         solo_rnn_size = get_rnn_size(cfg_solo)
 
         # Initial reset/snapshot to establish deterministic baseline state buffers.
         obs, stored_states = deterministic_reset(env, seed, None)
+        if geometry is not None:
+            _apply_fixed_obstacle_geometry(env, geometry)
         obs = _set_single_agent_start_goal(env, start_point, goal_point)
 
         action_low = np.asarray(env.action_space.low, dtype=np.float64)
@@ -428,6 +526,7 @@ def collect_lipschitz(
         traj_ids = np.empty(num_total_samples, dtype=np.int32)
         step_ids = np.empty(num_total_samples, dtype=np.int32)
         policy_actions_unit = np.empty((num_total_samples, action_dim), dtype=np.float32)
+        policy_thrusts = np.empty((num_total_samples, action_dim), dtype=np.float32)
         actual_actions_unit = np.empty((num_total_samples, action_dim), dtype=np.float32)
 
         real_next_actual = np.empty((num_total_samples, 18), dtype=np.float32)
@@ -439,8 +538,11 @@ def collect_lipschitz(
         # Upper bound on pair count per state for 11 actions is C(11,2)=55.
         ratios_u = np.empty(num_total_samples * max_ratios_per_state, dtype=np.float32)
         ratios_eu = np.empty(num_total_samples * max_ratios_per_state, dtype=np.float32)
+        ratios_U = np.empty(num_total_samples * (10 * 9 // 2), dtype=np.float32)
         write_u = 0
         write_eu = 0
+        write_U = 0
+        rejected_nominal_equal = 0
 
         sample_idx = 0
         collect_pbar = tqdm(total=num_trajectories, desc="Collecting trajectories", unit="traj")
@@ -448,6 +550,8 @@ def collect_lipschitz(
         for traj in range(num_trajectories):
             # Deterministic per-trajectory reset then explicit override to requested start/goal.
             obs, stored_states = deterministic_reset(env, seed + traj, stored_states)
+            if geometry is not None:
+                _apply_fixed_obstacle_geometry(env, geometry)
             obs = _set_single_agent_start_goal(env, start_point, goal_point)
 
             run_rnn = torch.zeros((1, solo_rnn_size), dtype=torch.float32, device=DEVICE)
@@ -455,7 +559,7 @@ def collect_lipschitz(
 
             for step in range(episode_length):
                 obs_np = np.asarray(obs, dtype=np.float32)
-                obs_self = obs_np[0]
+                obs_self = obs_np[0, :solo_obs_dim]
                 obs_dict = {OBS_KEY: obs_self[None, :]}
 
                 # Policy inference for solo action.
@@ -472,23 +576,38 @@ def collect_lipschitz(
                 if is_perturbed_rollout:
                     # Perturbed half: additive bounded uniform noise before clipping to env bounds.
                     noise = rng.uniform(low=-1.0, high=1.0, size=action_dim)
-                    actual_action_raw = np.clip(base_action_raw + perturbation_scale * noise, action_low, action_high)
+                    pre_cbf_action_raw = np.clip(base_action_raw + perturbation_scale * noise, action_low, action_high)
                 else:
-                    actual_action_raw = base_action_raw
+                    pre_cbf_action_raw = base_action_raw
 
+                dynamics = env.unwrapped.envs[0].dynamics
                 base_action_unit = _action_to_unit(base_action_raw, action_low, action_high)
-                actual_action_unit = _action_to_unit(actual_action_raw, action_low, action_high)
+                base_thrust, _ = _normalized_to_thrust(base_action_unit, dynamics)
 
                 # Snapshot current simulator state x_t before stepping.
-                dynamics = env.unwrapped.envs[0].dynamics
                 current_state = _pack_state(dynamics.pos, dynamics.vel, dynamics.rot, dynamics.omega)
+                obstacle_list = _build_obstacle_list(env)
+
+                # Execute actions through the CBF filter with r=0.
+                actual_action_raw = apply_cbf_filter(
+                    base_action=pre_cbf_action_raw,
+                    env_state=env.unwrapped,
+                    quad_state=current_state.astype(np.float64),
+                    obstacles=obstacle_list,
+                    r=0.0,
+                    gamma=float(cbf_gamma),
+                ).astype(np.float64)
+                actual_action_unit = _action_to_unit(actual_action_raw, action_low, action_high)
 
                 # Probe set = {executed action} U {10 shared random actions}.
                 action_bank_unit = np.vstack([actual_action_unit[None, :], random_actions_unit])
+                action_bank_thrust = np.empty((11, 16), dtype=np.float64)
                 real_bank = np.empty((11, 18), dtype=np.float64)
                 cbf_bank = np.empty((11, 18), dtype=np.float64)
                 for a_idx in range(11):
                     cmd_unit = action_bank_unit[a_idx]
+                    thrust_cmd, torque_cmd = _normalized_to_thrust(cmd_unit, dynamics)
+                    action_bank_thrust[a_idx] = np.concatenate((thrust_cmd, torque_cmd.flatten()), axis=0)
                     real_next = real_dynamics(cmd_unit, dynamics, env.unwrapped.control_dt)
                     cbf_next = cbf_dynamics(cmd_unit, dynamics, env.unwrapped.control_dt)
                     real_bank[a_idx] = _pack_next_state_tuple(real_next)
@@ -497,7 +616,7 @@ def collect_lipschitz(
                 # Residual dynamics e(x,u) = real(x,u) - cbf(x,u).
                 residual_bank = real_bank - cbf_bank
                 write_u, write_eu = _compute_pairwise_action_lipschitz(
-                    actions_unit=action_bank_unit,
+                    actions_thrust=action_bank_thrust,
                     real_next=real_bank,
                     residual_next=residual_bank,
                     ratios_u=ratios_u,
@@ -506,10 +625,40 @@ def collect_lipschitz(
                     write_eu=write_eu,
                 )
 
+                # L_U: sensitivity of CBF-filtered thrust output to the conformal radius r.
+                num_r_values = 2
+                r_values = rng.uniform(low=0.0, high=5.0, size=num_r_values).astype(np.float64)
+                thrusts_for_r = np.empty((num_r_values, 16), dtype=np.float64)
+                valid_r_mask = np.ones(num_r_values, dtype=bool)
+                for r_idx, r_val in enumerate(r_values):
+                    action_r = apply_cbf_filter(
+                        base_action=pre_cbf_action_raw,
+                        env_state=env.unwrapped,
+                        quad_state=current_state.astype(np.float64),
+                        obstacles=obstacle_list,
+                        r=float(r_val),
+                        gamma=float(cbf_gamma),
+                    ).astype(np.float64)
+                    if _is_infeasible_proxy(action_r, pre_cbf_action_raw):
+                        rejected_nominal_equal += 1
+                        valid_r_mask[r_idx] = False
+                        continue
+                    action_r_unit = _action_to_unit(action_r, action_low, action_high)
+                    thrust_r, torque_r = _normalized_to_thrust(action_r_unit, dynamics)
+                    thrusts_for_r[r_idx] = np.concatenate((thrust_r, torque_r.flatten()), axis=0)
+                if np.sum(valid_r_mask) >= 2:
+                    write_U = _compute_pairwise_r_lipschitz(
+                        r_values=r_values[valid_r_mask],
+                        thrusts_for_r=thrusts_for_r[valid_r_mask],
+                        ratios_U=ratios_U,
+                        write_U=write_U,
+                    )
+
                 states[sample_idx] = current_state.astype(np.float32)
                 traj_ids[sample_idx] = traj
                 step_ids[sample_idx] = step
                 policy_actions_unit[sample_idx] = base_action_unit.astype(np.float32)
+                policy_thrusts[sample_idx] = base_thrust.astype(np.float32)
                 actual_actions_unit[sample_idx] = actual_action_unit.astype(np.float32)
 
                 real_next_actual[sample_idx] = real_bank[0].astype(np.float32)
@@ -523,9 +672,22 @@ def collect_lipschitz(
             collect_pbar.update(1)
         collect_pbar.close()
 
+        # Drop unfilled sample tail if some steps were rejected.
+        states = states[:sample_idx]
+        traj_ids = traj_ids[:sample_idx]
+        step_ids = step_ids[:sample_idx]
+        policy_actions_unit = policy_actions_unit[:sample_idx]
+        policy_thrusts = policy_thrusts[:sample_idx]
+        actual_actions_unit = actual_actions_unit[:sample_idx]
+        real_next_actual = real_next_actual[:sample_idx]
+        cbf_next_actual = cbf_next_actual[:sample_idx]
+        real_next_random = real_next_random[:, :sample_idx, :]
+        cbf_next_random = cbf_next_random[:, :sample_idx, :]
+
         # Trim unused preallocated ratio tail.
         ratios_u = ratios_u[:write_u]
         ratios_eu = ratios_eu[:write_eu]
+        ratios_U = ratios_U[:write_U]
 
         # Residuals for random probe actions used by L_ex computation.
         residual_random = real_next_random - cbf_next_random
@@ -539,7 +701,7 @@ def collect_lipschitz(
             step_ids=step_ids,
             real_next_random=real_next_random,
             residual_random=residual_random,
-            policy_actions=policy_actions_unit,
+            policy_thrusts=policy_thrusts,
             unperturbed_mask=unperturbed_mask,
             same_traj_window=same_traj_window,
             cross_traj_window=cross_traj_window,
@@ -565,13 +727,20 @@ def collect_lipschitz(
                 "cross_samples_per_step": int(cross_samples_per_step),
                 "max_state_pairs": int(max_state_pairs),
                 "state_close_radius": float(state_close_radius),
-                "action_space": "[0, 1]^4 (normalized)",
+                "u_space_for_L_u_and_L_eu": "thrust (Newtons, R^4)",
+                "L_U_r_range": "[0, 50]",
+                "cbf_rollout_r": 0.0,
+                "cbf_gamma": float(cbf_gamma),
+                "uses_fixed_obstacle_geometry": bool(geometry is not None),
+                "rejected_nominal_equal_count_L_U_only": int(rejected_nominal_equal),
+                "num_valid_samples": int(sample_idx),
             },
             "L_u": _stats_from_ratios(ratios_u),
             "L_eu": _stats_from_ratios(ratios_eu),
             "L_x": state_metrics["L_x"],
             "L_ex": state_metrics["L_ex"],
             "L_pi": state_metrics["L_pi"],
+            "L_U": _stats_from_ratios(ratios_U),
         }
         lipschitz_pbar.update(1)
         lipschitz_pbar.close()
@@ -614,6 +783,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode_length", type=int, default=1500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", default="train_dir/lipschitz_collection")
+    parser.add_argument("--cbf_gamma", type=float, default=0.8, help="CBF gamma used when filtering actions.")
 
     # State-pair search controls for L_x, L_ex, and L_pi.
     parser.add_argument("--same_traj_window", type=int, default=8)
@@ -621,6 +791,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cross_samples_per_step", type=int, default=2)
     parser.add_argument("--max_state_pairs", type=int, default=500000)
     parser.add_argument("--state_close_radius", type=float, default=2.0)
+    parser.add_argument(
+        "--conformal_environment_json",
+        type=str,
+        default=None,
+        help="Optional path to conformal_obstacles_environment.json. If provided, start/goal/obstacles are loaded from it.",
+    )
     return parser.parse_args()
 
 
@@ -631,6 +807,18 @@ def main() -> None:
     # Requested defaults for patrol_dual_goal-like 3D points.
     start_point = np.array([-1.0, -1.0, -1.0], dtype=np.float64)
     goal_point = np.array([2.0, 2.0, 2.0], dtype=np.float64)
+    geometry = None
+    if args.conformal_environment_json is not None:
+        geometry = _load_conformal_environment_geometry(args.conformal_environment_json)
+        start_point = geometry.start_point.copy()
+        goal_point = geometry.goal_point.copy()
+        print(f"Loaded geometry from {args.conformal_environment_json}")
+        print(f"  start_point={start_point.tolist()}")
+        print(f"  goal_point={goal_point.tolist()}")
+        print(
+            f"  obstacles={int(geometry.obstacle_positions.shape[0])}, "
+            f"radius={float(geometry.obstacle_radius):.6f}"
+        )
 
     result = collect_lipschitz(
         perturbation_scale=args.perturbation_scale,
@@ -646,6 +834,8 @@ def main() -> None:
         max_state_pairs=args.max_state_pairs,
         state_close_radius=args.state_close_radius,
         output_dir=args.output_dir,
+        cbf_gamma=args.cbf_gamma,
+        geometry=geometry,
     )
 
     print("Saved dataset:", result.dataset_path)
