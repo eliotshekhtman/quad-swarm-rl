@@ -30,7 +30,7 @@ from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 from project_utils.conformal_utils import explicit_radius_update, get_alpha_bar
 from project_utils.cbf_utils import CBF_K0, CBF_K1, apply_cbf_filter, cbf_dynamics, real_dynamics
 from project_utils.restart_utils import deterministic_reset, extract_positions_velocities
-from project_utils.utils import OBS_KEY, SwarmState, load_actor, load_cfg, latest_checkpoint
+from project_utils.utils import OBS_KEY, load_actor, load_cfg, latest_checkpoint
 
 DEVICE = torch.device("cpu")
 MAX_RADIUS = 8.0
@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--kappa", type=float, default=0.6, help="Radius update aggressiveness.")
     parser.add_argument("--initial_radius", type=float, default=2.0, help="Initial conformal safety radius.")
+    parser.add_argument("--obstacle_radius_margin", type=float, default=0.05, help="Extra radius added to each obstacle for CBF constraints.")
+    parser.add_argument("--gamma", type=float, default=0.8, help="CBF gamma in (0, 1].")
     return parser.parse_args()
 
 
@@ -69,27 +71,48 @@ def ensure_experiment_dir(base_dir: str, name: str) -> str:
     return experiment_dir
 
 
-def _safe_boundary_points(
-    solo_pos: np.ndarray,
-    obstacle_centers: np.ndarray,
-    obstacle_radius: float,
-) -> np.ndarray:
-    """Project each obstacle center to its closest boundary point from the solo agent."""
-    points = []
-    for center in obstacle_centers:
-        rel = solo_pos - center
-        dist = float(np.linalg.norm(rel))
-        if dist < 1e-8:
-            continue
-        # Requested representation: center shifted by obstacle radius along center->solo line.
-        boundary_point = center + obstacle_radius * (rel / dist)
-        points.append(boundary_point)
-    if not points:
-        return np.zeros((0, 3), dtype=np.float64)
-    return np.asarray(points, dtype=np.float64)
+def _pack_state_tuple(pos: np.ndarray, vel: np.ndarray, rot: np.ndarray, omega: np.ndarray) -> np.ndarray:
+    return np.concatenate([pos.reshape(-1), vel.reshape(-1), rot.reshape(-1), omega.reshape(-1)], axis=0).astype(np.float64)
 
 
-def make_obstacle_cbf_filter(radius: float):
+def _capture_environment_geometry(env) -> Dict[str, object]:
+    """Capture the current single-agent obstacle environment geometry."""
+    env_unwrapped = env.unwrapped
+    return {
+        "start_point": np.asarray(env_unwrapped.envs[0].dynamics.pos, dtype=np.float64).tolist(),
+        "goal_point": np.asarray(env_unwrapped.envs[0].goal, dtype=np.float64).tolist(),
+        "obstacle_radius": float(env_unwrapped.obstacles.obstacle_radius),
+        "obstacle_positions": np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64).tolist(),
+    }
+
+
+def _print_initial_environment_geometry(env, obstacle_radius_margin: float) -> None:
+    """Print the solo quad start/goal and obstacle geometry before rollouts start."""
+    env_unwrapped = env.unwrapped
+    start_point = np.asarray(env_unwrapped.envs[0].dynamics.pos, dtype=np.float64)
+    goal_point = np.asarray(env_unwrapped.envs[0].goal, dtype=np.float64)
+    obstacle_positions = np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64)
+    base_radius = float(env_unwrapped.obstacles.obstacle_radius)
+    inflated_radius = base_radius + float(obstacle_radius_margin)
+
+    print("[conformal_obstacles] Initial geometry before episode 0")
+    print(f"  start_point: {start_point.tolist()}")
+    print(f"  goal_point: {goal_point.tolist()}")
+    print(
+        f"  obstacle_radius: {base_radius:.6f} "
+        f"(inflated_for_cbf: {inflated_radius:.6f})"
+    )
+    if obstacle_positions.size == 0:
+        print("  obstacles: []")
+        return
+    for idx, center in enumerate(obstacle_positions):
+        print(
+            f"  obstacle[{idx}]: position={np.asarray(center, dtype=np.float64).tolist()}, "
+            f"radius={base_radius:.6f} (inflated_for_cbf={inflated_radius:.6f})"
+        )
+
+
+def make_obstacle_cbf_filter(radius: float, gamma: float, obstacle_radius_margin: float):
     def _filter(base_action: np.ndarray, env_state, _unused_swarm_state=None):
         env_unwrapped = env_state.unwrapped
         if not getattr(env_unwrapped, "use_obstacles", False) or env_unwrapped.obstacles is None:
@@ -100,57 +123,58 @@ def make_obstacle_cbf_filter(radius: float):
             return np.asarray(base_action, dtype=np.float32)
 
         quad = env_unwrapped.envs[0]
-        solo_pos = np.asarray(quad.dynamics.pos, dtype=np.float64)
-        solo_vel = np.asarray(quad.dynamics.vel, dtype=np.float64)
-        solo_rot = np.asarray(quad.dynamics.rot, dtype=np.float64)
-        obstacle_radius = float(env_unwrapped.obstacles.obstacle_radius)
-
-        boundary_points = _safe_boundary_points(solo_pos, obstacle_centers, obstacle_radius)
-        if boundary_points.shape[0] == 0:
-            return np.asarray(base_action, dtype=np.float32)
-
-        num_constraints = boundary_points.shape[0]
-        pseudo_swarm_state = SwarmState(
-            positions=np.vstack([boundary_points, solo_pos[None, :]]),
-            velocities=np.vstack([np.zeros((num_constraints, 3), dtype=np.float64), solo_vel[None, :]]),
-            rotations=np.concatenate(
-                [
-                    np.repeat(np.eye(3, dtype=np.float64)[None, :, :], num_constraints, axis=0),
-                    solo_rot[None, :, :],
-                ],
-                axis=0,
-            ),
+        dynamics = quad.dynamics
+        quad_state = _pack_state_tuple(
+            np.asarray(dynamics.pos, dtype=np.float64),
+            np.asarray(dynamics.vel, dtype=np.float64),
+            np.asarray(dynamics.rot, dtype=np.float64),
+            np.asarray(dynamics.omega, dtype=np.float64),
         )
-        radii = np.full(num_constraints, float(radius), dtype=np.float64)
-        return apply_cbf_filter(base_action, radii, env_unwrapped, pseudo_swarm_state)
+        inflated_radius = float(env_unwrapped.obstacles.obstacle_radius) + float(obstacle_radius_margin)
+        obstacles = [
+            {
+                "position": np.asarray(center, dtype=np.float64),
+                "velocity": np.zeros(3, dtype=np.float64),
+                "radius": inflated_radius,
+            }
+            for center in obstacle_centers
+        ]
+        return apply_cbf_filter(
+            base_action=base_action,
+            env_state=env_unwrapped,
+            quad_state=quad_state,
+            obstacles=obstacles,
+            r=float(radius),
+            gamma=float(gamma),
+        )
 
     return _filter
 
 
-def _position_model_mismatch(
+def _state_model_mismatch(
     action: np.ndarray,
     dynamics,
     dt: float,
 ) -> float:
     """
-    Position-only one-step mismatch between cbf_dynamics and real_dynamics.
+    One-step full-state mismatch between cbf_dynamics and real_dynamics.
     """
     action = np.asarray(action, dtype=np.float64)
     normalized = np.clip(0.5 * (action + 1.0), 0.0, 1.0)
-    pos_cbf, _, _, _ = cbf_dynamics(normalized, dynamics, dt)
-    pos_real, _, _, _ = real_dynamics(normalized, dynamics, dt)
-    return float(np.linalg.norm(np.asarray(pos_cbf) - np.asarray(pos_real)))
+    state_cbf = _pack_state_tuple(*cbf_dynamics(normalized, dynamics, dt))
+    state_real = _pack_state_tuple(*real_dynamics(normalized, dynamics, dt))
+    return float(np.linalg.norm(state_cbf - state_real))
 
 
-def conformal_obstacle_radius(logs: List[Dict[str, np.ndarray]], alpha: float, episode_length: int) -> float:
+def conformal_qj(logs: List[Dict[str, np.ndarray]], alpha: float, episode_length: int) -> float:
     """
-    Trajectory-level score is maximum position mismatch across timesteps.
+    Trajectory-level score is maximum full-state mismatch across timesteps.
     We use the upper-tail quantile to get a high-probability upper bound.
     """
     scores = []
     for run_log in logs:
         max_mismatch = 0.0
-        mismatch = run_log["model_mismatch_pos"]
+        mismatch = run_log["model_mismatch_state"]
         for step in range(min(episode_length, len(mismatch))):
             max_mismatch = max(max_mismatch, float(mismatch[step]))
         scores.append(max_mismatch)
@@ -190,7 +214,7 @@ def run_single_agent(
             "collision_obstacle": [],
             "boundary_dist": [],
             "clearance": [],
-            "model_mismatch_pos": [],
+            "model_mismatch_state": [],
         }
         env_run = clone_env_from_snapshot(snapshot)
         obs_run = np.array(obs, copy=True, dtype=np.float32)
@@ -215,7 +239,7 @@ def run_single_agent(
                 env_state=env_run,
                 _unused_swarm_state=None,
             )
-            mismatch_pos = _position_model_mismatch(
+            mismatch_state = _state_model_mismatch(
                 action_solo,
                 env_run.unwrapped.envs[0].dynamics,
                 float(env_run.unwrapped.control_dt),
@@ -245,15 +269,15 @@ def run_single_agent(
             run_logs["collision_obstacle"].append(collision_obstacle)
             run_logs["boundary_dist"].append(boundary_dist)
             run_logs["clearance"].append(clearance)
-            run_logs["model_mismatch_pos"].append(mismatch_pos)
+            run_logs["model_mismatch_state"].append(mismatch_state)
 
             done = np.all(dones)
             step_num += 1
 
         for key in run_logs:
             run_logs[key] = np.asarray(run_logs[key], dtype=np.float32)
-        if len(run_logs["model_mismatch_pos"]) > 0:
-            running_max_mismatch = max(running_max_mismatch, float(np.max(run_logs["model_mismatch_pos"])))
+        if len(run_logs["model_mismatch_state"]) > 0:
+            running_max_mismatch = max(running_max_mismatch, float(np.max(run_logs["model_mismatch_state"])))
         progress_bar.set_postfix_str(f"max mismatch={running_max_mismatch:.6f}")
         logs[run_idx] = run_logs
         env_run.close()
@@ -263,6 +287,8 @@ def run_single_agent(
 
 def main() -> None:
     args = parse_args()
+    if not (0.0 < args.gamma <= 1.0):
+        raise ValueError("--gamma must satisfy 0 < gamma <= 1")
 
     torch.set_grad_enabled(False)
     register_swarm_components()
@@ -321,10 +347,16 @@ def main() -> None:
     solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
 
     obs, stored_states = deterministic_reset(env, args.seed, None)
+    _print_initial_environment_geometry(env, args.obstacle_radius_margin)
+    initial_geometry = _capture_environment_geometry(env)
+    env_json_path = os.path.join(experiment_dir, "conformal_obstacles_environment.json")
+    with open(env_json_path, "w", encoding="utf-8") as f:
+        json.dump(initial_geometry, f, indent=2)
+    print(f"[conformal_obstacles] Saved initial environment geometry to {env_json_path}")
     alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
 
     radius = float(np.clip(args.initial_radius, 0.0, MAX_RADIUS))
-    filter_fn = make_obstacle_cbf_filter(radius)
+    filter_fn = make_obstacle_cbf_filter(radius, args.gamma, args.obstacle_radius_margin)
 
     qj_per_episode = []
     radius_per_episode = []
@@ -336,23 +368,11 @@ def main() -> None:
     mismatch_per_episode = []
     mismatch_runs_per_episode = []
     run_logs_per_episode = []
-    environment_per_episode = []
-
     for episode in range(args.num_episodes):
         print("EPISODE", episode)
 
         solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
         obs, stored_states = deterministic_reset(env, args.seed, stored_states)
-        env_unwrapped = env.unwrapped
-        environment_per_episode.append(
-            {
-                "episode": int(episode),
-                "start_point": np.asarray(env_unwrapped.envs[0].dynamics.pos, dtype=np.float64).tolist(),
-                "goal_point": np.asarray(env_unwrapped.envs[0].goal, dtype=np.float64).tolist(),
-                "obstacle_radius": float(env_unwrapped.obstacles.obstacle_radius),
-                "obstacle_positions": np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64).tolist(),
-            }
-        )
         snapshot = safe_capture_env_snapshot(env)
         temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
         cal_logs = run_single_agent(
@@ -366,11 +386,11 @@ def main() -> None:
             num_runs=args.num_trajectories,
             deterministic=args.deterministic,
         )
-        qj = conformal_obstacle_radius(cal_logs, alpha, args.episode_length)
+        qj = conformal_qj(cal_logs, alpha, args.episode_length)
         new_radius = explicit_radius_update(radius, qj, args.kappa, 0.0, MAX_RADIUS)
         print("radius", radius, "qj", qj, "new radius", new_radius)
         radius = float(new_radius)
-        filter_fn = make_obstacle_cbf_filter(radius)
+        filter_fn = make_obstacle_cbf_filter(radius, args.gamma, args.obstacle_radius_margin)
         temp_env.close()
 
         solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
@@ -401,7 +421,7 @@ def main() -> None:
             cumulative_reward = float(np.sum(positive_progress))
             had_crash = bool(np.any(logs[run_id]["collision_obstacle"]))
             min_clearance = float(np.min(logs[run_id]["clearance"]))
-            max_mismatch = float(np.max(logs[run_id]["model_mismatch_pos"]))
+            max_mismatch = float(np.max(logs[run_id]["model_mismatch_state"]))
 
             cumulative_reward_per_run.append(cumulative_reward)
             num_crashes_per_run.append(1 if had_crash else 0)
@@ -422,7 +442,7 @@ def main() -> None:
             f"Cum rew: {cumulative_reward_per_episode[-1]} "
             f"Crash rate: {crashes_per_episode[-1]} "
             f"Min clearance: {min_clearance_per_episode[-1]} "
-            f"Max pos mismatch: {mismatch_per_episode[-1]}"
+            f"Max mismatch: {mismatch_per_episode[-1]}"
         )
 
     metrics_path = os.path.join(experiment_dir, "conformal_obstacles_metrics.npz")
@@ -447,10 +467,6 @@ def main() -> None:
     )
     print(f"[conformal_obstacles] Saved per-episode metrics to {metrics_path}")
 
-    env_json_path = os.path.join(experiment_dir, "conformal_obstacles_environment.json")
-    with open(env_json_path, "w", encoding="utf-8") as f:
-        json.dump({"episodes": environment_per_episode}, f, indent=2)
-    print(f"[conformal_obstacles] Saved environment geometry to {env_json_path}")
     env.close()
 
     if len(video_frames) > 0:

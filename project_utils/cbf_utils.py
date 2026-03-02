@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import itertools
+from dataclasses import dataclass
 from typing import List, Tuple
 
 import warnings
@@ -197,62 +199,84 @@ def real_dynamics(norm_cmds, dynamics, dt):
 
 
 # ---------------------------------------------------------------------------
-# ECBF helpers
+# CBF helpers
 # ---------------------------------------------------------------------------
 
-def _ecbf_coefficients(
-    *,
-    solo_pos: np.ndarray,
-    solo_vel: np.ndarray,
-    solo_rot: np.ndarray,
-    teammate_pos: np.ndarray,
-    teammate_vel: np.ndarray,
+@dataclass
+class CBFObstacle:
+    position: np.ndarray
+    radius: float
+    velocity: np.ndarray
+
+
+def _calculate_Lh(pos, vel, rot, obs_pos, mass, dt, thrust_bounds, r):
+    """
+    Conservative finite-search upper bound for L_h over:
+      u in box [u_min, u_max]
+      s_p, s_v in {-1, 0, 1}^3
+
+    This avoids non-DCP convex-maximization in CVXPY.
+    """
+    u_min, u_max = thrust_bounds
+    pos = np.asarray(pos, dtype=np.float64)
+    vel = np.asarray(vel, dtype=np.float64)
+    obs_pos = np.asarray(obs_pos, dtype=np.float64)
+    rot = np.asarray(rot, dtype=np.float64)
+    r = float(r)
+
+    # (1/m) R e3 1^T in R^{3x4}
+    acc_scale = (1.0 / mass) * np.outer(rot[:, 2], np.ones(4, dtype=np.float64))
+
+    # Corners of the action box in any action dimension.
+    u_corners = np.array(list(itertools.product(*[(mn, mx) for mn, mx in zip(u_min, u_max)])), dtype=np.float64)
+
+    # 27 component-wise direction vectors in {-1, 1}^3.
+    dirs = np.array(np.meshgrid([-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0])).T.reshape(-1, 3)
+
+    best = 0.0
+    for u in u_corners:
+        base_vel = vel + dt * (GRAVITY_VECTOR + acc_scale @ u)
+        base_pos = pos + dt * vel
+        new_pos = base_pos # Realistically, no error in position
+        pos_term = (1 + 2 * CBF_K0) * np.linalg.norm(new_pos - obs_pos)
+        for s_v in dirs:
+            new_vel = base_vel + r * s_v
+            val = pos_term + np.linalg.norm(new_vel)
+            if val > best:
+                best = val
+
+    return float(best)
+
+def _cbf_h_values(
+    pos: np.ndarray,
+    vel: np.ndarray,
+    rot: np.ndarray,
+    obs_pos: np.ndarray,
     radius: float,
     mass: float,
-) -> Tuple[np.ndarray, float, float]:
+    dt: float,
+    u_var):
     """
-    Compute the ``(a, b, h)`` triple for the ECBF constraint ``a^T u ≥ -b - slack``.
-
-    The derivation follows the supplied formulation:
-
-        h(x) = ||x - p||² - r²
-        ḣ(x) = 2 zᵀ v_rel
-        ḧ(x) = 2 ||v_rel||² + 2 zᵀ g + (2/m) (zᵀ R e₃) 1ᵀ u
-
-    where:
-
-        z      := solo_pos - teammate_pos
-        v_rel  := solo_vel - teammate_vel   (moving obstacle extension)
-        g      := GRAVITY_VECTOR
-        R e₃   := third column of the body-to-world rotation
-
-    The moving-obstacle extension treats the teammate as a point translating with
-    velocity ``teammate_vel``.  This keeps the barrier conservative: if the
-    teammate is stationary it reduces to the exact textbook form.
     """
-    pos_rel = solo_pos - teammate_pos # (x-p)
-    # v_rel = solo_vel - teammate_vel
-    h_value = float(np.dot(pos_rel, pos_rel) - radius**2) # h
-    relpos_dot_gravity = float(np.dot(pos_rel, GRAVITY_VECTOR)) # (x-p)ᵀg
-    relpos_dot_v = float(np.dot(pos_rel, solo_vel)) # (x-p)ᵀv
-    v_sq = float(np.dot(solo_vel, solo_vel)) # vᵀv
-    thrust_axis_world = solo_rot[:, 2] # R e₃
-    thrust_alignment = float(np.dot(pos_rel, thrust_axis_world)) # (x-p)ᵀRe₃
-    c_scale = (2.0 / mass) * thrust_alignment # (2/m) (x-p)ᵀRe₃
-    LgLfh = c_scale * np.ones(4, dtype=np.float64) # (2/m) (x-p)ᵀRe₃ 1ᵀ
-    Lf2h = 2.0 * v_sq + 2.0 * relpos_dot_gravity # 2vᵀv + 2(x-p)ᵀg
-    Lfh = 2 * relpos_dot_v # 2(x-p)ᵀv
-    return h_value, Lfh, Lf2h, LgLfh
+    pos_rel = pos - obs_pos # (x-p)
+    next_pos_rel = pos + dt * vel - obs_pos 
+    acc_scale = (1.0 / mass) * np.outer(rot[:, 2], np.ones(4))
+    acc = GRAVITY_VECTOR + acc_scale @ u_var
+    next_vel = vel + dt * acc
+    next_h = CBF_K0 * (next_pos_rel @ next_pos_rel - radius**2) + next_pos_rel @ next_vel
+    h_value = CBF_K0 * (pos_rel @ pos_rel - radius**2) + pos_rel @ vel
+    return h_value, next_h
 
 
 def _solve_cbf_qp(
-    *,
+    gamma,
     u_ref_thrust: np.ndarray,
-    swarm_state: SwarmState,
-    radii: np.ndarray,
+    state,
+    obstacles, # Contains obstacle positions and radii
+    r,
     mass: float,
-    thrust_bounds: Tuple[np.ndarray, np.ndarray],
-    debug=False
+    dt,
+    thrust_bounds: Tuple[np.ndarray, np.ndarray]
 ) -> np.ndarray:
     """
     Build and solve the ECBF quadratic program described in the task statement.
@@ -274,40 +298,21 @@ def _solve_cbf_qp(
     """
     u_ref = np.asarray(u_ref_thrust, dtype=np.float64)
     u_min, u_max = thrust_bounds
-    solo_pos = swarm_state.positions[-1]
-    solo_vel = swarm_state.velocities[-1]
-    solo_rot = swarm_state.rotations[-1]
-    num_multi_agents = len(radii)
+    pos = state[:3]
+    vel = state[3:6]
+    rot = state[6:15].reshape(3, 3)
 
     constraints: List[cp.Constraint] = []
     u_var = cp.Variable(4)
     slack = cp.Variable()
 
-    hdd_list = []
-    hd_list = []
-    h_list = []
-
-    for teammate_idx in range(num_multi_agents):
-        radius = float(radii[teammate_idx])
-        if radius < 0.0:
-            continue
-        teammate_pos = swarm_state.positions[teammate_idx]
-        teammate_vel = swarm_state.velocities[teammate_idx]
-        h_value, Lfh, Lf2h, LgLfh = _ecbf_coefficients(
-            solo_pos=solo_pos,
-            solo_vel=solo_vel,
-            solo_rot=solo_rot,
-            teammate_pos=teammate_pos,
-            teammate_vel=teammate_vel,
-            radius=radius,
-            mass=mass,
-        )
-        hdd = Lf2h + LgLfh @ u_var
-        hd = Lfh
-        hdd_list.append(hdd)
-        hd_list.append(hd)
-        h_list.append(h_value)
-        constraints.append(hdd + CBF_K1 * (hd + CBF_K0 * h_value) >= - slack) #  EPSILON
+    for obs_idx in range(len(obstacles)):
+        obs = obstacles[obs_idx]
+        radius = float(obs["radius"])
+        obs_pos = np.asarray(obs["position"], dtype=np.float64)
+        h_value, h_next = _cbf_h_values(pos, vel, rot, obs_pos, radius, mass, dt, u_var)
+        Lh = _calculate_Lh(pos, vel, rot, obs_pos, mass, dt, thrust_bounds, r)
+        constraints.append(h_next - (1 - gamma) * h_value >= Lh * r - slack)
 
     if len(constraints) == 0:
         return np.clip(u_ref, u_min, u_max)
@@ -327,39 +332,29 @@ def _solve_cbf_qp(
     except cp.SolverError:
         approx = u_var.value
         if approx is None:
-            approx = u_ref # No iteratre returned
+            approx = u_ref # No iterate returned
         clipped = np.clip(approx, u_min, u_max)
         print("QP timed out; returning last iterate:", clipped)
-        if debug:
-            return clipped, h_list, hd_list, hdd_list
         return clipped
     if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-        print('OTHER ISSUE', problem.status)
+        print('OTHER ISSUE', problem.status, 'r=', r, 'Lhr=', Lh * r)
         return np.clip(u_ref, u_min, u_max)
-    if debug:
-        for agent_id in range(num_multi_agents):
-            print('C0:', h_list[agent_id])
-            print('C1:', hd_list[agent_id] + CBF_K0 * (h_list[agent_id]))
-            print('C2:', hdd_list[agent_id].value + CBF_K1 * (hd_list[agent_id] + CBF_K0 * (h_list[agent_id])))
-        # print('Slack: ', slack.value, 'u dist:', np.linalg.norm(u_ref - u_var.value), u_var.value)
-        # print(np.linalg.norm(u_var.value - u_min), np.linalg.norm(u_var.value - u_max))
     solution = np.array(u_var.value, dtype=np.float64)
-    # solution = u_ref / np.sum(u_ref) * np.sum(solution) # 
-    if debug:
-        return solution, h_list, hd_list, hdd_list
-    return solution # np.clip(solution, u_min, u_max)
+    # print('FINE r=', r, 'Lhr=', Lh * r)
+    return solution 
 
 
 def apply_cbf_filter(
     base_action: np.ndarray,
-    radii: np.ndarray,
     env_state,
-    swarm_state: SwarmState,
+    quad_state,
+    obstacles,
+    r,
+    gamma,
     debug=False
 ) -> np.ndarray:
     """
-    Wrap the raw solo-policy action with the ECBF safety filter.
-    Assumed that the protected solo agent is at the last index.
+    Wrap the raw solo-policy action with the obstacle-based CBF safety filter.
 
     Parameters
     ----------
@@ -367,8 +362,14 @@ def apply_cbf_filter(
         Motor command in [-1, 1]⁴ produced by the solo policy.
     env_state :
         Vectorised environment used to access the simulator dynamics.
-    swarm_state : SwarmState
-        Pre-computed positions, velocities, and orientations for the current step.
+    quad_state :
+        Packed solo state [pos(3), vel(3), rot(9), omega(3)].
+    obstacles :
+        Sequence of obstacles with position, radius, velocity.
+    r :
+        Conformal upper bound on model mismatch used by robust CBF.
+    gamma :
+        CBF contraction factor in (0, 1].
     """
     quad = env_state.envs[-1]
     dynamics = quad.dynamics
@@ -382,29 +383,32 @@ def apply_cbf_filter(
     u_max = np.asarray(dynamics.thrust_max, dtype=np.float64)
     # Hopefully stop the "Solution may be innacurate" warnings since they're unactionable
     with warnings.catch_warnings(action='ignore'):
-        outputs = _solve_cbf_qp(
+        safe_thrust = _solve_cbf_qp(
+            gamma=gamma,
             u_ref_thrust=u_ref_thrust,
-            swarm_state=swarm_state,
-            radii=radii,
+            state=quad_state,
+            obstacles=obstacles,
+            r=r,
             mass=float(dynamics.mass),
+            dt=float(env_state.control_dt),
             thrust_bounds=(u_min, u_max),
-            debug=debug
         )
-    if debug:
-        safe_thrust, h_list, hd_list, hdd_list = outputs
-    else:
-        safe_thrust = outputs
 
     # Convert Newton thrust back to the environment's action space.
     safe_normalized = _thrust_to_normalized(safe_thrust, dynamics)
     safe_action = 2.0 * safe_normalized - 1.0
     clipped_action = np.clip(safe_action.astype(np.float32), -1.0, 1.0)
-    if debug:
-        return clipped_action, h_list, hd_list, hdd_list
-    else:
-        return clipped_action
+    return clipped_action
 
-def make_cbf_filter(radii: np.ndarray):
-    def filter(base_action: np.ndarray, env_state, swarm_state: SwarmState, debug=False):
-        return apply_cbf_filter(base_action, radii, env_state, swarm_state, debug=debug)
+def make_cbf_filter(r: float, gamma: float):
+    def filter(base_action: np.ndarray, env_state, quad_state, obstacles, debug=False):
+        return apply_cbf_filter(
+            base_action=base_action,
+            env_state=env_state,
+            quad_state=quad_state,
+            obstacles=obstacles,
+            r=r,
+            gamma=gamma,
+            debug=debug,
+        )
     return filter
