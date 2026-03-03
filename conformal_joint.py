@@ -42,7 +42,7 @@ from project_utils.restart_utils import deterministic_reset, extract_positions_v
 from project_utils.utils import OBS_KEY, load_actor, load_cfg, latest_checkpoint
 
 DEVICE = torch.device("cpu")
-MAX_RADIUS = 8.0
+MAX_R = 8.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic", action="store_true")
 
     parser.add_argument("--kappa", type=float, default=0.6, help="Radius update aggressiveness.")
-    parser.add_argument("--initial_radius", type=float, default=2.0, help="Initial conformal safety radius.")
+    parser.add_argument("--initial_r", type=float, default=2.0, help="Initial conformal safety radius.")
     parser.add_argument("--separation_radius", type=float, default=0.5, help="Desired pairwise separation distance enforced by CBF.")
     parser.add_argument("--gamma", type=float, default=0.8, help="CBF gamma in (0, 1].")
     return parser.parse_args()
@@ -225,9 +225,9 @@ def run_joint_agents(
     return logs
 
 
-def _collision_indicator_from_positions(positions_t: np.ndarray, min_radius: float) -> int:
+def _collision_indicator_from_positions(positions_t: np.ndarray, min_r: float) -> int:
     for i, j in combinations(range(positions_t.shape[0]), 2):
-        if np.linalg.norm(positions_t[i] - positions_t[j]) <= min_radius:
+        if np.linalg.norm(positions_t[i] - positions_t[j]) <= min_r:
             return 1
     return 0
 
@@ -289,13 +289,13 @@ def main() -> None:
     obs, stored_states = deterministic_reset(env, args.seed, None)
 
     arm_len = env.quad_arm
-    min_radius = arm_len * 2.5
+    min_r = arm_len * 2.5
     alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
-    r_mismatch = float(np.clip(args.initial_radius, 0.0, MAX_RADIUS))
+    r_mismatch = float(np.clip(args.initial_r, 0.0, MAX_R))
     filter_fn = make_joint_cbf_filter(r_mismatch, args.separation_radius, args.gamma)
 
     qj_per_episode = []
-    radius_per_episode = []
+    r_mismatch_per_episode = []
     safety_per_episode = []
     crashes_per_episode = []
     cumulative_reward_per_episode = []
@@ -324,7 +324,7 @@ def main() -> None:
             deterministic=args.deterministic,
         )
         qj = conformal_qj(cal_logs, alpha, args.episode_length)
-        new_r = explicit_radius_update(r_mismatch, qj, args.kappa, 0.0, MAX_RADIUS)
+        new_r = explicit_radius_update(r_mismatch, qj, args.kappa, 0.0, MAX_R)
         print("r_mismatch", r_mismatch, "qj", qj, "new_r_mismatch", new_r, "separation_radius", args.separation_radius)
         r_mismatch = float(new_r)
         filter_fn = make_joint_cbf_filter(r_mismatch, args.separation_radius, args.gamma)
@@ -371,7 +371,7 @@ def main() -> None:
 
             had_crash = 0
             for t in range(positions.shape[0]):
-                had_crash = max(had_crash, _collision_indicator_from_positions(positions[t], min_radius))
+                had_crash = max(had_crash, _collision_indicator_from_positions(positions[t], min_r))
 
             cumulative_reward_per_run.append(cumulative_reward)
             crash_indicator_per_run.append(had_crash)
@@ -384,7 +384,7 @@ def main() -> None:
         mismatch_per_episode.append(float(np.mean(max_mismatch_per_run)))
         mismatch_runs_per_episode.append(np.asarray(max_mismatch_per_run, dtype=np.float32))
         qj_per_episode.append(float(qj))
-        radius_per_episode.append(float(r_mismatch))
+        r_mismatch_per_episode.append(float(r_mismatch))
         agent_locs_per_episode.append(logs[0]["positions"])
         print(
             f"Cum rew: {cumulative_reward_per_episode[-1]} "
@@ -397,7 +397,7 @@ def main() -> None:
         metrics_path,
         episodes=np.arange(args.num_episodes),
         qj_per_episode=np.asarray(qj_per_episode, dtype=np.float32),
-        radius_per_episode=np.asarray(radius_per_episode, dtype=np.float32),
+        r_mismatch_per_episode=np.asarray(r_mismatch_per_episode, dtype=np.float32),
         crashes_per_episode=np.asarray(crashes_per_episode, dtype=np.float32),
         safety_per_episode=np.asarray(safety_per_episode, dtype=np.float32),
         cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),

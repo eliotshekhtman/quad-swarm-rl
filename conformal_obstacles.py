@@ -33,7 +33,7 @@ from project_utils.restart_utils import deterministic_reset, extract_positions_v
 from project_utils.utils import OBS_KEY, load_actor, load_cfg, latest_checkpoint
 
 DEVICE = torch.device("cpu")
-MAX_RADIUS = 8.0
+MAX_R = 8.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,8 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quads_obst_density", type=float, default=0.2)
     parser.add_argument("--quads_obst_size", type=float, default=0.6)
 
-    parser.add_argument("--kappa", type=float, default=0.6, help="Radius update aggressiveness.")
-    parser.add_argument("--initial_radius", type=float, default=2.0, help="Initial conformal safety radius.")
+    parser.add_argument("--kappa", type=float, default=0.6, help="r update aggressiveness.")
+    parser.add_argument("--initial_r", type=float, default=2.0, help="Initial conformal mismatch bound r.")
     parser.add_argument("--obstacle_radius_margin", type=float, default=0.05, help="Extra radius added to each obstacle for CBF constraints.")
     parser.add_argument("--gamma", type=float, default=0.8, help="CBF gamma in (0, 1].")
     return parser.parse_args()
@@ -75,13 +75,16 @@ def _pack_state_tuple(pos: np.ndarray, vel: np.ndarray, rot: np.ndarray, omega: 
     return np.concatenate([pos.reshape(-1), vel.reshape(-1), rot.reshape(-1), omega.reshape(-1)], axis=0).astype(np.float64)
 
 
-def _capture_environment_geometry(env) -> Dict[str, object]:
+def _capture_environment_geometry(env, obstacle_radius_margin: float) -> Dict[str, object]:
     """Capture the current single-agent obstacle environment geometry."""
     env_unwrapped = env.unwrapped
+    env_obstacle_radius = float(env_unwrapped.obstacles.obstacle_radius)
+    cbf_radius = env_obstacle_radius + float(obstacle_radius_margin)
     return {
         "start_point": np.asarray(env_unwrapped.envs[0].dynamics.pos, dtype=np.float64).tolist(),
         "goal_point": np.asarray(env_unwrapped.envs[0].goal, dtype=np.float64).tolist(),
-        "obstacle_radius": float(env_unwrapped.obstacles.obstacle_radius),
+        "obstacle_radius": env_obstacle_radius,
+        "cbf_obstacle_radius": cbf_radius,
         "obstacle_positions": np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64).tolist(),
     }
 
@@ -93,14 +96,14 @@ def _print_initial_environment_geometry(env, obstacle_radius_margin: float) -> N
     goal_point = np.asarray(env_unwrapped.envs[0].goal, dtype=np.float64)
     obstacle_positions = np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64)
     base_radius = float(env_unwrapped.obstacles.obstacle_radius)
-    inflated_radius = base_radius + float(obstacle_radius_margin)
+    cbf_radius = base_radius + float(obstacle_radius_margin)
 
     print("[conformal_obstacles] Initial geometry before episode 0")
     print(f"  start_point: {start_point.tolist()}")
     print(f"  goal_point: {goal_point.tolist()}")
     print(
         f"  obstacle_radius: {base_radius:.6f} "
-        f"(inflated_for_cbf: {inflated_radius:.6f})"
+        f"(cbf_radius: {cbf_radius:.6f})"
     )
     if obstacle_positions.size == 0:
         print("  obstacles: []")
@@ -108,11 +111,11 @@ def _print_initial_environment_geometry(env, obstacle_radius_margin: float) -> N
     for idx, center in enumerate(obstacle_positions):
         print(
             f"  obstacle[{idx}]: position={np.asarray(center, dtype=np.float64).tolist()}, "
-            f"radius={base_radius:.6f} (inflated_for_cbf={inflated_radius:.6f})"
+            f"radius={base_radius:.6f} (cbf_radius={cbf_radius:.6f})"
         )
 
 
-def make_obstacle_cbf_filter(radius: float, gamma: float, obstacle_radius_margin: float):
+def make_obstacle_cbf_filter(r_mismatch: float, gamma: float, obstacle_radius_margin: float):
     def _filter(base_action: np.ndarray, env_state, _unused_swarm_state=None):
         env_unwrapped = env_state.unwrapped
         if not getattr(env_unwrapped, "use_obstacles", False) or env_unwrapped.obstacles is None:
@@ -130,12 +133,12 @@ def make_obstacle_cbf_filter(radius: float, gamma: float, obstacle_radius_margin
             np.asarray(dynamics.rot, dtype=np.float64),
             np.asarray(dynamics.omega, dtype=np.float64),
         )
-        inflated_radius = float(env_unwrapped.obstacles.obstacle_radius) + float(obstacle_radius_margin)
+        cbf_obstacle_radius = float(env_unwrapped.obstacles.obstacle_radius) + float(obstacle_radius_margin)
         obstacles = [
             {
                 "position": np.asarray(center, dtype=np.float64),
                 "velocity": np.zeros(3, dtype=np.float64),
-                "radius": inflated_radius,
+                "radius": cbf_obstacle_radius,
             }
             for center in obstacle_centers
         ]
@@ -144,7 +147,7 @@ def make_obstacle_cbf_filter(radius: float, gamma: float, obstacle_radius_margin
             env_state=env_unwrapped,
             quad_state=quad_state,
             obstacles=obstacles,
-            r=float(radius),
+            r=float(r_mismatch),
             gamma=float(gamma),
         )
 
@@ -348,18 +351,18 @@ def main() -> None:
 
     obs, stored_states = deterministic_reset(env, args.seed, None)
     _print_initial_environment_geometry(env, args.obstacle_radius_margin)
-    initial_geometry = _capture_environment_geometry(env)
+    initial_geometry = _capture_environment_geometry(env, args.obstacle_radius_margin)
     env_json_path = os.path.join(experiment_dir, "conformal_obstacles_environment.json")
     with open(env_json_path, "w", encoding="utf-8") as f:
         json.dump(initial_geometry, f, indent=2)
     print(f"[conformal_obstacles] Saved initial environment geometry to {env_json_path}")
     alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
 
-    radius = float(np.clip(args.initial_radius, 0.0, MAX_RADIUS))
-    filter_fn = make_obstacle_cbf_filter(radius, args.gamma, args.obstacle_radius_margin)
+    r_mismatch = float(np.clip(args.initial_r, 0.0, MAX_R))
+    filter_fn = make_obstacle_cbf_filter(r_mismatch, args.gamma, args.obstacle_radius_margin)
 
     qj_per_episode = []
-    radius_per_episode = []
+    r_mismatch_per_episode = []
     crashes_per_episode = []
     safety_per_episode = []
     cumulative_reward_per_episode = []
@@ -387,10 +390,10 @@ def main() -> None:
             deterministic=args.deterministic,
         )
         qj = conformal_qj(cal_logs, alpha, args.episode_length)
-        new_radius = explicit_radius_update(radius, qj, args.kappa, 0.0, MAX_RADIUS)
-        print("radius", radius, "qj", qj, "new radius", new_radius)
-        radius = float(new_radius)
-        filter_fn = make_obstacle_cbf_filter(radius, args.gamma, args.obstacle_radius_margin)
+        new_r = explicit_radius_update(r_mismatch, qj, args.kappa, 0.0, MAX_R)
+        print("r_mismatch", r_mismatch, "qj", qj, "new_r_mismatch", new_r)
+        r_mismatch = float(new_r)
+        filter_fn = make_obstacle_cbf_filter(r_mismatch, args.gamma, args.obstacle_radius_margin)
         temp_env.close()
 
         solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
@@ -436,7 +439,7 @@ def main() -> None:
         cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
         mismatch_runs_per_episode.append(np.asarray(max_mismatch_per_run, dtype=np.float32))
         qj_per_episode.append(float(qj))
-        radius_per_episode.append(float(radius))
+        r_mismatch_per_episode.append(float(r_mismatch))
         run_logs_per_episode.append(logs[0]["position"])
         print(
             f"Cum rew: {cumulative_reward_per_episode[-1]} "
@@ -450,7 +453,7 @@ def main() -> None:
         metrics_path,
         episodes=np.arange(args.num_episodes),
         qj_per_episode=np.asarray(qj_per_episode, dtype=np.float32),
-        radius_per_episode=np.asarray(radius_per_episode, dtype=np.float32),
+        r_mismatch_per_episode=np.asarray(r_mismatch_per_episode, dtype=np.float32),
         crashes_per_episode=np.asarray(crashes_per_episode, dtype=np.float32),
         safety_per_episode=np.asarray(safety_per_episode, dtype=np.float32),
         cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
