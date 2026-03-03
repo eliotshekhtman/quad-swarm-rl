@@ -99,6 +99,10 @@ def add_quadrotors_env_args(env, parser):
     # Room
     p.add_argument('--quads_room_dims', nargs='+', default=[10., 10., 10.], type=float,
                    help='Length, width, and height dimensions respectively of the quadrotor env')
+    p.add_argument('--quads_sim_freq', default=200.0, type=float,
+                   help='Simulation frequency in Hz used by QuadrotorSingle (dt = 1/sim_freq).')
+    p.add_argument('--quads_sim_steps', default=2, type=int,
+                   help='Number of simulation integration steps per control step.')
 
     # Replay Buffer
     p.add_argument('--replay_buffer_sample_prob', default=0.0, type=float,
