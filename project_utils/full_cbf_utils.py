@@ -40,7 +40,7 @@ def _cross_vec_mx4(v: np.ndarray, mx4: np.ndarray) -> np.ndarray:
 # Motor command conversions
 # ---------------------------------------------------------------------------
 
-def _normalized_to_thrust(norm_cmds: np.ndarray, dynamics, give_damped_cmds=False) -> np.ndarray:
+def _normalized_to_thrust(norm_cmds: np.ndarray, dynamics, steps: int = 1) -> np.ndarray:
     """
     Convert environment actions in [0, 1] into per-rotor thrust magnitudes (Newtons).
 
@@ -48,25 +48,34 @@ def _normalized_to_thrust(norm_cmds: np.ndarray, dynamics, give_damped_cmds=Fals
     to map the high-level command to thrust.  We delegate the core conversion to
     ``QuadrotorDynamics.angvel2thrust`` so the QP shares the exact actuator model.
     """
-    motor_tau_down = np.asarray(dynamics.motor_tau_down, dtype=np.float64)
-    motor_tau = dynamics.motor_tau_up * np.ones([4, ])
-    motor_tau[norm_cmds < dynamics.thrust_cmds_damp] = motor_tau_down
-    motor_tau[motor_tau > 1.] = 1.
+    if steps <= 0:
+        raise ValueError("steps must be >= 1")
+
+    norm_cmds = np.asarray(norm_cmds, dtype=np.float64)
     thrust_rot = norm_cmds ** 0.5
-    thrust_rot_damp = motor_tau * (thrust_rot - dynamics.thrust_rot_damp) + dynamics.thrust_rot_damp
-    thrust_cmds_damp = thrust_rot_damp ** 2
-    
     thrust_max = np.asarray(getattr(dynamics, "thrust_max"), dtype=np.float64)
     linearity = np.asarray(getattr(dynamics, "motor_linearity", 1.0), dtype=np.float64)
-    thrusts = thrust_max * dynamics.angvel2thrust(thrust_cmds_damp, linearity=linearity)
+    motor_tau_down = np.asarray(dynamics.motor_tau_down, dtype=np.float64)
 
-    torques = dynamics.prop_crossproducts * thrusts[:, None]  
-    torques[:, 2] += dynamics.torque_max * dynamics.prop_ccw * thrust_cmds_damp
+    thrust_rot_damp = np.asarray(dynamics.thrust_rot_damp, dtype=np.float64).copy()
+    thrust_cmds_damp = np.asarray(dynamics.thrust_cmds_damp, dtype=np.float64).copy()
+    outputs = []
+    for _ in range(steps):
+        motor_tau = dynamics.motor_tau_up * np.ones([4, ], dtype=np.float64)
+        motor_tau[norm_cmds < thrust_cmds_damp] = motor_tau_down
+        motor_tau[motor_tau > 1.0] = 1.0
+        thrust_rot_damp = motor_tau * (thrust_rot - thrust_rot_damp) + thrust_rot_damp
+        thrust_cmds_damp = thrust_rot_damp ** 2
 
-    if give_damped_cmds:
-        return thrusts, torques, thrust_cmds_damp
-    else:
+        thrusts = thrust_max * dynamics.angvel2thrust(thrust_cmds_damp, linearity=linearity)
+        torques = dynamics.prop_crossproducts * thrusts[:, None]
+        torques[:, 2] += dynamics.torque_max * dynamics.prop_ccw * thrust_cmds_damp
+        outputs.append((thrusts, torques, thrust_cmds_damp.copy()))
+
+    if steps == 1:
+        thrusts, torques, _ = outputs[0]
         return thrusts, torques
+    return outputs
 
 def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
     def _invert_single(index):
@@ -86,175 +95,122 @@ def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
         norm_cmds[i] = _invert_single(i)
     return norm_cmds
 
-def cbf_dynamics(norm_cmds, dynamics, dt):
+def cbf_dynamics(norm_cmds, dynamics, dt, steps=2):
+    dt = dt / steps
     thrusts, torques = _normalized_to_thrust(norm_cmds, dynamics)
+    rot = dynamics.rot 
+    omega = dynamics.omega 
+    pos = dynamics.pos 
+    vel = dynamics.vel 
 
-    torque = np.sum(torques, axis=0)
-    thrust = np.array([0, 0, np.sum(thrusts)])
+    for step in range(steps):
+        torque = np.sum(torques, axis=0)
+        thrust = np.array([0, 0, np.sum(thrusts)])
 
-    # ROTATIONAL DYNAMICS
-    # Integrating rotations (based on current values)
-    omega_vec = np.matmul(dynamics.rot, dynamics.omega)  # Change from body to world frame
-    wx, wy, wz = omega_vec
-    omega_norm = np.linalg.norm(omega_vec)
-    if omega_norm != 0:
-        # See [7]
-        K = np.array([[0, -wz, wy], [wz, 0, -wx], [-wy, wx, 0]]) / omega_norm
-        rot_angle = omega_norm * dt
-        dRdt = np.eye(3) + np.sin(rot_angle) * K + (1. - np.cos(rot_angle)) * (K @ K)
-        rot = dRdt @ dynamics.rot
-    else:
-        rot = dynamics.rot
+        # ROTATIONAL DYNAMICS
+        # Integrating rotations (based on current values)
+        omega_vec = np.matmul(rot, omega)  # Change from body to world frame
+        wx, wy, wz = omega_vec
+        omega_norm = np.linalg.norm(omega_vec)
+        if omega_norm != 0:
+            # See [7]
+            K = np.array([[0, -wz, wy], [wz, 0, -wx], [-wy, wx, 0]]) / omega_norm
+            rot_angle = omega_norm * dt
+            dRdt = np.eye(3) + np.sin(rot_angle) * K + (1. - np.cos(rot_angle)) * (K @ K)
+            rot = dRdt @ rot
+        else:
+            rot = rot
 
-    # COMPUTING OMEGA UPDATE
-    omega_dot = ((1.0 / dynamics.inertia) * (_cross(-dynamics.omega, dynamics.inertia * dynamics.omega) + torque))
-    omega = dynamics.omega + dt * omega_dot
-    omega = np.clip(omega, a_min=-dynamics.omega_max, a_max=dynamics.omega_max)
+        # COMPUTING OMEGA UPDATE
+        omega_dot = ((1.0 / dynamics.inertia) * (_cross(-omega, dynamics.inertia * omega) + torque))
+        omega = omega + dt * omega_dot
+        omega = np.clip(omega, a_min=-dynamics.omega_max, a_max=dynamics.omega_max)
 
-    # TRANSLATIONAL DYNAMICS
-    # Computing position
-    pos = dynamics.pos + dt * dynamics.vel
-    force = np.matmul(rot, thrust)
-    acc = [0., 0., -9.81] + (1.0 / dynamics.mass) * force
+        # TRANSLATIONAL DYNAMICS
+        # Computing position
+        pos = pos + dt * vel
+        force = np.matmul(rot, thrust)
+        acc = [0., 0., -9.81] + (1.0 / dynamics.mass) * force
 
-    # Computing velocities
-    vel = dynamics.vel + dt * acc
+        # Computing velocities
+        vel = vel + dt * acc
     return pos, vel, rot, omega # What I'm determining to be the state
 
-def real_dynamics(norm_cmds, dynamics, dt):
-    thrusts, torques, thrust_cmds_damp = _normalized_to_thrust(norm_cmds, dynamics, True)
+def real_dynamics(norm_cmds, dynamics, dt, steps=2):
+    dt = dt / steps
+    norm_cmds = np.asarray(norm_cmds, dtype=np.float64)
 
-    thrust_torque = np.sum(torques, axis=0)
-
-    # Rotor drag and Rolling forces and moments
-    # See Ref[1] Sec:2.1 for details
-    if dynamics.C_rot_drag != 0 or dynamics.C_rot_roll != 0:
-        vel_body = dynamics.rot.T @ dynamics.vel
-        v_rotor = vel_body + _cross_vec_mx4(dynamics.omega, dynamics.model.prop_pos)
-        v_rotor[:, 2] = 0.  # Projection to the rotor plane
-
-        # Drag/Roll of rotors (both in body frame)
-        rotor_drag_fi = - dynamics.C_rot_drag * np.sqrt(thrust_cmds_damp)[:, None] * v_rotor
-        rotor_drag_force = np.sum(rotor_drag_fi, axis=0)
-        rotor_drag_ti = _cross_mx4(rotor_drag_fi, dynamics.model.prop_pos)
-        rotor_drag_torque = np.sum(rotor_drag_ti, axis=0)
-
-        rotor_roll_torque = \
-            - dynamics.C_rot_roll * dynamics.prop_ccw[:, None] * np.sqrt(thrust_cmds_damp)[:, None] * v_rotor
-        rotor_roll_torque = np.sum(rotor_roll_torque, axis=0)
-        rotor_visc_torque = rotor_drag_torque + rotor_roll_torque
-
-        # Constraints (prevent numerical instabilities)
-        vel_norm = np.linalg.norm(vel_body)
-        rdf_norm = np.linalg.norm(rotor_drag_force)
-        rdf_norm_clip = np.clip(rdf_norm, a_min=0., a_max=vel_norm * dynamics.mass / (2 * dt))
-        if rdf_norm > EPS:
-            rotor_drag_force = (rotor_drag_force / rdf_norm) * rdf_norm_clip
-
-        # omega_norm = np.linalg.norm(dynamics.omega)
-        rvt_norm = np.linalg.norm(rotor_visc_torque)
-        rvt_norm_clipped = np.clip(rvt_norm, a_min=0., a_max=np.linalg.norm(dynamics.omega * dynamics.inertia) / (2 * dt))
-        if rvt_norm > EPS:
-            rotor_visc_torque = (rotor_visc_torque / rvt_norm) * rvt_norm_clipped
+    if steps == 1:
+        step_outputs = _normalized_to_thrust(norm_cmds, dynamics, steps=2)
+        step_outputs = [step_outputs[0]]
     else:
-        rotor_visc_torque = rotor_drag_force = np.zeros(3)
+        step_outputs = _normalized_to_thrust(norm_cmds, dynamics, steps=steps)
 
-    # (Square) Damping using torques (in case we would like to add damping using torques)
-    # damping_torque = - 0.3 * dynamics.omega * np.fabs(dynamics.omega)
-    torque = thrust_torque + rotor_visc_torque
-    thrust = np.array([0, 0, np.sum(thrusts)])
+    rot = np.asarray(dynamics.rot, dtype=np.float64).copy()
+    omega = np.asarray(dynamics.omega, dtype=np.float64).copy()
+    pos = np.asarray(dynamics.pos, dtype=np.float64).copy()
+    vel = np.asarray(dynamics.vel, dtype=np.float64).copy()
 
-    # ROTATIONAL DYNAMICS
-    # Integrating rotations (based on current values)
-    omega_vec = np.matmul(dynamics.rot, dynamics.omega)  # Change from body to world frame
-    wx, wy, wz = omega_vec
-    omega_norm = np.linalg.norm(omega_vec)
-    if omega_norm != 0:
-        # See [7]
-        K = np.array([[0, -wz, wy], [wz, 0, -wx], [-wy, wx, 0]]) / omega_norm
-        rot_angle = omega_norm * dt
-        dRdt = np.eye(3) + np.sin(rot_angle) * K + (1. - np.cos(rot_angle)) * (K @ K)
-        rot = dRdt @ dynamics.rot
-    else:
-        rot = dynamics.rot
+    for thrusts, torques, thrust_cmds_damp in step_outputs:
+        thrust_torque = np.sum(torques, axis=0)
 
-    # COMPUTING OMEGA UPDATE
-    omega_dot = ((1.0 / dynamics.inertia) * (_cross(-dynamics.omega, dynamics.inertia * dynamics.omega) + torque))
-    # Quadratic damping
-    # 0.03 corresponds to roughly 1 revolution per sec
-    omega_damp_quadratic = np.clip(dynamics.damp_omega_quadratic * dynamics.omega ** 2, a_min=0.0, a_max=1.0)
-    omega = dynamics.omega + (1.0 - omega_damp_quadratic) * dt * omega_dot
-    omega = np.clip(omega, a_min=-dynamics.omega_max, a_max=dynamics.omega_max)
+        # Rotor drag and Rolling forces and moments
+        if dynamics.C_rot_drag != 0 or dynamics.C_rot_roll != 0:
+            vel_body = rot.T @ vel
+            v_rotor = vel_body + _cross_vec_mx4(omega, dynamics.model.prop_pos)
+            v_rotor[:, 2] = 0.0
 
-    # TRANSLATIONAL DYNAMICS
-    # Computing position
-    pos = dynamics.pos + dt * dynamics.vel
-    force = np.matmul(rot, thrust)
-    acc = [0., 0., -9.81] + (1.0 / dynamics.mass) * force
+            rotor_drag_fi = -dynamics.C_rot_drag * np.sqrt(thrust_cmds_damp)[:, None] * v_rotor
+            rotor_drag_force = np.sum(rotor_drag_fi, axis=0)
+            rotor_drag_ti = _cross_mx4(rotor_drag_fi, dynamics.model.prop_pos)
+            rotor_drag_torque = np.sum(rotor_drag_ti, axis=0)
 
-    # Computing velocities
-    vel = (1.0 - dynamics.vel_damp) * dynamics.vel + dt * acc
-    return pos, vel, rot, omega # What I'm determining to be the state
+            rotor_roll_torque = -dynamics.C_rot_roll * dynamics.prop_ccw[:, None] * np.sqrt(thrust_cmds_damp)[:, None] * v_rotor
+            rotor_roll_torque = np.sum(rotor_roll_torque, axis=0)
+            rotor_visc_torque = rotor_drag_torque + rotor_roll_torque
+
+            vel_norm = np.linalg.norm(vel_body)
+            rdf_norm = np.linalg.norm(rotor_drag_force)
+            rdf_norm_clip = np.clip(rdf_norm, a_min=0.0, a_max=vel_norm * dynamics.mass / (2 * dt))
+            if rdf_norm > EPS:
+                rotor_drag_force = (rotor_drag_force / rdf_norm) * rdf_norm_clip
+
+            rvt_norm = np.linalg.norm(rotor_visc_torque)
+            rvt_norm_clipped = np.clip(rvt_norm, a_min=0.0, a_max=np.linalg.norm(omega * dynamics.inertia) / (2 * dt))
+            if rvt_norm > EPS:
+                rotor_visc_torque = (rotor_visc_torque / rvt_norm) * rvt_norm_clipped
+        else:
+            rotor_visc_torque = np.zeros(3)
+            rotor_drag_force = np.zeros(3)
+
+        torque = thrust_torque + rotor_visc_torque
+        thrust = np.array([0.0, 0.0, np.sum(thrusts)], dtype=np.float64)
+
+        omega_vec = np.matmul(rot, omega)
+        wx, wy, wz = omega_vec
+        omega_norm = np.linalg.norm(omega_vec)
+        if omega_norm != 0:
+            K = np.array([[0, -wz, wy], [wz, 0, -wx], [-wy, wx, 0]]) / omega_norm
+            rot_angle = omega_norm * dt
+            dRdt = np.eye(3) + np.sin(rot_angle) * K + (1.0 - np.cos(rot_angle)) * (K @ K)
+            rot = dRdt @ rot
+
+        omega_dot = ((1.0 / dynamics.inertia) * (_cross(-omega, dynamics.inertia * omega) + torque))
+        omega_damp_quadratic = np.clip(dynamics.damp_omega_quadratic * omega ** 2, a_min=0.0, a_max=1.0)
+        omega = omega + (1.0 - omega_damp_quadratic) * dt * omega_dot
+        omega = np.clip(omega, a_min=-dynamics.omega_max, a_max=dynamics.omega_max)
+
+        pos = pos + dt * vel
+        force = np.matmul(rot, thrust) + np.matmul(rot, rotor_drag_force)
+        acc = GRAVITY_VECTOR + (1.0 / dynamics.mass) * force
+        vel = (1.0 - dynamics.vel_damp) * vel + dt * acc
+
+    return pos, vel, rot, omega
 
 
 # ---------------------------------------------------------------------------
 # CBF helpers
 # ---------------------------------------------------------------------------
-
-def _calculate_Lh(
-    i: int,
-    j: int,
-    swarm_state: SwarmState,
-    mass: float,
-    dt: float,
-    thrust_bounds: Tuple[float, float],
-    r: float,
-) -> float:
-    """
-    Pairwise conservative finite-search upper bound for:
-      (1 + 2 * CBF_K0) * ||next_pos_rel|| + ||next_vel_rel||
-
-    where relative terms are for agent pair (i, j), and the maximization is over:
-      - u_i, u_j at control-box corners with scalar bounds [u_min, u_max]
-      - additive velocity disturbance direction s_v in {-1, 1}^3 scaled by r
-    """
-    u_min, u_max = float(thrust_bounds[0]), float(thrust_bounds[1])
-    r = float(r)
-
-    positions = swarm_state.positions
-    velocities = swarm_state.velocities
-    rotations = swarm_state.rotations
-
-    pos_rel = np.asarray(positions[i] - positions[j], dtype=np.float64)
-    vel_rel = np.asarray(velocities[i] - velocities[j], dtype=np.float64)
-    rot_i = np.asarray(rotations[i], dtype=np.float64)
-    rot_j = np.asarray(rotations[j], dtype=np.float64)
-
-    # Relative position one step ahead (current model, independent of control).
-    next_pos_rel = pos_rel + dt * vel_rel
-    pos_term = (1.0 + 2.0 * CBF_K0) * np.linalg.norm(next_pos_rel)
-
-    # (1/m) R e3 1^T in R^{3x4} for each agent.
-    acc_scale_i = (1.0 / mass) * np.outer(rot_i[:, 2], np.ones(4, dtype=np.float64))
-    acc_scale_j = (1.0 / mass) * np.outer(rot_j[:, 2], np.ones(4, dtype=np.float64))
-
-    # Corners for each agent's 4 motor thrusts under scalar bounds.
-    u_corners = np.array(list(itertools.product([u_min, u_max], repeat=4)), dtype=np.float64)
-    dirs = np.array(np.meshgrid([-1.0, 1.0], [-1.0, 1.0], [-1.0, 1.0])).T.reshape(-1, 3)
-
-    best = 0.0
-    for u_i in u_corners:
-        acc_i = GRAVITY_VECTOR + acc_scale_i @ u_i
-        for u_j in u_corners:
-            acc_j = GRAVITY_VECTOR + acc_scale_j @ u_j
-            base_next_vel_rel = vel_rel + dt * (acc_i - acc_j)
-            for s_v in dirs:
-                next_vel_rel = base_next_vel_rel + r * s_v
-                val = pos_term + np.linalg.norm(next_vel_rel)
-                if val > best:
-                    best = val
-
-    return float(best)
 
 def _cbf_h_values(
     i, j,
@@ -263,29 +219,45 @@ def _cbf_h_values(
     mass: float,
     dt: float,
     u_vars: cp.Variable,
+    u_ref
 ):
     """
     Pairwise CBF terms for agents i and j.
     """
+    dt = dt / 2.0 # each control step is 2 simulator steps
     positions = swarm_state.positions
     velocities = swarm_state.velocities
     rotations = swarm_state.rotations
 
     u_i = u_vars[4 * i: 4 * (i + 1)]
     u_j = u_vars[4 * j: 4 * (j + 1)]
+    u_ref_i = u_ref[4 * i: 4 * (i + 1)]
+    u_ref_j = u_ref[4 * j: 4 * (j + 1)]
 
-    pos_rel = positions[i] - positions[j] # (x-p)
-    vel_rel = velocities[i] - velocities[j] 
-    next_pos_rel = pos_rel + dt * vel_rel
+    rel_pos = positions[i] - positions[j] # (x-p)
+    rel_vel = velocities[i] - velocities[j] 
     acc_scale_i = (1.0 / mass) * np.outer(rotations[i][:, 2], np.ones(4))
     acc_scale_j = (1.0 / mass) * np.outer(rotations[j][:, 2], np.ones(4))
     acc_i = GRAVITY_VECTOR + acc_scale_i @ u_i
     acc_j = GRAVITY_VECTOR + acc_scale_j @ u_j
-    acc_rel = acc_i - acc_j
-    next_vel_rel = vel_rel + dt * acc_rel
-    next_h = CBF_K0 * (next_pos_rel @ next_pos_rel - radius**2) + next_pos_rel @ next_vel_rel
-    h_value = CBF_K0 * (pos_rel @ pos_rel - radius**2) + pos_rel @ vel_rel
-    return h_value, next_h
+    rel_acc = acc_i - acc_j
+
+    acc_ref_i = GRAVITY_VECTOR + acc_scale_i @ u_ref_i
+    acc_ref_j = GRAVITY_VECTOR + acc_scale_j @ u_ref_j
+    rel_acc_ref = acc_ref_i - acc_ref_j
+
+    next_rel_vel = rel_vel + dt * rel_acc
+    next_rel_vel_ref = rel_vel + dt * rel_acc_ref
+
+    z = rel_pos + dt * rel_vel + dt * next_rel_vel
+    z_ref = rel_pos + dt * rel_vel + dt * next_rel_vel_ref
+    z_ref_norm = max(float(np.linalg.norm(z_ref)), 1e-6)
+    grad = z_ref / z_ref_norm 
+    norm_lb = z_ref_norm + grad @ (z - z_ref)
+
+    h_value = np.linalg.norm(rel_pos) - radius
+    h_next = norm_lb - radius
+    return h_value, h_next
 
 
 def _solve_cbf_qp(
@@ -333,17 +305,8 @@ def _solve_cbf_qp(
     # Pairwise constraints across all agent pairs.
     for i in range(num_agents):
         for j in range(i + 1, num_agents):
-            h_value, h_next = _cbf_h_values(i, j, swarm_state, separation_radius, mass, dt, u_var)
-            Lh_ij = _calculate_Lh(
-                i=i,
-                j=j,
-                swarm_state=swarm_state,
-                mass=mass,
-                dt=dt,
-                thrust_bounds=(u_min, u_max),
-                r=r,
-            )
-            constraints.append(h_next - (1 - gamma) * h_value >= Lh_ij * r - slack)
+            h_value, h_next = _cbf_h_values(i, j, swarm_state, separation_radius, mass, dt, u_var, u_ref)
+            constraints.append(h_next - (1 - gamma) * h_value >= r - slack)
 
     if len(constraints) == 0:
         return np.clip(u_ref, u_min, u_max)
