@@ -27,8 +27,27 @@ def make_quadrotor_env_multi(cfg, render_mode=None, **kwargs):
     if dyn_randomization_ratio is not None:
         sampler_1 = dict(type='RelativeSampler', noise_ratio=dyn_randomization_ratio, sampler='normal')
 
+    # Attempting to turn off all trajectory-dependent behavior
     sense_noise = 'default'
-    dynamics_change = dict(noise=dict(thrust_noise_ratio=0.05), damp=dict(vel=0, omega_quadratic=0))
+    dynamics_change = dict(noise=dict(thrust_noise_ratio=0.05), damp=dict(vel=0.0001, omega_quadratic=0.0001))
+
+    # sense_noise = None  # disables observation/sensor noise
+    # dynamics_change = dict(
+    #     noise=dict(
+    #         thrust_noise_ratio=0.0,   # no thrust noise
+    #     ),
+    #     damp=dict(
+    #         vel=0.0,                  # no velocity damping
+    #         omega_quadratic=0.0,      # no angular-rate damping
+    #     ),
+    #     motor=dict(
+    #         C_drag=0.0,               # no rotor drag force/torque
+    #         C_roll=0.0,               # no rotor roll torque
+    #         damp_time_up=0.0,         # no motor spin-up lag (instant)
+    #         damp_time_down=0.0,       # no motor spin-down lag (instant)
+    #     ),
+    # )
+
 
     rew_coeff = DEFAULT_QUAD_REWARD_SHAPING['quad_rewards']
     use_replay_buffer = cfg.replay_buffer_sample_prob > 0.0
@@ -60,6 +79,9 @@ def make_quadrotor_env_multi(cfg, render_mode=None, **kwargs):
         dynamics_params=quad, raw_control=raw_control, raw_control_zero_middle=raw_control_zero_middle,
         dynamics_randomize_every=dyn_randomize_every, dynamics_change=dynamics_change, dyn_sampler_1=sampler_1,
         sense_noise=sense_noise, init_random_state=False,
+        # Simulation timing (optional cfg keys, keep old defaults if absent)
+        sim_freq=float(getattr(cfg, "quads_sim_freq", 200.0)),
+        sim_steps=int(getattr(cfg, "quads_sim_steps", 2)),
         # Rendering
         render_mode=render_mode,
     )
