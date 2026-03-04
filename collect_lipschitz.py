@@ -108,7 +108,7 @@ def _set_single_agent_start_goal(env, start_point: np.ndarray, goal_point: np.nd
 
 
 def _compute_pairwise_action_lipschitz(
-    actions_thrust: np.ndarray,
+    actions_features: np.ndarray,
     real_next: np.ndarray,
     residual_next: np.ndarray,
     ratios_u: np.ndarray,
@@ -124,9 +124,9 @@ def _compute_pairwise_action_lipschitz(
 
     Results are appended into preallocated buffers for efficiency.
     """
-    pair_i, pair_j = np.triu_indices(actions_thrust.shape[0], k=1)
+    pair_i, pair_j = np.triu_indices(actions_features.shape[0], k=1)
 
-    delta_u = np.linalg.norm(actions_thrust[pair_i] - actions_thrust[pair_j], axis=1)
+    delta_u = np.linalg.norm(actions_features[pair_i] - actions_features[pair_j], axis=1)
     valid = delta_u >= EPS
     if not np.any(valid):
         return write_u, write_eu
@@ -146,7 +146,7 @@ def _compute_pairwise_action_lipschitz(
 
 def _compute_pairwise_r_lipschitz(
     r_values: np.ndarray,
-    thrusts_for_r: np.ndarray,
+    action_features_for_r: np.ndarray,
     ratios_U: np.ndarray,
     write_U: int,
 ) -> int:
@@ -159,7 +159,7 @@ def _compute_pairwise_r_lipschitz(
     pair_i = pair_i[valid]
     pair_j = pair_j[valid]
     delta_r = delta_r[valid]
-    delta_u = np.linalg.norm(thrusts_for_r[pair_i] - thrusts_for_r[pair_j], axis=1)
+    delta_u = np.linalg.norm(action_features_for_r[pair_i] - action_features_for_r[pair_j], axis=1)
     count = delta_r.shape[0]
     ratios_U[write_U : write_U + count] = (delta_u / delta_r).astype(np.float32)
     return write_U + count
@@ -173,6 +173,21 @@ def _is_infeasible_proxy(filtered_action: np.ndarray, nominal_action: np.ndarray
         atol=INFEASIBLE_EQ_TOL,
         rtol=0.0,
     )
+
+
+def _action_features_from_unit_action(
+    action_unit: np.ndarray,
+    dynamics,
+    action_metric_space: str,
+) -> np.ndarray:
+    """Map normalized [0,1]^4 action to selected feature space for action-based Lipschitz metrics."""
+    action_unit = np.asarray(action_unit, dtype=np.float64)
+    if action_metric_space == "norm_cmds":
+        return action_unit.astype(np.float64)
+    if action_metric_space == "thrust_torque":
+        thrust, torque = _normalized_to_thrust(action_unit, dynamics)
+        return np.concatenate((thrust, torque.reshape(-1)), axis=0).astype(np.float64)
+    raise ValueError(f"Unknown action_metric_space: {action_metric_space}")
 
 
 def _stats_from_ratios(values: np.ndarray) -> Dict[str, float]:
@@ -277,7 +292,7 @@ def _compute_state_based_lipschitz(
     step_ids: np.ndarray,
     real_next_random: np.ndarray,
     residual_random: np.ndarray,
-    policy_thrusts: np.ndarray,
+    policy_action_features: np.ndarray,
     unperturbed_mask: np.ndarray,
     same_traj_window: int,
     cross_traj_window: int,
@@ -290,7 +305,7 @@ def _compute_state_based_lipschitz(
     Compute state-conditioned Lipschitz constants:
     - L_x: real dynamics sensitivity to state (fixed action).
     - L_ex: residual sensitivity to state (fixed action).
-    - L_pi: policy thrust sensitivity to state (unperturbed rollouts only).
+    - L_pi: policy action-feature sensitivity to state (unperturbed rollouts only).
     """
     i_all, j_all = _build_state_pairs(
         traj_ids=traj_ids,
@@ -360,7 +375,7 @@ def _compute_state_based_lipschitz(
         j_u = j_u[valid_pi]
         dx_pi = dx_pi[valid_pi]
         if i_u.size > 0:
-            du = np.linalg.norm(policy_thrusts[i_u] - policy_thrusts[j_u], axis=1)
+            du = np.linalg.norm(policy_action_features[i_u] - policy_action_features[j_u], axis=1)
             ratios_pi = (du / dx_pi).astype(np.float32)
         else:
             ratios_pi = np.empty(0, dtype=np.float32)
@@ -455,6 +470,9 @@ def collect_lipschitz(
     state_close_radius: float,
     output_dir: str,
     cbf_gamma: float,
+    action_metric_space: str,
+    quads_sim_freq: float,
+    quads_sim_steps: int,
     geometry: Optional[EnvironmentGeometry] = None,
 ) -> CollectionResult:
     """
@@ -472,6 +490,12 @@ def collect_lipschitz(
         raise ValueError("perturbation_scale must be in [0, 1]")
     if not (0.0 < cbf_gamma <= 1.0):
         raise ValueError("cbf_gamma must satisfy 0 < cbf_gamma <= 1")
+    if action_metric_space not in ("norm_cmds", "thrust_torque"):
+        raise ValueError("action_metric_space must be one of: norm_cmds, thrust_torque")
+    if quads_sim_freq <= 0.0:
+        raise ValueError("quads_sim_freq must be > 0")
+    if quads_sim_steps <= 0:
+        raise ValueError("quads_sim_steps must be >= 1")
 
     register_swarm_components()
 
@@ -487,6 +511,8 @@ def collect_lipschitz(
         f"--quads_use_obstacles={str(geometry is not None)}",
         f"--quads_neighbor_visible_num={cfg_solo.quads_neighbor_visible_num}",
         f"--quads_neighbor_obs_type={cfg_solo.quads_neighbor_obs_type}",
+        f"--quads_sim_freq={float(quads_sim_freq)}",
+        f"--quads_sim_steps={int(quads_sim_steps)}",
         "--quads_use_numba=False",
         "--quads_render=False",
         "--max_num_episodes=1",
@@ -531,8 +557,9 @@ def collect_lipschitz(
         states = np.empty((num_total_samples, 18), dtype=np.float32)
         traj_ids = np.empty(num_total_samples, dtype=np.int32)
         step_ids = np.empty(num_total_samples, dtype=np.int32)
+        action_feature_dim = 4 if action_metric_space == "norm_cmds" else 16
         policy_actions_unit = np.empty((num_total_samples, action_dim), dtype=np.float32)
-        policy_thrusts = np.empty((num_total_samples, 16), dtype=np.float32)
+        policy_action_features = np.empty((num_total_samples, action_feature_dim), dtype=np.float32)
         actual_actions_unit = np.empty((num_total_samples, action_dim), dtype=np.float32)
 
         real_next_actual = np.empty((num_total_samples, 18), dtype=np.float32)
@@ -588,7 +615,11 @@ def collect_lipschitz(
 
                 dynamics = env.unwrapped.envs[0].dynamics
                 base_action_unit = _action_to_unit(base_action_raw, action_low, action_high)
-                base_thrust, base_torque = _normalized_to_thrust(base_action_unit, dynamics)
+                base_action_features = _action_features_from_unit_action(
+                    base_action_unit,
+                    dynamics,
+                    action_metric_space,
+                )
 
                 # Snapshot current simulator state x_t before stepping.
                 current_state = _pack_state(dynamics.pos, dynamics.vel, dynamics.rot, dynamics.omega)
@@ -607,13 +638,16 @@ def collect_lipschitz(
 
                 # Probe set = {executed action} U {10 shared random actions}.
                 action_bank_unit = np.vstack([actual_action_unit[None, :], random_actions_unit])
-                action_bank_thrust = np.empty((11, 16), dtype=np.float64)
+                action_bank_features = np.empty((11, action_feature_dim), dtype=np.float64)
                 real_bank = np.empty((11, 18), dtype=np.float64)
                 cbf_bank = np.empty((11, 18), dtype=np.float64)
                 for a_idx in range(11):
                     cmd_unit = action_bank_unit[a_idx]
-                    thrust_cmd, torque_cmd = _normalized_to_thrust(cmd_unit, dynamics)
-                    action_bank_thrust[a_idx] = np.concatenate((thrust_cmd, torque_cmd.flatten()), axis=0)
+                    action_bank_features[a_idx] = _action_features_from_unit_action(
+                        cmd_unit,
+                        dynamics,
+                        action_metric_space,
+                    )
                     real_next = real_dynamics(cmd_unit, dynamics, env.unwrapped.control_dt)
                     cbf_next = cbf_dynamics(cmd_unit, dynamics, env.unwrapped.control_dt)
                     real_bank[a_idx] = _pack_next_state_tuple(real_next)
@@ -622,7 +656,7 @@ def collect_lipschitz(
                 # Residual dynamics e(x,u) = real(x,u) - cbf(x,u).
                 residual_bank = real_bank - cbf_bank
                 write_u, write_eu = _compute_pairwise_action_lipschitz(
-                    actions_thrust=action_bank_thrust,
+                    actions_features=action_bank_features,
                     real_next=real_bank,
                     residual_next=residual_bank,
                     ratios_u=ratios_u,
@@ -634,7 +668,7 @@ def collect_lipschitz(
                 # L_U: sensitivity of CBF-filtered thrust output to the conformal radius r.
                 num_r_values = 2
                 r_values = rng.uniform(low=0.0, high=5.0, size=num_r_values).astype(np.float64)
-                thrusts_for_r = np.empty((num_r_values, 16), dtype=np.float64)
+                action_features_for_r = np.empty((num_r_values, action_feature_dim), dtype=np.float64)
                 valid_r_mask = np.ones(num_r_values, dtype=bool)
                 for r_idx, r_val in enumerate(r_values):
                     action_r = apply_cbf_filter(
@@ -650,12 +684,15 @@ def collect_lipschitz(
                         valid_r_mask[r_idx] = False
                         continue
                     action_r_unit = _action_to_unit(action_r, action_low, action_high)
-                    thrust_r, torque_r = _normalized_to_thrust(action_r_unit, dynamics)
-                    thrusts_for_r[r_idx] = np.concatenate((thrust_r, torque_r.flatten()), axis=0)
+                    action_features_for_r[r_idx] = _action_features_from_unit_action(
+                        action_r_unit,
+                        dynamics,
+                        action_metric_space,
+                    )
                 if np.sum(valid_r_mask) >= 2:
                     write_U = _compute_pairwise_r_lipschitz(
                         r_values=r_values[valid_r_mask],
-                        thrusts_for_r=thrusts_for_r[valid_r_mask],
+                        action_features_for_r=action_features_for_r[valid_r_mask],
                         ratios_U=ratios_U,
                         write_U=write_U,
                     )
@@ -664,7 +701,7 @@ def collect_lipschitz(
                 traj_ids[sample_idx] = traj
                 step_ids[sample_idx] = step
                 policy_actions_unit[sample_idx] = base_action_unit.astype(np.float32)
-                policy_thrusts[sample_idx] = np.concatenate((base_thrust, base_torque.flatten()), axis=0)
+                policy_action_features[sample_idx] = base_action_features.astype(np.float32)
                 actual_actions_unit[sample_idx] = actual_action_unit.astype(np.float32)
 
                 real_next_actual[sample_idx] = real_bank[0].astype(np.float32)
@@ -683,7 +720,7 @@ def collect_lipschitz(
         traj_ids = traj_ids[:sample_idx]
         step_ids = step_ids[:sample_idx]
         policy_actions_unit = policy_actions_unit[:sample_idx]
-        policy_thrusts = policy_thrusts[:sample_idx]
+        policy_action_features = policy_action_features[:sample_idx]
         actual_actions_unit = actual_actions_unit[:sample_idx]
         real_next_actual = real_next_actual[:sample_idx]
         cbf_next_actual = cbf_next_actual[:sample_idx]
@@ -707,7 +744,7 @@ def collect_lipschitz(
             step_ids=step_ids,
             real_next_random=real_next_random,
             residual_random=residual_random,
-            policy_thrusts=policy_thrusts,
+            policy_action_features=policy_action_features,
             unperturbed_mask=unperturbed_mask,
             same_traj_window=same_traj_window,
             cross_traj_window=cross_traj_window,
@@ -733,10 +770,13 @@ def collect_lipschitz(
                 "cross_samples_per_step": int(cross_samples_per_step),
                 "max_state_pairs": int(max_state_pairs),
                 "state_close_radius": float(state_close_radius),
-                "u_space_for_L_u_and_L_eu": "thrust (Newtons, R^4)",
+                "action_metric_space": action_metric_space,
+                "action_feature_dim": int(action_feature_dim),
                 "L_U_r_range": "[0, 50]",
                 "cbf_rollout_r": 0.0,
                 "cbf_gamma": float(cbf_gamma),
+                "quads_sim_freq": float(quads_sim_freq),
+                "quads_sim_steps": int(quads_sim_steps),
                 "uses_fixed_obstacle_geometry": bool(geometry is not None),
                 "rejected_nominal_equal_count_L_U_only": int(rejected_nominal_equal),
                 "num_valid_samples": int(sample_idx),
@@ -762,6 +802,7 @@ def collect_lipschitz(
             traj_ids=traj_ids,
             step_ids=step_ids,
             policy_actions_unit=policy_actions_unit,
+            policy_action_features=policy_action_features,
             actual_actions_unit=actual_actions_unit,
             random_actions_raw=random_actions_raw.astype(np.float32),
             random_actions_unit=random_actions_unit.astype(np.float32),
@@ -790,6 +831,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", default="train_dir/lipschitz_collection")
     parser.add_argument("--cbf_gamma", type=float, default=0.8, help="CBF gamma used when filtering actions.")
+    parser.add_argument("--quads_sim_freq", type=float, default=200.0, help="Simulation frequency in Hz.")
+    parser.add_argument("--quads_sim_steps", type=int, default=2, help="Simulation steps per control step.")
+    parser.add_argument(
+        "--action_metric_space",
+        type=str,
+        choices=["norm_cmds", "thrust_torque"],
+        default="thrust_torque",
+        help="Action representation used for L_u/L_eu/L_U/L_pi.",
+    )
 
     # State-pair search controls for L_x, L_ex, and L_pi.
     parser.add_argument("--same_traj_window", type=int, default=8)
@@ -841,6 +891,9 @@ def main() -> None:
         state_close_radius=args.state_close_radius,
         output_dir=args.output_dir,
         cbf_gamma=args.cbf_gamma,
+        action_metric_space=args.action_metric_space,
+        quads_sim_freq=args.quads_sim_freq,
+        quads_sim_steps=args.quads_sim_steps,
         geometry=geometry,
     )
 
