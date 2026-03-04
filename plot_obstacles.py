@@ -37,16 +37,66 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Alpha for performance error bars; defaults to the value stored in the metrics file.",
     )
+    parser.add_argument(
+        "--highlight_distance",
+        type=float,
+        default=1.0,
+        help="Obstacles within this XY distance (meters) of the episode trajectory are rendered darker.",
+    )
     return parser.parse_args()
 
 
-def draw_sphere(ax, center: np.ndarray, radius: float, color: str = "gray", alpha: float = 0.15):
-    u = np.linspace(0, 2 * np.pi, 18)
-    v = np.linspace(0, np.pi, 18)
-    x = center[0] + radius * np.outer(np.cos(u), np.sin(v))
-    y = center[1] + radius * np.outer(np.sin(u), np.sin(v))
-    z = center[2] + radius * np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_surface(x, y, z, color=color, alpha=alpha, linewidth=0)
+def draw_vertical_cylinder(
+    ax,
+    center_xy: np.ndarray,
+    radius: float,
+    z_min: float,
+    z_max: float,
+    color: str = "gray",
+    alpha: float = 0.15,
+):
+    theta = np.linspace(0, 2 * np.pi, 36)
+    z = np.linspace(z_min, z_max, 2)
+    theta_grid, z_grid = np.meshgrid(theta, z)
+    x_grid = center_xy[0] + radius * np.cos(theta_grid)
+    y_grid = center_xy[1] + radius * np.sin(theta_grid)
+    ax.plot_surface(x_grid, y_grid, z_grid, color=color, alpha=alpha, linewidth=0)
+
+
+def infer_room_height(geometry: dict, obstacle_positions: np.ndarray) -> float:
+    room_dims = geometry.get("room_dims")
+    if isinstance(room_dims, list) and len(room_dims) >= 3:
+        return float(room_dims[2])
+
+    # Obstacles are spawned at z = room_height / 2 in this env.
+    if obstacle_positions.size > 0:
+        return max(float(np.max(obstacle_positions[:, 2])) * 2.0, 1.0)
+    return 10.0
+
+
+def point_to_segment_distance_2d(point_xy: np.ndarray, seg_start_xy: np.ndarray, seg_end_xy: np.ndarray) -> float:
+    seg = seg_end_xy - seg_start_xy
+    seg_norm_sq = float(np.dot(seg, seg))
+    if seg_norm_sq <= 1e-12:
+        return float(np.linalg.norm(point_xy - seg_start_xy))
+    t = float(np.dot(point_xy - seg_start_xy, seg) / seg_norm_sq)
+    t = np.clip(t, 0.0, 1.0)
+    proj = seg_start_xy + t * seg
+    return float(np.linalg.norm(point_xy - proj))
+
+
+def obstacle_near_trajectory_xy(center_xy: np.ndarray, trajectory_xyz: np.ndarray, threshold: float) -> bool:
+    traj_xy = np.asarray(trajectory_xyz[:, :2], dtype=np.float32)
+    if traj_xy.shape[0] == 0:
+        return False
+    if traj_xy.shape[0] == 1:
+        return float(np.linalg.norm(center_xy - traj_xy[0])) <= threshold
+
+    for idx in range(traj_xy.shape[0] - 1):
+        dist = point_to_segment_distance_2d(center_xy, traj_xy[idx], traj_xy[idx + 1])
+        if dist <= threshold:
+            return True
+    return False
 
 
 def _load_geometry(plot_data_path: str, env_geometry_path: Optional[str]) -> dict:
@@ -91,6 +141,8 @@ def main() -> None:
         min_clearance_arr = data["min_clearance_per_episode"]
         alpha = float(data["alpha"])
         solo_positions = data["solo_positions_first_run"]
+    room_height = infer_room_height(geometry, obstacle_positions)
+    cylinder_z_min, cylinder_z_max = 0.0, room_height
 
     num_episodes = len(episodes)
     x_ticks = np.arange(0, num_episodes, 1)
@@ -206,13 +258,28 @@ def main() -> None:
         ax.scatter([goal_point[0]], [goal_point[1]], [goal_point[2]], color="tab:blue", marker="*", s=60, label="Goal")
 
         for obs_idx, center in enumerate(obstacle_positions):
-            draw_sphere(ax, center=center, radius=obstacle_radius)
-            ax.scatter([center[0]], [center[1]], [center[2]], color="black", s=8, label="Obstacle center" if obs_idx == 0 else None)
+            center_xy = np.asarray(center[:2], dtype=np.float32)
+            is_near = obstacle_near_trajectory_xy(center_xy, traj, args.highlight_distance)
+            cylinder_color = "dimgray" if is_near else "lightgray"
+            cylinder_alpha = 0.45 if is_near else 0.08
+            draw_vertical_cylinder(
+                ax,
+                center_xy=center_xy,
+                radius=obstacle_radius,
+                z_min=cylinder_z_min,
+                z_max=cylinder_z_max,
+                color=cylinder_color,
+                alpha=cylinder_alpha,
+            )
+            marker_color = "black" if is_near else "gray"
+            marker_size = 10 if is_near else 6
+            ax.scatter([center[0]], [center[1]], [center[2]], color=marker_color, s=marker_size, label="Obstacle center" if obs_idx == 0 else None)
 
-        ax.set_title(rf"3D Solo Trajectory with Obstacles (Episode {episode_idx + 1})")
+        ax.set_title(rf"3D Solo Trajectory with Vertical Obstacle Columns (Episode {episode_idx + 1})")
         ax.set_xlabel(r"$x$ (m)")
         ax.set_ylabel(r"$y$ (m)")
         ax.set_zlabel(r"$z$ (m)")
+        ax.set_zlim(cylinder_z_min, cylinder_z_max)
         if episode_idx == 0:
             ax.legend()
 

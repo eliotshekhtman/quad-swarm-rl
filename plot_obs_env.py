@@ -30,13 +30,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def draw_sphere(ax, center: np.ndarray, radius: float, color: str = "gray", alpha: float = 0.15):
-    u = np.linspace(0, 2 * np.pi, 18)
-    v = np.linspace(0, np.pi, 18)
-    x = center[0] + radius * np.outer(np.cos(u), np.sin(v))
-    y = center[1] + radius * np.outer(np.sin(u), np.sin(v))
-    z = center[2] + radius * np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_surface(x, y, z, color=color, alpha=alpha, linewidth=0)
+def draw_vertical_cylinder(
+    ax,
+    center_xy: np.ndarray,
+    radius: float,
+    z_min: float,
+    z_max: float,
+    color: str = "gray",
+    alpha: float = 0.15,
+):
+    theta = np.linspace(0, 2 * np.pi, 36)
+    z = np.linspace(z_min, z_max, 2)
+    theta_grid, z_grid = np.meshgrid(theta, z)
+    x_grid = center_xy[0] + radius * np.cos(theta_grid)
+    y_grid = center_xy[1] + radius * np.sin(theta_grid)
+    ax.plot_surface(x_grid, y_grid, z_grid, color=color, alpha=alpha, linewidth=0)
+
+
+def infer_room_height(env: dict, obstacle_positions: np.ndarray) -> float:
+    room_dims = env.get("room_dims")
+    if isinstance(room_dims, list) and len(room_dims) >= 3:
+        return float(room_dims[2])
+    if obstacle_positions.size > 0:
+        return max(float(np.max(obstacle_positions[:, 2])) * 2.0, 1.0)
+    return 10.0
 
 
 def main() -> None:
@@ -52,6 +69,8 @@ def main() -> None:
     goal_point = np.asarray(env.get("goal_point", [0.0, 0.0, 0.0]), dtype=np.float32)
     obstacle_positions = np.asarray(env.get("obstacle_positions", []), dtype=np.float32)
     obstacle_radius = float(env.get("obstacle_radius", 0.0))
+    room_height = infer_room_height(env, obstacle_positions)
+    z_min, z_max = 0.0, room_height
 
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
@@ -60,7 +79,13 @@ def main() -> None:
     ax.scatter([goal_point[0]], [goal_point[1]], [goal_point[2]], color="tab:blue", marker="*", s=80, label="Goal")
 
     for obs_idx, center in enumerate(obstacle_positions):
-        draw_sphere(ax, center=center, radius=obstacle_radius)
+        draw_vertical_cylinder(
+            ax,
+            center_xy=np.asarray(center[:2], dtype=np.float32),
+            radius=obstacle_radius,
+            z_min=z_min,
+            z_max=z_max,
+        )
         ax.scatter(
             [center[0]], [center[1]], [center[2]],
             color="black", s=10,
@@ -71,6 +96,7 @@ def main() -> None:
     ax.set_xlabel(r"$x$ (m)")
     ax.set_ylabel(r"$y$ (m)")
     ax.set_zlabel(r"$z$ (m)")
+    ax.set_zlim(z_min, z_max)
     ax.legend()
 
     out_path = os.path.join(out_dir, "obstacle_environment.pdf")
