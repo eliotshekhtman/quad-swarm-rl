@@ -101,7 +101,7 @@ def main() -> None:
     plot_paths = {}
 
     fig, ax = plt.subplots()
-    shifted_radius_arr = np.insert(radius_arr, 0, 8)[:-1]
+    shifted_radius_arr = np.insert(radius_arr, 0, 2)[:-1]
     ax.plot(episodes, shifted_radius_arr, label=r"$r_j$", marker="s")
     ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker="o")
     ax.set_title(r"Radius Across Episodes")
