@@ -245,13 +245,14 @@ def _cbf_h_values(
     next_vel_ref = vel + dt * acc_ref
     next_pos_ref = pos + dt * vel + dt * next_vel_ref
 
-    z = next_pos - obs_pos
-    z_ref = np.asarray(next_pos_ref - obs_pos, dtype=np.float64)
+    # Obstacles are vertical columns in this environment, so enforce barriers in XY only.
+    z = next_pos[:2] - obs_pos[:2]
+    z_ref = np.asarray(next_pos_ref[:2] - obs_pos[:2], dtype=np.float64)
     z_ref_norm = max(float(np.linalg.norm(z_ref)), 1e-6)
     grad = z_ref / z_ref_norm
     norm_lb = z_ref_norm + grad @ (z - z_ref)
 
-    h_value = np.linalg.norm(pos - obs_pos) - radius
+    h_value = np.linalg.norm(pos[:2] - obs_pos[:2]) - radius
     h_next = norm_lb - radius
     return h_value, h_next
 
