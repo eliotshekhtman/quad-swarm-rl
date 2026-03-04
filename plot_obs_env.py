@@ -27,6 +27,12 @@ def parse_args() -> argparse.Namespace:
         "--output_dir",
         help="Directory to save the plot.",
     )
+    parser.add_argument(
+        "--highlight_distance",
+        type=float,
+        default=1.0,
+        help="Obstacles within this XY distance (meters) of the start-goal line are rendered darker.",
+    )
     return parser.parse_args()
 
 
@@ -56,6 +62,17 @@ def infer_room_height(env: dict, obstacle_positions: np.ndarray) -> float:
     return 10.0
 
 
+def point_to_segment_distance_2d(point_xy: np.ndarray, seg_start_xy: np.ndarray, seg_end_xy: np.ndarray) -> float:
+    seg = seg_end_xy - seg_start_xy
+    seg_norm_sq = float(np.dot(seg, seg))
+    if seg_norm_sq <= 1e-12:
+        return float(np.linalg.norm(point_xy - seg_start_xy))
+    t = float(np.dot(point_xy - seg_start_xy, seg) / seg_norm_sq)
+    t = np.clip(t, 0.0, 1.0)
+    proj = seg_start_xy + t * seg
+    return float(np.linalg.norm(point_xy - proj))
+
+
 def main() -> None:
     args = parse_args()
     env_path = os.path.abspath(args.env_geometry)
@@ -77,18 +94,39 @@ def main() -> None:
 
     ax.scatter([start_point[0]], [start_point[1]], [start_point[2]], color="tab:green", marker="o", s=45, label="Start")
     ax.scatter([goal_point[0]], [goal_point[1]], [goal_point[2]], color="tab:blue", marker="*", s=80, label="Goal")
+    ax.plot(
+        [start_point[0], goal_point[0]],
+        [start_point[1], goal_point[1]],
+        [start_point[2], goal_point[2]],
+        color="tab:red",
+        linewidth=2.0,
+        linestyle="--",
+        label="Start->Goal line",
+    )
+
+    start_xy = np.asarray(start_point[:2], dtype=np.float32)
+    goal_xy = np.asarray(goal_point[:2], dtype=np.float32)
 
     for obs_idx, center in enumerate(obstacle_positions):
+        center_xy = np.asarray(center[:2], dtype=np.float32)
+        dist = point_to_segment_distance_2d(center_xy, start_xy, goal_xy)
+        is_near = dist <= args.highlight_distance
+        cylinder_color = "dimgray" if is_near else "lightgray"
+        cylinder_alpha = 0.45 if is_near else 0.08
         draw_vertical_cylinder(
             ax,
-            center_xy=np.asarray(center[:2], dtype=np.float32),
+            center_xy=center_xy,
             radius=obstacle_radius,
             z_min=z_min,
             z_max=z_max,
+            color=cylinder_color,
+            alpha=cylinder_alpha,
         )
+        marker_color = "black" if is_near else "gray"
+        marker_size = 10 if is_near else 7
         ax.scatter(
             [center[0]], [center[1]], [center[2]],
-            color="black", s=10,
+            color=marker_color, s=marker_size,
             label="Obstacle center" if obs_idx == 0 else None,
         )
 
