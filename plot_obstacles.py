@@ -275,7 +275,7 @@ def main() -> None:
             marker_size = 10 if is_near else 6
             ax.scatter([center[0]], [center[1]], [center[2]], color=marker_color, s=marker_size, label="Obstacle center" if obs_idx == 0 else None)
 
-        ax.set_title(rf"3D Solo Trajectory with Vertical Obstacle Columns (Episode {episode_idx + 1})")
+        ax.set_title(rf"3D Solo Trajectory (Episode {episode_idx + 1})")
         ax.set_xlabel(r"$x$ (m)")
         ax.set_ylabel(r"$y$ (m)")
         ax.set_zlabel(r"$z$ (m)")

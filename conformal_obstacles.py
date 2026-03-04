@@ -79,11 +79,13 @@ def _capture_environment_geometry(env, obstacle_radius_margin: float) -> Dict[st
     """Capture the current single-agent obstacle environment geometry."""
     env_unwrapped = env.unwrapped
     env_obstacle_radius = float(env_unwrapped.obstacles.obstacle_radius)
-    cbf_radius = env_obstacle_radius + float(obstacle_radius_margin)
+    quad_radius = float(env_unwrapped.quad_arm)
+    cbf_radius = env_obstacle_radius + quad_radius + float(obstacle_radius_margin)
     return {
         "start_point": np.asarray(env_unwrapped.envs[0].dynamics.pos, dtype=np.float64).tolist(),
         "goal_point": np.asarray(env_unwrapped.envs[0].goal, dtype=np.float64).tolist(),
         "obstacle_radius": env_obstacle_radius,
+        "quad_radius": quad_radius,
         "cbf_obstacle_radius": cbf_radius,
         "obstacle_positions": np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64).tolist(),
     }
@@ -96,14 +98,15 @@ def _print_initial_environment_geometry(env, obstacle_radius_margin: float) -> N
     goal_point = np.asarray(env_unwrapped.envs[0].goal, dtype=np.float64)
     obstacle_positions = np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64)
     base_radius = float(env_unwrapped.obstacles.obstacle_radius)
-    cbf_radius = base_radius + float(obstacle_radius_margin)
+    quad_radius = float(env_unwrapped.quad_arm)
+    cbf_radius = base_radius + quad_radius + float(obstacle_radius_margin)
 
     print("[conformal_obstacles] Initial geometry before episode 0")
     print(f"  start_point: {start_point.tolist()}")
     print(f"  goal_point: {goal_point.tolist()}")
     print(
         f"  obstacle_radius: {base_radius:.6f} "
-        f"(cbf_radius: {cbf_radius:.6f})"
+        f"(quad_radius: {quad_radius:.6f}, cbf_radius: {cbf_radius:.6f})"
     )
     if obstacle_positions.size == 0:
         print("  obstacles: []")
@@ -111,7 +114,7 @@ def _print_initial_environment_geometry(env, obstacle_radius_margin: float) -> N
     for idx, center in enumerate(obstacle_positions):
         print(
             f"  obstacle[{idx}]: position={np.asarray(center, dtype=np.float64).tolist()}, "
-            f"radius={base_radius:.6f} (cbf_radius={cbf_radius:.6f})"
+            f"radius={base_radius:.6f} (quad_radius={quad_radius:.6f}, cbf_radius={cbf_radius:.6f})"
         )
 
 
@@ -133,7 +136,11 @@ def make_obstacle_cbf_filter(r_mismatch: float, gamma: float, obstacle_radius_ma
             np.asarray(dynamics.rot, dtype=np.float64),
             np.asarray(dynamics.omega, dtype=np.float64),
         )
-        cbf_obstacle_radius = float(env_unwrapped.obstacles.obstacle_radius) + float(obstacle_radius_margin)
+        cbf_obstacle_radius = (
+            float(env_unwrapped.obstacles.obstacle_radius)
+            + float(env_unwrapped.quad_arm)
+            + float(obstacle_radius_margin)
+        )
         obstacles = [
             {
                 "position": np.asarray(center, dtype=np.float64),
@@ -259,9 +266,14 @@ def run_single_agent(
 
             obstacle_centers = np.asarray(env_run.unwrapped.obstacles.pos_arr, dtype=np.float64)
             obstacle_radius = float(env_run.unwrapped.obstacles.obstacle_radius)
-            center_dists = np.linalg.norm(obstacle_centers - solo_pos[None, :], axis=1)
-            boundary_dist = float(np.min(center_dists - obstacle_radius))
-            clearance = boundary_dist
+            quad_radius = float(env_run.unwrapped.quad_arm)
+            if obstacle_centers.size == 0:
+                boundary_dist = float("inf")
+                clearance = float("inf")
+            else:
+                center_dists_xy = np.linalg.norm(obstacle_centers[:, :2] - solo_pos[None, :2], axis=1)
+                boundary_dist = float(np.min(center_dists_xy - obstacle_radius))
+                clearance = float(np.min(center_dists_xy - (obstacle_radius + quad_radius)))
 
             rew_obst_raw = infos[0]["rewards"].get("rewraw_quadcol_obstacle", 0.0)
             collision_obstacle = float(rew_obst_raw) < 0.0
