@@ -229,6 +229,14 @@ def _collision_indicator_from_positions(positions_t: np.ndarray, min_r: float) -
     return 0
 
 
+def _pairwise_h_min(positions_t: np.ndarray, separation_radius: float) -> float:
+    min_h = float("inf")
+    for i, j in combinations(range(positions_t.shape[0]), 2):
+        margin = float(np.linalg.norm(positions_t[i] - positions_t[j]) - separation_radius)
+        min_h = min(min_h, margin)
+    return min_h
+
+
 def main() -> None:
     args = parse_args()
     if args.num_agents < 2:
@@ -298,8 +306,13 @@ def main() -> None:
     cumulative_reward_per_episode = []
     cumulative_reward_runs_per_episode = []
     mismatch_per_episode = []
+    mismatch_q10_per_episode = []
+    mismatch_q90_per_episode = []
     mismatch_runs_per_episode = []
     agent_locs_per_episode = []
+    h_violation_per_episode = []
+    h_violation_runs_per_episode = []
+    h_min_per_episode = []
 
     print("EPISODE", 0)
 
@@ -344,6 +357,8 @@ def main() -> None:
     cumulative_reward_per_run = []
     crash_indicator_per_run = []
     max_mismatch_per_run = []
+    h_violation_per_run = []
+    h_min_per_run = []
     for run_id in range(args.num_eval_trajs):
         run = logs[run_id]
         goal_dist = run["goal_dist"]        # (T, N)
@@ -363,19 +378,29 @@ def main() -> None:
             cumulative_reward = cumulative_reward / nonswap_steps * max(1, goal_dist.shape[0] - 1)
 
         had_crash = 0
+        min_h = float("inf")
         for t in range(positions.shape[0]):
+            step_h = _pairwise_h_min(positions[t], args.separation_radius)
+            min_h = min(min_h, step_h)
             had_crash = max(had_crash, _collision_indicator_from_positions(positions[t], min_r))
 
         cumulative_reward_per_run.append(cumulative_reward)
         crash_indicator_per_run.append(had_crash)
         max_mismatch_per_run.append(float(np.max(run["model_mismatch_state"])) if run["model_mismatch_state"].size > 0 else 0.0)
+        h_violation_per_run.append(1.0 if min_h <= 0.0 else 0.0)
+        h_min_per_run.append(min_h)
 
     cumulative_reward_per_episode.append(float(np.mean(cumulative_reward_per_run)))
     cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
     crashes_per_episode.append(float(np.mean(crash_indicator_per_run)))
     safety_per_episode.append(1.0 - float(np.mean(crash_indicator_per_run)))
     mismatch_per_episode.append(float(np.mean(max_mismatch_per_run)))
+    mismatch_q10_per_episode.append(float(np.quantile(max_mismatch_per_run, 0.10)))
+    mismatch_q90_per_episode.append(float(np.quantile(max_mismatch_per_run, 0.90)))
     mismatch_runs_per_episode.append(np.asarray(max_mismatch_per_run, dtype=np.float32))
+    h_violation_per_episode.append(float(np.mean(h_violation_per_run)))
+    h_violation_runs_per_episode.append(np.asarray(h_violation_per_run, dtype=np.float32))
+    h_min_per_episode.append(float(np.mean(h_min_per_run)))
     qj_per_episode.append(float(qj))
     r_mismatch_per_episode.append(float(r_mismatch))
     agent_locs_per_episode.append(logs[0]["positions"])
@@ -395,7 +420,12 @@ def main() -> None:
         safety_per_episode=np.asarray(safety_per_episode, dtype=np.float32),
         cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
         cumulative_reward_per_run=np.asarray(cumulative_reward_runs_per_episode, dtype=np.float32),
+        h_violation_per_episode=np.asarray(h_violation_per_episode, dtype=np.float32),
+        h_violation_per_run=np.asarray(h_violation_runs_per_episode, dtype=np.float32),
+        h_min_per_episode=np.asarray(h_min_per_episode, dtype=np.float32),
         mismatch_per_episode=np.asarray(mismatch_per_episode, dtype=np.float32),
+        mismatch_q10_per_episode=np.asarray(mismatch_q10_per_episode, dtype=np.float32),
+        mismatch_q90_per_episode=np.asarray(mismatch_q90_per_episode, dtype=np.float32),
         mismatch_per_run=np.asarray(mismatch_runs_per_episode, dtype=np.float32),
         agent_locs_first_run=np.asarray(agent_locs_per_episode, dtype=np.float32),
         alpha=args.alpha,

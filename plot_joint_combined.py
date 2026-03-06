@@ -4,7 +4,7 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,14 +29,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_run(path: str) -> Dict[str, Optional[np.ndarray]]:
+def load_run(path: str) -> Dict[str, np.ndarray]:
     with np.load(path) as data:
-        if "r_mismatch_per_episode" in data.files:
-            radius = data["r_mismatch_per_episode"]
-        elif "radius_per_episode" in data.files:
-            radius = data["radius_per_episode"]
-        else:
-            raise KeyError(f"{path}: expected r_mismatch_per_episode (or radius_per_episode).")
+        if "r_mismatch_per_episode" not in data.files:
+            raise KeyError(f"{path}: expected r_mismatch_per_episode.")
+        radius = data["r_mismatch_per_episode"]
 
         return {
             "episodes": data["episodes"],
@@ -45,8 +42,11 @@ def load_run(path: str) -> Dict[str, Optional[np.ndarray]]:
             "crashes": data["crashes_per_episode"],
             "safety": data["safety_per_episode"],
             "cumulative_reward": data["cumulative_reward_per_episode"],
-            "cumulative_reward_runs": data["cumulative_reward_per_run"] if "cumulative_reward_per_run" in data.files else None,
+            "cumulative_reward_runs": data["cumulative_reward_per_run"],
             "mismatch": data["mismatch_per_episode"],
+            "mismatch_runs": data["mismatch_per_run"],
+            "h_violation": data["h_violation_per_episode"],
+            "h_violation_runs": data["h_violation_per_run"],
             "alpha": float(data["alpha"]) if "alpha" in data.files else None,
         }
 
@@ -104,32 +104,39 @@ def main() -> None:
     ensure_len("robust radius", robust["radius"], num_episodes)
     ensure_len("robust qj", robust["qj"], num_episodes)
     ensure_len("robust crashes", robust["crashes"], num_episodes)
-    ensure_len("robust safety", robust["safety"], num_episodes)
     ensure_len("robust cumulative_reward", robust["cumulative_reward"], num_episodes)
     ensure_len("robust mismatch", robust["mismatch"], num_episodes)
-    if robust["cumulative_reward_runs"] is not None:
-        ensure_len("robust cumulative_reward_per_run", robust["cumulative_reward_runs"], num_episodes)
+    ensure_len("robust mismatch_runs", robust["mismatch_runs"], num_episodes)
+    ensure_len("robust h_violation", robust["h_violation"], num_episodes)
+    ensure_len("robust h_violation_runs", robust["h_violation_runs"], num_episodes)
+    ensure_len("robust cumulative_reward_per_run", robust["cumulative_reward_runs"], num_episodes)
 
     ensure_len("naive radius", naive["radius"], num_episodes)
     ensure_len("naive qj", naive["qj"], num_episodes)
     ensure_len("naive crashes", naive["crashes"], num_episodes)
-    ensure_len("naive safety", naive["safety"], num_episodes)
     ensure_len("naive cumulative_reward", naive["cumulative_reward"], num_episodes)
     ensure_len("naive mismatch", naive["mismatch"], num_episodes)
-    if naive["cumulative_reward_runs"] is not None:
-        ensure_len("naive cumulative_reward_per_run", naive["cumulative_reward_runs"], num_episodes)
+    ensure_len("naive mismatch_runs", naive["mismatch_runs"], num_episodes)
+    ensure_len("naive h_violation", naive["h_violation"], num_episodes)
+    ensure_len("naive h_violation_runs", naive["h_violation_runs"], num_episodes)
+    ensure_len("naive cumulative_reward_per_run", naive["cumulative_reward_runs"], num_episodes)
 
     nonrobust_radius = pad_repeat(prepare_radius(nonrobust["radius"], NONROBUST_INITIAL_RADIUS), num_episodes)
     nonrobust_qj = pad_repeat(nonrobust["qj"], num_episodes)
     nonrobust_crashes = pad_repeat(nonrobust["crashes"], num_episodes)
-    nonrobust_safety = pad_repeat(nonrobust["safety"], num_episodes)
     nonrobust_reward = pad_repeat(nonrobust["cumulative_reward"], num_episodes)
     nonrobust_mismatch = pad_repeat(nonrobust["mismatch"], num_episodes)
-    nonrobust_reward_runs = (
-        pad_repeat(nonrobust["cumulative_reward_runs"], num_episodes)
-        if nonrobust["cumulative_reward_runs"] is not None
-        else None
-    )
+    nonrobust_mismatch_runs = pad_repeat(nonrobust["mismatch_runs"], num_episodes)
+    nonrobust_h_violation = pad_repeat(nonrobust["h_violation"], num_episodes)
+    nonrobust_h_violation_runs = pad_repeat(nonrobust["h_violation_runs"], num_episodes)
+    nonrobust_reward_runs = pad_repeat(nonrobust["cumulative_reward_runs"], num_episodes)
+
+    robust_mismatch_q10 = np.quantile(robust["mismatch_runs"], 0.10, axis=1)
+    robust_mismatch_q90 = np.quantile(robust["mismatch_runs"], 0.90, axis=1)
+    naive_mismatch_q10 = np.quantile(naive["mismatch_runs"], 0.10, axis=1)
+    naive_mismatch_q90 = np.quantile(naive["mismatch_runs"], 0.90, axis=1)
+    nonrobust_mismatch_q10 = np.quantile(nonrobust_mismatch_runs, 0.10, axis=1)
+    nonrobust_mismatch_q90 = np.quantile(nonrobust_mismatch_runs, 0.90, axis=1)
 
     robust_radius = prepare_radius(robust["radius"], ROBUST_INITIAL_RADIUS)
     naive_radius = prepare_radius(naive["radius"], NAIVE_INITIAL_RADIUS)
@@ -140,7 +147,6 @@ def main() -> None:
 
     alpha_for_error = args.alpha if args.alpha is not None else robust["alpha"] if robust["alpha"] is not None else 0.1
     target_alpha = robust["alpha"] if robust["alpha"] is not None else 0.1
-    target_line = 1 - target_alpha
 
     robust_stem = Path(args.robust).stem
     output_dir = args.output_dir or os.path.join("./", "plots", f"combined_joint_{robust_stem}")
@@ -193,22 +199,22 @@ def main() -> None:
     plt.close(fig)
     plot_paths["performance"] = path
 
-    # Safety
+    # H-value violation rate
     fig, ax = plt.subplots()
-    ax.axhline(target_line, linestyle="--", color="gray", label=r"Target $(1 - \alpha)$")
-    ax.plot(x, robust["safety"], label="Robust safety", color="tab:blue", marker="s")
-    ax.plot(x, naive["safety"], label="Naive safety", color="tab:orange", marker="o")
-    ax.plot(x, nonrobust_safety, label="Nonrobust safety", color="tab:red", marker="v")
-    ax.set_title(r"Empirical Safety Coverage")
-    ax.set_xlabel(r"Episode ($j$)")
+    ax.axhline(target_alpha, linestyle=":", color="gray", label=r"Target $\alpha$")
+    ax.plot(x, robust["h_violation"], label="Robust h-violation", color="tab:blue", marker="s")
+    ax.plot(x, naive["h_violation"], label="Naive h-violation", color="tab:orange", marker="o")
+    ax.plot(x, nonrobust_h_violation, label="Nonrobust h-violation", color="tab:red", marker="v")
+    ax.set_title("Trajectory H-Violation Rate")
+    ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_lim)
     ax.set_xticks(x_ticks)
-    ax.set_ylabel(r"Coverage (\%)")
+    ax.set_ylabel("Frac. trajectories with min(h)<0")
     ax.legend()
-    path = os.path.join(output_dir, "empirical_safety_coverage.pdf")
+    path = os.path.join(output_dir, "h_violation_rate.pdf")
     fig.savefig(path, bbox_inches="tight", format="pdf")
     plt.close(fig)
-    plot_paths["safety"] = path
+    plot_paths["h_violation"] = path
 
     # Crash rate
     fig, ax = plt.subplots()
@@ -228,9 +234,40 @@ def main() -> None:
 
     # Mismatch
     fig, ax = plt.subplots()
-    ax.plot(x, robust["mismatch"], label="Robust mismatch", color="tab:blue", marker="s")
-    ax.plot(x, naive["mismatch"], label="Naive mismatch", color="tab:orange", marker="o")
-    ax.plot(x, nonrobust_mismatch, label="Nonrobust mismatch", color="tab:red", marker="v")
+    robust_mismatch_err_low = np.maximum(robust["mismatch"] - robust_mismatch_q10, 0.0)
+    robust_mismatch_err_high = np.maximum(robust_mismatch_q90 - robust["mismatch"], 0.0)
+    naive_mismatch_err_low = np.maximum(naive["mismatch"] - naive_mismatch_q10, 0.0)
+    naive_mismatch_err_high = np.maximum(naive_mismatch_q90 - naive["mismatch"], 0.0)
+    nonrobust_mismatch_err_low = np.maximum(nonrobust_mismatch - nonrobust_mismatch_q10, 0.0)
+    nonrobust_mismatch_err_high = np.maximum(nonrobust_mismatch_q90 - nonrobust_mismatch, 0.0)
+
+    ax.errorbar(
+        x,
+        robust["mismatch"],
+        yerr=np.vstack([robust_mismatch_err_low, robust_mismatch_err_high]),
+        label="Robust mismatch",
+        color="tab:blue",
+        marker="s",
+        capsize=4,
+    )
+    ax.errorbar(
+        x,
+        naive["mismatch"],
+        yerr=np.vstack([naive_mismatch_err_low, naive_mismatch_err_high]),
+        label="Naive mismatch",
+        color="tab:orange",
+        marker="o",
+        capsize=4,
+    )
+    ax.errorbar(
+        x,
+        nonrobust_mismatch,
+        yerr=np.vstack([nonrobust_mismatch_err_low, nonrobust_mismatch_err_high]),
+        label="Nonrobust mismatch",
+        color="tab:red",
+        marker="v",
+        capsize=4,
+    )
     ax.set_title("Mismatch Across Episodes")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_lim)

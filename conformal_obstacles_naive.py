@@ -202,6 +202,7 @@ def run_single_agent(
     solo_rnn_states,
     solo_obs_dim,
     solo_action_fn,
+    obstacle_radius_margin: float,
     max_steps=1500,
     num_runs=1,
     deterministic=False,
@@ -223,6 +224,7 @@ def run_single_agent(
             "collision_obstacle": [],
             "boundary_dist": [],
             "clearance": [],
+            "cbf_clearance": [],
             "model_mismatch_state": [],
         }
         env_run = clone_env_from_snapshot(snapshot)
@@ -269,10 +271,12 @@ def run_single_agent(
             if obstacle_centers.size == 0:
                 boundary_dist = float("inf")
                 clearance = float("inf")
+                cbf_clearance = float("inf")
             else:
                 center_dists_xy = np.linalg.norm(obstacle_centers[:, :2] - solo_pos[None, :2], axis=1)
                 boundary_dist = float(np.min(center_dists_xy - obstacle_radius))
                 clearance = float(np.min(center_dists_xy - (obstacle_radius + quad_radius)))
+                cbf_clearance = float(np.min(center_dists_xy - (obstacle_radius + quad_radius + obstacle_radius_margin)))
 
             rew_obst_raw = infos[0]["rewards"].get("rewraw_quadcol_obstacle", 0.0)
             collision_obstacle = float(rew_obst_raw) < 0.0
@@ -283,6 +287,7 @@ def run_single_agent(
             run_logs["collision_obstacle"].append(collision_obstacle)
             run_logs["boundary_dist"].append(boundary_dist)
             run_logs["clearance"].append(clearance)
+            run_logs["cbf_clearance"].append(cbf_clearance)
             run_logs["model_mismatch_state"].append(mismatch_state)
 
             done = np.all(dones)
@@ -379,7 +384,12 @@ def main() -> None:
     cumulative_reward_per_episode = []
     cumulative_reward_runs_per_episode = []
     min_clearance_per_episode = []
+    h_violation_per_episode = []
+    h_violation_runs_per_episode = []
+    h_min_per_episode = []
     mismatch_per_episode = []
+    mismatch_q10_per_episode = []
+    mismatch_q90_per_episode = []
     mismatch_runs_per_episode = []
     run_logs_per_episode = []
     for episode in range(args.num_episodes):
@@ -396,6 +406,7 @@ def main() -> None:
             solo_rnn_states,
             solo_obs_dim,
             filter_fn,
+            args.obstacle_radius_margin,
             max_steps=args.episode_length,
             num_runs=args.num_trajectories,
             deterministic=args.deterministic,
@@ -418,6 +429,7 @@ def main() -> None:
             solo_rnn_states,
             solo_obs_dim,
             filter_fn,
+            args.obstacle_radius_margin,
             max_steps=args.episode_length,
             num_runs=args.num_eval_trajs,
             deterministic=args.deterministic,
@@ -428,6 +440,8 @@ def main() -> None:
         num_crashes_per_run = []
         min_clearance_per_run = []
         max_mismatch_per_run = []
+        h_violation_per_run = []
+        h_min_per_run = []
         for run_id in range(args.num_eval_trajs):
             goal_dists = logs[run_id]["goal_dist"]
             goal_delta = goal_dists[:-1] - goal_dists[1:]
@@ -435,20 +449,29 @@ def main() -> None:
             cumulative_reward = float(np.sum(positive_progress))
             had_crash = bool(np.any(logs[run_id]["collision_obstacle"]))
             min_clearance = float(np.min(logs[run_id]["clearance"]))
+            min_h = float(np.min(logs[run_id]["cbf_clearance"]))
             max_mismatch = float(np.max(logs[run_id]["model_mismatch_state"]))
+            h_violation = 1.0 if min_h <= 0.0 else 0.0
 
             cumulative_reward_per_run.append(cumulative_reward)
             num_crashes_per_run.append(1 if had_crash else 0)
             min_clearance_per_run.append(min_clearance)
             max_mismatch_per_run.append(max_mismatch)
+            h_violation_per_run.append(h_violation)
+            h_min_per_run.append(min_h)
 
         cumulative_reward_per_episode.append(float(np.mean(cumulative_reward_per_run)))
         crashes_per_episode.append(float(np.mean(num_crashes_per_run)))
         safety_per_episode.append(1.0 - float(np.mean(num_crashes_per_run)))
         min_clearance_per_episode.append(float(np.mean(min_clearance_per_run)))
         mismatch_per_episode.append(float(np.mean(max_mismatch_per_run)))
+        mismatch_q10_per_episode.append(float(np.quantile(max_mismatch_per_run, 0.10)))
+        mismatch_q90_per_episode.append(float(np.quantile(max_mismatch_per_run, 0.90)))
         cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
         mismatch_runs_per_episode.append(np.asarray(max_mismatch_per_run, dtype=np.float32))
+        h_violation_per_episode.append(float(np.mean(h_violation_per_run)))
+        h_violation_runs_per_episode.append(np.asarray(h_violation_per_run, dtype=np.float32))
+        h_min_per_episode.append(float(np.mean(h_min_per_run)))
         qj_per_episode.append(float(qj))
         r_mismatch_per_episode.append(float(r_mismatch))
         run_logs_per_episode.append(logs[0]["position"])
@@ -470,7 +493,12 @@ def main() -> None:
         cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
         cumulative_reward_per_run=np.asarray(cumulative_reward_runs_per_episode, dtype=np.float32),
         min_clearance_per_episode=np.asarray(min_clearance_per_episode, dtype=np.float32),
+        h_violation_per_episode=np.asarray(h_violation_per_episode, dtype=np.float32),
+        h_violation_per_run=np.asarray(h_violation_runs_per_episode, dtype=np.float32),
+        h_min_per_episode=np.asarray(h_min_per_episode, dtype=np.float32),
         mismatch_per_episode=np.asarray(mismatch_per_episode, dtype=np.float32),
+        mismatch_q10_per_episode=np.asarray(mismatch_q10_per_episode, dtype=np.float32),
+        mismatch_q90_per_episode=np.asarray(mismatch_q90_per_episode, dtype=np.float32),
         mismatch_per_run=np.asarray(mismatch_runs_per_episode, dtype=np.float32),
         solo_positions_first_run=np.asarray(run_logs_per_episode, dtype=np.float32),
         alpha=args.alpha,
