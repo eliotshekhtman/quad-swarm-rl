@@ -53,27 +53,28 @@ def main() -> None:
         crashes_arr = data["crashes_per_episode"]
         cumulative_reward_arr = data["cumulative_reward_per_episode"]
         cumulative_reward_runs = data["cumulative_reward_per_run"]
-        safety_arr = data["safety_per_episode"]
         mismatch_arr = data["mismatch_per_episode"]
         alpha = float(data["alpha"])
         agent_locs = data["agent_locs_first_run"]
 
     num_episodes = len(episodes)
-    x_ticks = np.arange(0, num_episodes, 1)
-    x_lim = (0, max(num_episodes - 1, 0))
-    target_alpha = alpha if alpha is not None else 0.1
-    target_line = 1 - target_alpha
+    x_radius = episodes
+    x_other = episodes[1:]
+    x_radius_ticks = np.arange(0, num_episodes, 1)
+    x_other_ticks = np.arange(1, num_episodes, 1)
+    x_radius_lim = (0, max(num_episodes - 1, 0))
+    x_other_lim = (1, max(num_episodes - 1, 1))
 
     plot_paths = {}
 
     fig, ax = plt.subplots()
     shifted_radius_arr = np.insert(radius_arr, 0, 2)[:-1]
-    ax.plot(episodes, shifted_radius_arr, label=r"$r_j$", marker="s")
-    ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker="o")
+    ax.plot(x_radius, shifted_radius_arr, label=r"$r_j$", marker="s")
+    ax.plot(x_radius, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker="o")
     ax.set_title(r"Radius Across Episodes")
     ax.set_xlabel(r"Episode ($j$)")
-    ax.set_xlim(*x_lim)
-    ax.set_xticks(x_ticks)
+    ax.set_xlim(*x_radius_lim)
+    ax.set_xticks(x_radius_ticks)
     ax.set_ylabel(r"Radius ($m$)")
     ax.legend()
     path = os.path.join(output_dir, "radius_across_episodes.pdf")
@@ -83,15 +84,18 @@ def main() -> None:
 
     fig, ax = plt.subplots()
     alpha_for_error = args.alpha if args.alpha is not None else alpha
-    lower = np.quantile(cumulative_reward_runs, alpha_for_error, axis=1)
-    upper = np.quantile(cumulative_reward_runs, 1 - alpha_for_error, axis=1)
+    lower = np.quantile(cumulative_reward_runs, alpha_for_error, axis=1)[:-1]
+    upper = np.quantile(cumulative_reward_runs, 1 - alpha_for_error, axis=1)[:-1]
+    plot_reward = cumulative_reward_arr[:-1]
+    lower_plot = lower
+    upper_plot = upper
     yerr = np.vstack([
-        np.maximum(cumulative_reward_arr - lower, 0),
-        np.maximum(upper - cumulative_reward_arr, 0),
+        np.maximum(plot_reward - lower_plot, 0),
+        np.maximum(upper_plot - plot_reward, 0),
     ])
     ax.errorbar(
-        episodes,
-        cumulative_reward_arr,
+        x_other,
+        plot_reward,
         yerr=yerr,
         label=rf"Cumulative progress ({alpha_for_error:.2g}/{1 - alpha_for_error:.2g} quantiles)",
         marker="s",
@@ -99,8 +103,8 @@ def main() -> None:
     )
     ax.set_title(r"Performance Across Episodes")
     ax.set_xlabel(r"Episode ($j$)")
-    ax.set_xlim(*x_lim)
-    ax.set_xticks(x_ticks)
+    ax.set_xlim(*x_other_lim)
+    ax.set_xticks(x_other_ticks)
     ax.set_ylabel(r"Cumulative reward ($m$)")
     ax.legend(loc="center right")
     path = os.path.join(output_dir, "performance_cumulative_reward.pdf")
@@ -109,25 +113,11 @@ def main() -> None:
     plot_paths["performance"] = path
 
     fig, ax = plt.subplots()
-    ax.plot(episodes, safety_arr, label=r"Empirical safety", marker="s")
-    ax.axhline(target_line, linestyle="--", color="gray", label=r"Target $(1 - \alpha)$")
-    ax.set_title(r"Empirical Safety Coverage")
-    ax.set_xlabel(r"Episode ($j$)")
-    ax.set_xlim(*x_lim)
-    ax.set_xticks(x_ticks)
-    ax.set_ylabel(r"Coverage (\%)")
-    ax.legend()
-    path = os.path.join(output_dir, "empirical_safety_coverage.pdf")
-    fig.savefig(path, bbox_inches="tight", format="pdf")
-    plt.close(fig)
-    plot_paths["safety"] = path
-
-    fig, ax = plt.subplots()
-    ax.plot(episodes, crashes_arr, label="Crash rate", marker="s")
+    ax.plot(x_other, crashes_arr[:-1], label="Crash rate", marker="s")
     ax.set_title("Crash Rate Across Episodes")
     ax.set_xlabel("Episode (j)")
-    ax.set_xlim(*x_lim)
-    ax.set_xticks(x_ticks)
+    ax.set_xlim(*x_other_lim)
+    ax.set_xticks(x_other_ticks)
     ax.set_ylabel("Crash rate")
     ax.legend()
     path = os.path.join(output_dir, "crash_rate.pdf")
@@ -136,11 +126,11 @@ def main() -> None:
     plot_paths["crash_rate"] = path
 
     fig, ax = plt.subplots()
-    ax.plot(episodes, mismatch_arr, label="Max state mismatch", marker="s")
+    ax.plot(x_other, mismatch_arr[:-1], label="Max state mismatch", marker="s")
     ax.set_title("Mismatch Across Episodes")
     ax.set_xlabel("Episode (j)")
-    ax.set_xlim(*x_lim)
-    ax.set_xticks(x_ticks)
+    ax.set_xlim(*x_other_lim)
+    ax.set_xticks(x_other_ticks)
     ax.set_ylabel("Mismatch")
     ax.legend()
     path = os.path.join(output_dir, "mismatch_across_episodes.pdf")
