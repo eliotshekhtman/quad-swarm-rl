@@ -10,6 +10,7 @@ concatenated full swarm state.
 
 from __future__ import annotations
 
+import time
 import argparse
 import json
 import os
@@ -165,6 +166,10 @@ def run_joint_agents(
     snapshot = safe_capture_env_snapshot(env)
     logs = [None] * num_runs
     running_max_mismatch = 0.0
+    time_inference = 0.0
+    time_cbf = 0.0
+    time_env = 0.0
+    time_data = 0.0
     progress_bar = tqdm(range(num_runs))
 
     for run_idx in progress_bar:
@@ -191,6 +196,7 @@ def run_joint_agents(
             goals.append(np.asarray(target, dtype=np.float64).copy())
 
         while not done and step_num < max_steps:
+            start_time = time.time()
             obs_self = obs_run[:, :solo_obs_dim]
             obs_dict = {OBS_KEY: obs_self}
             with torch.no_grad():
@@ -203,14 +209,20 @@ def run_joint_agents(
             if actions.dim() == 1:
                 actions = actions.unsqueeze(-1)
             actions = actions.detach().cpu().numpy()
+            time_inference += time.time() - start_time
 
+            start_time = time.time()
             actions = joint_action_fn(base_action=actions, env_state=env_run)
+            time_cbf += time.time() - start_time
+            start_time = time.time()
             mismatch = _joint_state_model_mismatch(actions, env_run.unwrapped)
 
             obs_run, rewards, dones, infos = env_run.step(actions)
             obs_run = np.array(obs_run, dtype=np.float32)
             pos, vel = extract_positions_velocities(env_run.unwrapped)
+            time_env += time.time() - start_time
 
+            start_time = time.time()
             step_goal_dist = []
             step_goal_swap = []
             for agent_id in range(num_agents):
@@ -228,6 +240,7 @@ def run_joint_agents(
             run_logs["goal_dist"].append(np.asarray(step_goal_dist, dtype=np.float64))
             run_logs["goal_swap"].append(np.asarray(step_goal_swap, dtype=np.bool_))
             run_logs["model_mismatch_state"].append(mismatch)
+            time_data += time.time() - start_time
 
             done = np.all(dones)
             step_num += 1
@@ -240,6 +253,7 @@ def run_joint_agents(
         logs[run_idx] = run_logs
         env_run.close()
 
+    print('Clocks: inf', time_inference, 'cbf', time_cbf, 'env', time_env, 'data', time_data)
     return logs
 
 
@@ -256,6 +270,14 @@ def _pairwise_h_min(positions_t: np.ndarray, separation_radius: float) -> float:
         margin = float(np.linalg.norm(positions_t[i] - positions_t[j]) - separation_radius)
         min_h = min(min_h, margin)
     return min_h
+
+
+def _pairwise_min_dist(positions_t: np.ndarray) -> float:
+    min_dist = float("inf")
+    for i, j in combinations(range(positions_t.shape[0]), 2):
+        dist = float(np.linalg.norm(positions_t[i] - positions_t[j]))
+        min_dist = min(min_dist, dist)
+    return min_dist
 
 
 def main() -> None:
@@ -388,6 +410,8 @@ def main() -> None:
         max_mismatch_per_run = []
         h_violation_per_run = []
         h_min_per_run = []
+        pairwise_min_dist_per_run = []
+        quad_crash_flags = []
         for run_id in range(args.num_eval_trajs):
             run = logs[run_id]
             goal_dist = run["goal_dist"]        # (T, N)
@@ -408,9 +432,11 @@ def main() -> None:
 
             had_crash = 0
             min_h = float("inf")
+            run_pairwise_min_dist = float("inf")
             for t in range(positions.shape[0]):
                 step_h = _pairwise_h_min(positions[t], args.separation_radius)
                 min_h = min(min_h, step_h)
+                run_pairwise_min_dist = min(run_pairwise_min_dist, _pairwise_min_dist(positions[t]))
                 had_crash = max(had_crash, _collision_indicator_from_positions(positions[t], min_r))
 
             cumulative_reward_per_run.append(cumulative_reward)
@@ -418,6 +444,11 @@ def main() -> None:
             max_mismatch_per_run.append(float(np.max(run["model_mismatch_state"])) if run["model_mismatch_state"].size > 0 else 0.0)
             h_violation_per_run.append(1.0 if min_h <= 0.0 else 0.0)
             h_min_per_run.append(min_h)
+            pairwise_min_dist_per_run.append(run_pairwise_min_dist)
+            quad_crash_flags.append(float(had_crash))
+
+        episode_min_pair_dist = float(np.min(np.asarray(pairwise_min_dist_per_run, dtype=np.float32)))
+        episode_quad_crashes = int(np.sum(np.asarray(quad_crash_flags, dtype=np.float32)))
 
         cumulative_reward_per_episode.append(float(np.mean(cumulative_reward_per_run)))
         cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
@@ -434,9 +465,9 @@ def main() -> None:
         r_mismatch_per_episode.append(float(r_mismatch))
         agent_locs_per_episode.append(logs[0]["positions"])
         print(
-            f"Cum rew: {cumulative_reward_per_episode[-1]} "
             f"Crash rate: {crashes_per_episode[-1]} "
-            f"Max state mismatch: {mismatch_per_episode[-1]}"
+            f"Episode min pairwise dist: {episode_min_pair_dist} "
+            f"Quad-crash runs: {episode_quad_crashes}/{args.num_eval_trajs}"
         )
 
     metrics_path = os.path.join(experiment_dir, "conformal_joint_metrics.npz")
