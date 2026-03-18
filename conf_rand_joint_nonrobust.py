@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--separation_radius", type=float, default=0.5, help="Desired pairwise separation distance enforced by CBF.")
     parser.add_argument("--gamma", type=float, default=0.8, help="CBF gamma in (0, 1].")
     parser.add_argument("--disable_boundary_collision", action="store_true", help="Move room boundaries far enough to effectively disable wall/ceiling/floor collisions.")
+    parser.add_argument("--policy_refresh_interval", type=int, default=1, help="Call the policy every N control steps (N=1 keeps existing behavior).")
     return parser.parse_args()
 
 
@@ -154,6 +155,7 @@ def run_joint_agents(
     max_steps=1500,
     num_runs=1,
     deterministic=False,
+    policy_refresh_interval: int = 1,
     disable_boundary_collision=False,
     boundary_far_distance: float = COLLISION_FAR_DISTANCE,
     separation_radius: float | None = None,
@@ -164,6 +166,9 @@ def run_joint_agents(
     Run environment for max_steps and return run-level logs.
     """
     logs = [None] * num_runs
+    policy_refresh_interval = int(policy_refresh_interval)
+    if policy_refresh_interval < 1:
+        raise ValueError("--policy_refresh_interval must be >= 1")
     running_max_mismatch = 0.0
     progress_bar = tqdm(range(num_runs))
 
@@ -176,6 +181,7 @@ def run_joint_agents(
         step_num = 0
         sep_radius = float(separation_radius) if separation_radius is not None else 0.0
         run_rnn_states = init_rnn_states.clone()
+        cached_nominal_action = None
         cumulative_reward = 0.0
         nonswap_steps = 0
         run_max_mismatch = 0.0
@@ -193,18 +199,21 @@ def run_joint_agents(
             goals.append(np.asarray(target, dtype=np.float64).copy())
 
         while not done and step_num < max_steps:
-            obs_self = obs_run[:, :solo_obs_dim]
-            obs_dict = {OBS_KEY: obs_self}
-            with torch.no_grad():
-                normalized_obs = prepare_and_normalize_obs(solo_actor, obs_dict)
-                policy_out = solo_actor(normalized_obs, run_rnn_states)
-            run_rnn_states = policy_out["new_rnn_states"]
-            actions = policy_out["actions"]
-            if deterministic:
-                actions = argmax_actions(solo_actor.action_distribution())
-            if actions.dim() == 1:
-                actions = actions.unsqueeze(-1)
-            actions = actions.detach().cpu().numpy()
+            if (step_num % policy_refresh_interval == 0) or cached_nominal_action is None:
+                obs_self = obs_run[:, :solo_obs_dim]
+                obs_dict = {OBS_KEY: obs_self}
+                with torch.no_grad():
+                    normalized_obs = prepare_and_normalize_obs(solo_actor, obs_dict)
+                    policy_out = solo_actor(normalized_obs, run_rnn_states)
+                run_rnn_states = policy_out["new_rnn_states"]
+                cached_nominal_action = policy_out["actions"]
+                if deterministic:
+                    cached_nominal_action = argmax_actions(solo_actor.action_distribution())
+                if cached_nominal_action.dim() == 1:
+                    cached_nominal_action = cached_nominal_action.unsqueeze(-1)
+                cached_nominal_action = cached_nominal_action.detach().cpu().numpy()
+
+            actions = cached_nominal_action
 
             actions = joint_action_fn(base_action=actions, env_state=env)
             mismatch = _joint_state_model_mismatch(actions, env.unwrapped)
@@ -291,6 +300,8 @@ def main() -> None:
         raise ValueError("--gamma must satisfy 0 < gamma <= 1")
     if args.separation_radius <= 0.0:
         raise ValueError("--separation_radius must be > 0")
+    if args.policy_refresh_interval < 1:
+        raise ValueError("--policy_refresh_interval must be >= 1")
 
     torch.set_grad_enabled(False)
     register_swarm_components()
@@ -371,9 +382,10 @@ def main() -> None:
         filter_fn,
         num_agents=args.num_agents,
         max_steps=args.episode_length,
-        num_runs=args.num_trajectories,
-        deterministic=args.deterministic,
-        disable_boundary_collision=args.disable_boundary_collision,
+            num_runs=args.num_trajectories,
+            deterministic=args.deterministic,
+            policy_refresh_interval=args.policy_refresh_interval,
+            disable_boundary_collision=args.disable_boundary_collision,
         separation_radius=args.separation_radius,
         min_collision_distance=min_r,
     )
@@ -389,9 +401,10 @@ def main() -> None:
         filter_fn,
         num_agents=args.num_agents,
         max_steps=args.episode_length,
-        num_runs=args.num_eval_trajs,
-        deterministic=args.deterministic,
-        disable_boundary_collision=args.disable_boundary_collision,
+            num_runs=args.num_eval_trajs,
+            deterministic=args.deterministic,
+            policy_refresh_interval=args.policy_refresh_interval,
+            disable_boundary_collision=args.disable_boundary_collision,
         separation_radius=args.separation_radius,
         min_collision_distance=min_r,
         return_first_run_trajectory=True,
