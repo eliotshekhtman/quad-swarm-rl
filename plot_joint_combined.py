@@ -137,12 +137,29 @@ def main() -> None:
     naive_mismatch_q90 = np.quantile(naive["mismatch_runs"], 0.90, axis=1)
     nonrobust_mismatch_q10 = np.quantile(nonrobust_mismatch_runs, 0.10, axis=1)
     nonrobust_mismatch_q90 = np.quantile(nonrobust_mismatch_runs, 0.90, axis=1)
-
     robust_radius = prepare_radius(robust["radius"], ROBUST_INITIAL_RADIUS)
     naive_radius = prepare_radius(naive["radius"], NAIVE_INITIAL_RADIUS)
+    cal_once_radius = np.empty_like(naive_radius)
+    cal_once_radius[0] = naive_radius[0]
+    cal_once_qj = np.empty_like(naive["qj"])
+    cal_once_qj[0] = naive["qj"][0]
+    if num_episodes > 1:
+        cal_once_radius[1:] = np.repeat(naive_radius[1], num_episodes - 1)
+        cal_once_qj[1:] = np.repeat(naive["qj"][1], num_episodes - 1)
 
     x_radius = base_episodes
     x_other = base_episodes[1:]
+    cal_once_performance = np.repeat(naive["cumulative_reward"][0], num_episodes)
+    cal_once_performance_runs = (
+        np.repeat(naive["cumulative_reward_runs"][:1], num_episodes, axis=0)
+        if naive["cumulative_reward_runs"] is not None
+        else None
+    )
+    cal_once_h_violation = np.repeat(naive["h_violation"][0], x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
+    cal_once_crashes = np.repeat(naive["crashes"][0], x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
+    cal_once_mismatch = np.repeat(naive["mismatch"][0], x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
+    cal_once_mismatch_err_low = np.repeat(np.maximum(naive["mismatch"][0] - naive_mismatch_q10[0], 0.0), x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
+    cal_once_mismatch_err_high = np.repeat(np.maximum(naive_mismatch_q90[0] - naive["mismatch"][0], 0.0), x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
     x_radius_ticks = np.arange(0, num_episodes, 1)
     x_other_ticks = np.arange(1, num_episodes, 1)
     x_radius_lim = (0, max(num_episodes - 1, 0))
@@ -160,9 +177,11 @@ def main() -> None:
     fig, ax = plt.subplots()
     ax.plot(x_radius, robust_radius, label="Robust $r_j$", color="tab:blue", marker="s")
     ax.plot(x_radius, naive_radius, label="Naive $r_j$", color="tab:orange", marker="s")
+    ax.plot(x_radius, cal_once_radius, label="Calibrate-once $r_j$", color="tab:green", marker="s")
     ax.plot(x_radius, nonrobust_radius, label="Nonrobust $r_j$", color="tab:red", marker="s")
     ax.plot(x_radius, robust["qj"], label="Robust $q_j$", color="tab:blue", marker="x")
     ax.plot(x_radius, naive["qj"], label="Naive $q_j$", color="tab:orange", marker="x")
+    ax.plot(x_radius, cal_once_qj, label="Calibrate-once $q_j$", color="tab:green", marker="x")
     ax.plot(x_radius, nonrobust_qj, label="Nonrobust $q_j$", color="tab:red", marker="x")
     ax.set_title(r"Radius Across Episodes")
     ax.set_xlabel(r"Episode ($j$)")
@@ -180,6 +199,7 @@ def main() -> None:
     perf_series = [
         ("Robust performance", robust["cumulative_reward"], robust["cumulative_reward_runs"], "tab:blue", "s"),
         ("Naive performance", naive["cumulative_reward"], naive["cumulative_reward_runs"], "tab:orange", "o"),
+        ("Calibrate-once performance", cal_once_performance, cal_once_performance_runs, "tab:green", "^"),
         ("Nonrobust performance", nonrobust_reward, nonrobust_reward_runs, "tab:red", "v"),
     ]
     for label, y, runs, color, marker in perf_series:
@@ -211,12 +231,14 @@ def main() -> None:
     ax.axhline(target_alpha, linestyle=":", color="gray", label=r"Target $\alpha$")
     ax.plot(x_other, robust["h_violation"][:-1], label="Robust h-violation", color="tab:blue", marker="s")
     ax.plot(x_other, naive["h_violation"][:-1], label="Naive h-violation", color="tab:orange", marker="o")
+    ax.plot(x_other, cal_once_h_violation, label="Calibrate-once h-violation", color="tab:green", marker="^")
     ax.plot(x_other, nonrobust_h_violation[:-1], label="Nonrobust h-violation", color="tab:red", marker="v")
     ax.set_title("Trajectory H-Violation Rate")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("Frac. trajectories with min(h)<0")
+    ax.set_ylim(0.0, 1.0)
     ax.legend()
     path = os.path.join(output_dir, "h_violation_rate.pdf")
     fig.savefig(path, bbox_inches="tight", format="pdf")
@@ -227,6 +249,7 @@ def main() -> None:
     fig, ax = plt.subplots()
     ax.plot(x_other, robust["crashes"][:-1], label="Robust crash rate", color="tab:blue", marker="s")
     ax.plot(x_other, naive["crashes"][:-1], label="Naive crash rate", color="tab:orange", marker="o")
+    ax.plot(x_other, cal_once_crashes, label="Calibrate-once crash rate", color="tab:green", marker="^")
     ax.plot(x_other, nonrobust_crashes[:-1], label="Nonrobust crash rate", color="tab:red", marker="v")
     ax.set_title("Crash Rate Across Episodes")
     ax.set_xlabel("Episode (j)")
@@ -273,6 +296,15 @@ def main() -> None:
         label="Nonrobust mismatch",
         color="tab:red",
         marker="v",
+        capsize=4,
+    )
+    ax.errorbar(
+        x_other,
+        cal_once_mismatch,
+        yerr=np.vstack([cal_once_mismatch_err_low, cal_once_mismatch_err_high]),
+        label="Calibrate-once mismatch",
+        color="tab:green",
+        marker="^",
         capsize=4,
     )
     ax.set_title("Mismatch Across Episodes")
