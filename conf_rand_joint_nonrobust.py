@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_agents", type=int, default=8, help="Number of patrol agents.")
     parser.add_argument("--deterministic", action="store_true")
 
+    parser.add_argument("--kappa", type=float, default=0.6, help="Radius update aggressiveness.")
     parser.add_argument("--separation_radius", type=float, default=0.5, help="Desired pairwise separation distance enforced by CBF.")
     parser.add_argument("--gamma", type=float, default=0.8, help="CBF gamma in (0, 1].")
     parser.add_argument("--disable_boundary_collision", action="store_true", help="Move room boundaries far enough to effectively disable wall/ceiling/floor collisions.")
@@ -88,6 +89,19 @@ def _configure_far_boundary_geometry(env_unwrapped, far_distance: float = COLLIS
 
 def _pack_state_tuple(pos: np.ndarray, vel: np.ndarray, rot: np.ndarray, omega: np.ndarray) -> np.ndarray:
     return np.concatenate([pos.reshape(-1), vel.reshape(-1), rot.reshape(-1), omega.reshape(-1)], axis=0).astype(np.float64)
+
+
+def _unpack_step_result(step_result):
+    if not isinstance(step_result, tuple):
+        raise TypeError(f"Expected step() to return tuple, got {type(step_result)!r}")
+    if len(step_result) == 5:
+        obs, rewards, terminated, truncated, infos = step_result
+        dones = np.logical_or(terminated, truncated)
+    elif len(step_result) == 4:
+        obs, rewards, dones, infos = step_result
+    else:
+        raise ValueError(f"Unexpected step() return length: {len(step_result)}")
+    return obs, rewards, np.asarray(dones), infos
 
 
 def _joint_state_model_mismatch(actions: np.ndarray, env_unwrapped) -> float:
@@ -163,7 +177,7 @@ def run_joint_agents(
     return_first_run_trajectory=False,
 ):
     """
-    Run environment for max_steps and return run-level logs.
+    Run environment for max_steps and return run-level summaries.
     """
     logs = [None] * num_runs
     policy_refresh_interval = int(policy_refresh_interval)
@@ -187,6 +201,7 @@ def run_joint_agents(
         run_max_mismatch = 0.0
         crash_indicator = 0
         h_min = float("inf")
+        pairwise_min_dist = float("inf")
         prev_goal_dist = None
         run_trajectory_positions = []
         return_trajectory = bool(return_first_run_trajectory) and run_idx == 0
@@ -219,12 +234,13 @@ def run_joint_agents(
             mismatch = _joint_state_model_mismatch(actions, env.unwrapped)
             run_max_mismatch = max(run_max_mismatch, float(mismatch))
 
-            obs_run, rewards, dones, infos = env.step(actions)
+            obs_run, rewards, dones, infos = _unpack_step_result(env.step(actions))
             obs_run = np.array(obs_run, dtype=np.float32)
             pos, vel = extract_positions_velocities(env.unwrapped)
             step_h = _pairwise_h_min(pos, sep_radius)
             h_min = min(h_min, float(step_h))
             crash_indicator = max(crash_indicator, _collision_indicator_from_positions(pos, min_collision_distance))
+            pairwise_min_dist = min(pairwise_min_dist, _pairwise_min_dist(pos))
             if return_trajectory:
                 run_trajectory_positions.append(pos.copy())
 
@@ -264,11 +280,14 @@ def run_joint_agents(
             "model_mismatch_state": np.float64(run_max_mismatch),
             "cumulative_reward": float(cumulative_reward),
             "crash_indicator": int(crash_indicator),
+            "quad_crash_flag": int(crash_indicator),
+            "pairwise_min_dist": float(pairwise_min_dist),
             "h_violation": 1.0 if h_min <= 0.0 else 0.0,
             "h_min": float(h_min),
         }
         if return_trajectory:
             run_logs["positions"] = np.asarray(run_trajectory_positions, dtype=np.float32)
+
         if step_num > 0:
             running_max_mismatch = max(running_max_mismatch, run_max_mismatch)
         progress_bar.set_postfix_str(f"max mismatch={running_max_mismatch:.6f}")
@@ -290,6 +309,14 @@ def _pairwise_h_min(positions_t: np.ndarray, separation_radius: float) -> float:
         margin = float(np.linalg.norm(positions_t[i] - positions_t[j]) - separation_radius)
         min_h = min(min_h, margin)
     return min_h
+
+
+def _pairwise_min_dist(positions_t: np.ndarray) -> float:
+    min_dist = float("inf")
+    for i, j in combinations(range(positions_t.shape[0]), 2):
+        dist = float(np.linalg.norm(positions_t[i] - positions_t[j]))
+        min_dist = min(min_dist, dist)
+    return min_dist
 
 
 def main() -> None:
@@ -382,15 +409,15 @@ def main() -> None:
         filter_fn,
         num_agents=args.num_agents,
         max_steps=args.episode_length,
-            num_runs=args.num_trajectories,
-            deterministic=args.deterministic,
-            policy_refresh_interval=args.policy_refresh_interval,
-            disable_boundary_collision=args.disable_boundary_collision,
+        num_runs=args.num_trajectories,
+        deterministic=args.deterministic,
+        policy_refresh_interval=args.policy_refresh_interval,
+        disable_boundary_collision=args.disable_boundary_collision,
         separation_radius=args.separation_radius,
         min_collision_distance=min_r,
     )
     qj = conformal_qj(cal_logs, alpha, args.episode_length)
-    # Don't actually update r_mismatch or the filter.
+    # Don't actually update r or the filter
 
     solo_rnn_states = torch.zeros((args.num_agents, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
     logs = run_joint_agents(
@@ -401,27 +428,33 @@ def main() -> None:
         filter_fn,
         num_agents=args.num_agents,
         max_steps=args.episode_length,
-            num_runs=args.num_eval_trajs,
-            deterministic=args.deterministic,
-            policy_refresh_interval=args.policy_refresh_interval,
-            disable_boundary_collision=args.disable_boundary_collision,
+        num_runs=args.num_eval_trajs,
+        deterministic=args.deterministic,
+        policy_refresh_interval=args.policy_refresh_interval,
+        disable_boundary_collision=args.disable_boundary_collision,
         separation_radius=args.separation_radius,
         min_collision_distance=min_r,
         return_first_run_trajectory=True,
     )
-
     cumulative_reward_per_run = []
     crash_indicator_per_run = []
     max_mismatch_per_run = []
     h_violation_per_run = []
     h_min_per_run = []
+    pairwise_min_dist_per_run = []
+    quad_crash_flags = []
     for run_id in range(args.num_eval_trajs):
         run = logs[run_id]
         cumulative_reward_per_run.append(float(run["cumulative_reward"]))
         crash_indicator_per_run.append(float(run["crash_indicator"]))
+        quad_crash_flags.append(float(run["quad_crash_flag"]))
         max_mismatch_per_run.append(float(run["model_mismatch_state"]))
         h_violation_per_run.append(float(run["h_violation"]))
         h_min_per_run.append(float(run["h_min"]))
+        pairwise_min_dist_per_run.append(float(run["pairwise_min_dist"]))
+
+    episode_min_pair_dist = float(np.min(np.asarray(pairwise_min_dist_per_run, dtype=np.float32)))
+    episode_quad_crashes = int(np.sum(np.asarray(quad_crash_flags, dtype=np.float32)))
 
     cumulative_reward_per_episode.append(float(np.mean(cumulative_reward_per_run)))
     cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
@@ -440,13 +473,15 @@ def main() -> None:
     print(
         f"Cum rew: {cumulative_reward_per_episode[-1]} "
         f"Crash rate: {crashes_per_episode[-1]} "
-        f"Max state mismatch: {mismatch_per_episode[-1]}"
+        f"Max state mismatch: {mismatch_per_episode[-1]} "
+        f"Episode min pairwise dist: {episode_min_pair_dist} "
+        f"Quad-crash runs: {episode_quad_crashes}/{args.num_eval_trajs}"
     )
 
     metrics_path = os.path.join(experiment_dir, "conformal_joint_metrics.npz")
     np.savez(
         metrics_path,
-        episodes=np.arange(1),
+        episodes=np.array([0]),
         qj_per_episode=np.asarray(qj_per_episode, dtype=np.float32),
         r_mismatch_per_episode=np.asarray(r_mismatch_per_episode, dtype=np.float32),
         crashes_per_episode=np.asarray(crashes_per_episode, dtype=np.float32),
