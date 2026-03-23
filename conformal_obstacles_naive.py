@@ -34,6 +34,7 @@ from project_utils.utils import OBS_KEY, load_actor, load_cfg, latest_checkpoint
 
 DEVICE = torch.device("cpu")
 MAX_R = 8.0
+COLLISION_FAR_DISTANCE = 10000.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial_r", type=float, default=2.0, help="Initial conformal mismatch bound r.")
     parser.add_argument("--obstacle_radius_margin", type=float, default=0.05, help="Extra radius added to each obstacle for CBF constraints.")
     parser.add_argument("--gamma", type=float, default=0.8, help="CBF gamma in (0, 1].")
+    parser.add_argument("--disable_boundary_collision", action="store_true", help="Move room boundaries far enough to effectively disable wall/ceiling/floor collisions.")
     return parser.parse_args()
 
 
@@ -115,6 +117,18 @@ def _print_initial_environment_geometry(env, obstacle_radius_margin: float) -> N
             f"  obstacle[{idx}]: position={np.asarray(center, dtype=np.float64).tolist()}, "
             f"radius={base_radius:.6f} (quad_radius={quad_radius:.6f}, cbf_radius={cbf_radius:.6f})"
         )
+
+
+def _configure_far_boundary_geometry(env_unwrapped, far_distance: float = COLLISION_FAR_DISTANCE) -> None:
+    far_distance = float(far_distance)
+    if far_distance <= 0.0:
+        raise ValueError("--disable_boundary_collision requires a positive far distance")
+    far_box = np.array([[-far_distance, -far_distance, -far_distance], [far_distance, far_distance, far_distance]])
+    env_unwrapped.room_box = far_box.copy()
+    for quad in env_unwrapped.envs:
+        quad.room_box = far_box.copy()
+        quad.dynamics.room_box = far_box.copy()
+        quad.dynamics.floor_threshold = -far_distance
 
 
 def make_obstacle_cbf_filter(r_mismatch: float, gamma: float, obstacle_radius_margin: float):
@@ -206,6 +220,8 @@ def run_single_agent(
     max_steps=1500,
     num_runs=1,
     deterministic=False,
+    disable_boundary_collision=False,
+    boundary_far_distance: float = COLLISION_FAR_DISTANCE,
 ):
     """
     Run the environment for max_steps steps and return solo-agent logs.
@@ -228,6 +244,8 @@ def run_single_agent(
             "model_mismatch_state": [],
         }
         env_run = clone_env_from_snapshot(snapshot)
+        if disable_boundary_collision:
+            _configure_far_boundary_geometry(env_run.unwrapped, boundary_far_distance)
         obs_run = np.array(obs, copy=True, dtype=np.float32)
         done = False
         step_num = 0
@@ -356,6 +374,8 @@ def main() -> None:
     render_mode = "rgb_array"
 
     env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=render_mode)
+    if args.disable_boundary_collision:
+        _configure_far_boundary_geometry(env.unwrapped)
     solo_ckpt = latest_checkpoint(args.solo_train_dir, args.solo_experiment, policy_index=0)
     # Match conformal.py behavior: load actor with its original training observation space,
     # then slice runtime observations to that dimension.
@@ -410,6 +430,7 @@ def main() -> None:
             max_steps=args.episode_length,
             num_runs=args.num_trajectories,
             deterministic=args.deterministic,
+            disable_boundary_collision=args.disable_boundary_collision,
         )
         qj = conformal_qj(cal_logs, alpha, args.episode_length)
         new_r = float(np.clip(qj, 0.0, MAX_R))
@@ -433,6 +454,7 @@ def main() -> None:
             max_steps=args.episode_length,
             num_runs=args.num_eval_trajs,
             deterministic=args.deterministic,
+            disable_boundary_collision=args.disable_boundary_collision,
         )
         temp_env.close()
 
