@@ -275,8 +275,7 @@ def run_joint_agents(
 
         if nonswap_steps > 0:
             cumulative_reward = cumulative_reward / nonswap_steps * max(1, step_num - 1)
-        if h_min == float("inf"):
-            h_min = 0.0
+        has_rollout_data = step_num > 0
 
         run_logs = {
             "model_mismatch_state": np.float64(run_max_mismatch),
@@ -284,7 +283,7 @@ def run_joint_agents(
             "crash_indicator": int(crash_indicator),
             "quad_crash_flag": int(crash_indicator),
             "pairwise_min_dist": float(pairwise_min_dist),
-            "h_violation": 1.0 if h_min <= 0.0 else 0.0,
+            "h_violation": 1.0 if has_rollout_data and h_min <= 0.0 else 0.0,
             "h_min": float(h_min),
         }
         if return_trajectory:
@@ -461,6 +460,7 @@ def main() -> None:
 
         episode_min_pair_dist = float(np.min(np.asarray(pairwise_min_dist_per_run, dtype=np.float32)))
         episode_quad_crashes = int(np.sum(np.asarray(quad_crash_flags, dtype=np.float32)))
+        episode_h_violations = int(np.sum(np.asarray(h_violation_per_run, dtype=np.float32)))
 
         cumulative_reward_per_episode.append(float(np.mean(cumulative_reward_per_run)))
         cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
@@ -477,11 +477,10 @@ def main() -> None:
         r_mismatch_per_episode.append(float(r_mismatch))
         agent_locs_per_episode.append(logs[0]["positions"])
         print(
-            f"Cum rew: {cumulative_reward_per_episode[-1]} "
             f"Crash rate: {crashes_per_episode[-1]} "
-            f"Max state mismatch: {mismatch_per_episode[-1]} "
             f"Episode min pairwise dist: {episode_min_pair_dist} "
-            f"Quad-crash runs: {episode_quad_crashes}/{args.num_eval_trajs}"
+            f"Quad-crash runs: {episode_quad_crashes}/{args.num_eval_trajs} "
+            f"H-violation runs: {episode_h_violations}/{args.num_eval_trajs}"
         )
 
     metrics_path = os.path.join(experiment_dir, "conformal_joint_metrics.npz")

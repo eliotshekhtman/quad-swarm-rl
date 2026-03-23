@@ -108,11 +108,14 @@ def _build_joint_cbf_affine_terms(
 
         h_value = float(np.linalg.norm(rel_pos) - sep)
         a_const = rel_pos + 2.0 * dt * rel_vel
-        row = (dt * dt) * (grad @ (acc_scale_i - acc_scale_j))
+        # Keep separate per-agent blocks so the cached affine form matches
+        # the original full CBF linearization exactly.
+        row_i = (dt * dt) * (grad @ acc_scale_i)
+        row_j = -(dt * dt) * (grad @ acc_scale_j)
 
         const_term = float(grad @ a_const + z_ref_norm - grad @ z_ref - sep - (1.0 - gamma) * h_value)
-        A[row_idx, 4 * i: 4 * (i + 1)] = row
-        A[row_idx, 4 * j: 4 * (j + 1)] = -row
+        A[row_idx, 4 * i: 4 * (i + 1)] = row_i
+        A[row_idx, 4 * j: 4 * (j + 1)] = row_j
         rhs[row_idx] = float(r - const_term)
 
     return A, rhs

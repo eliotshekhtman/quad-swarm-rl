@@ -39,7 +39,7 @@ def conformal_radii(logs, num_multi_agents, pred_trajectories, alpha, episode_le
         scores.sort()
         # Just want to visually check that this makes sense
         # print(f'Scores for agent {agent_id}: ', scores)
-        conformal_radius = scores[int(np.ceil(len(scores) * (1 - alpha)) - 1)]
+        conformal_radius = scores[int(np.ceil(len(scores + 1) * (1 - alpha)) - 1)]
         radii[agent_id] = conformal_radius
     return radii
 

@@ -275,8 +275,7 @@ def run_joint_agents(
 
         if nonswap_steps > 0:
             cumulative_reward = cumulative_reward / nonswap_steps * max(1, step_num - 1)
-        if h_min == float("inf"):
-            h_min = 0.0
+        has_rollout_data = step_num > 0
 
         run_logs = {
             "model_mismatch_state": np.float64(run_max_mismatch),
@@ -284,7 +283,7 @@ def run_joint_agents(
             "crash_indicator": int(crash_indicator),
             "quad_crash_flag": int(crash_indicator),
             "pairwise_min_dist": float(pairwise_min_dist),
-            "h_violation": 1.0 if h_min <= 0.0 else 0.0,
+            "h_violation": 1.0 if has_rollout_data and h_min <= 0.0 else 0.0,
             "h_min": float(h_min),
         }
         if return_trajectory:
