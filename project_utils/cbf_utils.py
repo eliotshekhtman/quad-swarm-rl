@@ -14,6 +14,11 @@ CBF_K1 = 1
 CBF_K0 = 1
 CBF_SLACK_WEIGHT = 1.0e4
 EPSILON = 1e-3
+CBF_4STEP_SAMPLED_COARSE_COUNT = 100
+CBF_4STEP_SAMPLED_TOPK = 10
+CBF_4STEP_SAMPLED_REFINEMENT_COUNT = 20
+CBF_4STEP_SAMPLED_REFINEMENT_RADII = (0.10, 0.02)
+CBF_4STEP_SAMPLED_IMPROVEMENT_TOL = 1.0e-9
 
 GRAVITY_VECTOR = np.array([0.0, 0.0, -9.81], dtype=np.float64)
 
@@ -97,7 +102,7 @@ def _thrust_to_normalized(thrusts: np.ndarray, dynamics) -> np.ndarray:
     return norm_cmds
 
 def cbf_dynamics(norm_cmds, dynamics, dt, steps=2):
-    dt = dt / steps
+    dt = dt / 2.0 # control_dt is 2*dt since there are 2 env steps every control step
     thrusts, torques = _normalized_to_thrust(norm_cmds, dynamics)
     rot = dynamics.rot 
     omega = dynamics.omega 
@@ -138,7 +143,7 @@ def cbf_dynamics(norm_cmds, dynamics, dt, steps=2):
     return pos, vel, rot, omega # What I'm determining to be the state
 
 def real_dynamics(norm_cmds, dynamics, dt, steps=2):
-    dt = dt / steps
+    dt = dt / 2.0 # control_dt is 2*dt since there are 2 env steps every control step
     norm_cmds = np.asarray(norm_cmds, dtype=np.float64)
 
     if steps == 1:
@@ -257,6 +262,155 @@ def _cbf_h_values(
     return h_value, h_next
 
 
+def _current_h_value(obs_pos: np.ndarray, radius: float, dynamics) -> float:
+    pos = np.asarray(dynamics.pos, dtype=np.float64)
+    obs_pos = np.asarray(obs_pos, dtype=np.float64)
+    return float(np.linalg.norm(pos[:2] - obs_pos[:2]) - radius)
+
+
+def _4step_h_values(
+    norm_cmds: np.ndarray,
+    obs_pos: np.ndarray,
+    radius: float,
+    dynamics,
+    dt: float,
+) -> Tuple[float, float]:
+    norm_cmds = np.clip(np.asarray(norm_cmds, dtype=np.float64), 0.0, 1.0)
+    obs_pos = np.asarray(obs_pos, dtype=np.float64)
+    h_value = _current_h_value(obs_pos, radius, dynamics)
+    next_pos, _, _, _ = cbf_dynamics(norm_cmds, dynamics, dt, steps=4)
+    h_next = float(np.linalg.norm(np.asarray(next_pos, dtype=np.float64)[:2] - obs_pos[:2]) - radius)
+    return h_value, h_next
+
+
+def _shared_slack_for_cmd(
+    norm_cmds: np.ndarray,
+    obstacles,
+    r: float,
+    gamma: float,
+    dynamics,
+    dt: float,
+) -> float:
+    if len(obstacles) == 0:
+        return 0.0
+
+    shared_slack = 0.0
+    for obs in obstacles:
+        obs_pos = np.asarray(obs["position"], dtype=np.float64)
+        radius = float(obs["radius"])
+        h_value, h_next = _4step_h_values(norm_cmds, obs_pos, radius, dynamics, dt)
+        needed_slack = float(r) - (h_next - (1.0 - float(gamma)) * h_value)
+        if needed_slack > shared_slack:
+            shared_slack = needed_slack
+    return max(shared_slack, 0.0)
+
+
+def _evaluate_cmd(
+    base_action: np.ndarray,
+    norm_cmds: np.ndarray,
+    obstacles,
+    r: float,
+    gamma: float,
+    dynamics,
+    dt: float,
+) -> float:
+    base_action = np.asarray(base_action, dtype=np.float64)
+    norm_cmds = np.clip(np.asarray(norm_cmds, dtype=np.float64), 0.0, 1.0)
+
+    base_norm_cmds = np.clip(0.5 * (base_action + 1.0), 0.0, 1.0)
+    u_ref_thrust, _ = _normalized_to_thrust(base_norm_cmds, dynamics)
+    u_candidate_thrust, _ = _normalized_to_thrust(norm_cmds, dynamics)
+    slack = _shared_slack_for_cmd(norm_cmds, obstacles, r, gamma, dynamics, dt)
+    return float(np.sum((u_candidate_thrust - u_ref_thrust) ** 2) + CBF_SLACK_WEIGHT * (slack ** 2))
+
+
+def _sample_uniform_norm_cmds(count: int) -> np.ndarray:
+    return np.random.uniform(low=0.0, high=1.0, size=(int(count), 4)).astype(np.float64)
+
+
+def _sample_norm_cmd_ball(centers: np.ndarray, count_per_center: int, radius: float) -> np.ndarray:
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 4)
+    radius = float(radius)
+    sampled = []
+    for center in centers:
+        sampled.append(center[None, :].copy())
+        if count_per_center <= 0 or radius <= 0.0:
+            continue
+        directions = np.random.normal(size=(int(count_per_center), 4))
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        directions = directions / norms
+        scales = np.random.uniform(low=0.0, high=1.0, size=(int(count_per_center), 1)) ** 0.25
+        local = center[None, :] + radius * scales * directions
+        sampled.append(np.clip(local, 0.0, 1.0))
+    return np.vstack(sampled)
+
+
+def _select_topk_by_objective(candidates: np.ndarray, objectives: np.ndarray, topk: int) -> Tuple[np.ndarray, np.ndarray]:
+    candidates = np.asarray(candidates, dtype=np.float64).reshape(-1, 4)
+    objectives = np.asarray(objectives, dtype=np.float64).reshape(-1)
+    k = min(int(topk), objectives.shape[0])
+    order = np.argsort(objectives)[:k]
+    return candidates[order], objectives[order]
+
+
+def _solve_cbf_sampled(
+    base_action: np.ndarray,
+    cbf_action: np.ndarray,
+    dynamics,
+    gamma: float,
+    r: float,
+    dt: float,
+    obstacles,
+) -> np.ndarray:
+    base_action = np.asarray(base_action, dtype=np.float64)
+    cbf_action = np.asarray(cbf_action, dtype=np.float64)
+    base_norm_cmds = np.clip(0.5 * (base_action + 1.0), 0.0, 1.0)
+    cbf_norm_cmds = np.clip(0.5 * (cbf_action + 1.0), 0.0, 1.0)
+
+    if len(obstacles) == 0:
+        return cbf_norm_cmds.copy()
+
+    candidates = np.vstack(
+        [
+            _sample_uniform_norm_cmds(CBF_4STEP_SAMPLED_COARSE_COUNT),
+            base_norm_cmds[None, :],
+            cbf_norm_cmds[None, :],
+        ]
+    )
+    objectives = np.asarray(
+        [_evaluate_cmd(base_action, cmd, obstacles, r, gamma, dynamics, dt) for cmd in candidates],
+        dtype=np.float64,
+    )
+    survivors, survivor_objectives = _select_topk_by_objective(candidates, objectives, CBF_4STEP_SAMPLED_TOPK)
+
+    for radius in CBF_4STEP_SAMPLED_REFINEMENT_RADII:
+        refined_candidates = np.vstack(
+            [
+                _sample_norm_cmd_ball(survivors, CBF_4STEP_SAMPLED_REFINEMENT_COUNT, radius),
+                base_norm_cmds[None, :],
+                cbf_norm_cmds[None, :],
+            ]
+        )
+        refined_objectives = np.asarray(
+            [_evaluate_cmd(base_action, cmd, obstacles, r, gamma, dynamics, dt) for cmd in refined_candidates],
+            dtype=np.float64,
+        )
+        survivors, survivor_objectives = _select_topk_by_objective(
+            refined_candidates,
+            refined_objectives,
+            CBF_4STEP_SAMPLED_TOPK,
+        )
+
+    best_idx = int(np.argmin(survivor_objectives))
+    best_norm_cmds = survivors[best_idx]
+    best_objective = float(survivor_objectives[best_idx])
+    cbf_objective = _evaluate_cmd(base_action, cbf_norm_cmds, obstacles, r, gamma, dynamics, dt)
+    if best_objective < cbf_objective - CBF_4STEP_SAMPLED_IMPROVEMENT_TOL:
+        return best_norm_cmds.copy()
+    return cbf_norm_cmds.copy()
+
+
 def _solve_cbf_qp(
     gamma,
     u_ref_thrust: np.ndarray,
@@ -338,7 +492,8 @@ def apply_cbf_filter(
     obstacles,
     r,
     gamma,
-    debug=False
+    debug=False,
+    use_4step_sampled: bool = False,
 ) -> np.ndarray:
     """
     Wrap the raw solo-policy action with the obstacle-based CBF safety filter.
@@ -375,7 +530,7 @@ def apply_cbf_filter(
             u_ref_thrust=u_ref_thrust,
             state=quad_state,
             obstacles=obstacles,
-            r=r,
+            r=r / 2.0, # Only operating over 1 control step / 2 env steps
             mass=float(dynamics.mass),
             dt=float(env_state.control_dt),
             thrust_bounds=(u_min, u_max),
@@ -385,9 +540,23 @@ def apply_cbf_filter(
     safe_normalized = _thrust_to_normalized(safe_thrust, dynamics)
     safe_action = 2.0 * safe_normalized - 1.0
     clipped_action = np.clip(safe_action.astype(np.float32), -1.0, 1.0)
+
+    if use_4step_sampled and len(obstacles) > 0:
+        refined_normalized = _solve_cbf_sampled(
+            base_action=base_action,
+            cbf_action=clipped_action,
+            dynamics=dynamics,
+            gamma=gamma,
+            r=r,
+            dt=float(env_state.control_dt),
+            obstacles=obstacles,
+        )
+        refined_action = 2.0 * refined_normalized - 1.0
+        return np.clip(refined_action.astype(np.float32), -1.0, 1.0)
+
     return clipped_action
 
-def make_cbf_filter(r: float, gamma: float):
+def make_cbf_filter(r: float, gamma: float, use_4step_sampled: bool = False):
     def filter(base_action: np.ndarray, env_state, quad_state, obstacles, debug=False):
         return apply_cbf_filter(
             base_action=base_action,
@@ -397,5 +566,6 @@ def make_cbf_filter(r: float, gamma: float):
             r=r,
             gamma=gamma,
             debug=debug,
+            use_4step_sampled=use_4step_sampled,
         )
     return filter
