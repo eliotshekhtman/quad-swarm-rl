@@ -141,12 +141,64 @@ def _pad_with_nan(values: np.ndarray, target_len: int) -> np.ndarray:
     return np.concatenate([values, pad], axis=0)
 
 
+def _capture_reference_joint_initialization(env_unwrapped) -> Dict[str, np.ndarray]:
+    scenario = env_unwrapped.scenario
+    positions = []
+    rotations = []
+    goals = []
+    for quad in env_unwrapped.envs:
+        dynamics = quad.dynamics
+        positions.append(np.asarray(dynamics.pos, dtype=np.float64).copy())
+        rotations.append(np.asarray(dynamics.rot, dtype=np.float64).copy())
+        goals.append(np.asarray(quad.goal, dtype=np.float64).copy())
+
+    return {
+        "positions": np.stack(positions, axis=0),
+        "rotations": np.stack(rotations, axis=0),
+        "goals": np.stack(goals, axis=0),
+        "goal_pairs": np.asarray(scenario.goal_pairs, dtype=np.float64).copy(),
+        "active_goal_index": np.asarray(scenario.active_goal_index, dtype=np.int64).copy(),
+    }
+
+
+def _restore_reference_joint_initialization(env_unwrapped, reference_init: Dict[str, np.ndarray]) -> np.ndarray:
+    scenario = env_unwrapped.scenario
+    scenario.goal_pairs = np.asarray(reference_init["goal_pairs"], dtype=np.float64).copy()
+    scenario.active_goal_index = np.asarray(reference_init["active_goal_index"], dtype=np.int64).copy()
+
+    saved_positions = np.asarray(reference_init["positions"], dtype=np.float64)
+    saved_rotations = np.asarray(reference_init["rotations"], dtype=np.float64)
+    saved_goals = np.asarray(reference_init["goals"], dtype=np.float64)
+
+    for agent_id, quad in enumerate(env_unwrapped.envs):
+        dynamics = quad.dynamics
+        vel = np.asarray(dynamics.vel, dtype=np.float64).copy()
+        omega = np.asarray(dynamics.omega, dtype=np.float64).copy()
+        quad.dynamics.set_state(saved_positions[agent_id], vel, saved_rotations[agent_id], omega)
+        quad.dynamics.reset()
+        quad.dynamics.on_floor = False
+        quad.dynamics.crashed_floor = quad.dynamics.crashed_wall = quad.dynamics.crashed_ceiling = False
+        quad.tick = 0
+        quad.actions = [np.zeros(4, dtype=np.float64), np.zeros(4, dtype=np.float64)]
+        quad.goal = saved_goals[agent_id].copy()
+        env_unwrapped.pos[agent_id, :] = quad.dynamics.pos
+        env_unwrapped.vel[agent_id, :] = quad.dynamics.vel
+
+    scenario.goals = saved_goals.copy()
+
+    obs = [quad.state_vector(quad) for quad in env_unwrapped.envs]
+    if env_unwrapped.num_use_neighbor_obs > 0:
+        obs = env_unwrapped.add_neighborhood_obs(obs)
+    return np.asarray(obs, dtype=np.float32)
+
+
 def _run_joint_trajectory(
     env,
     solo_actor,
     init_rnn_states: torch.Tensor,
     solo_obs_dim: int,
     joint_action_fn,
+    reference_init: Dict[str, np.ndarray],
     num_agents: int,
     max_steps: int,
     deterministic: bool,
@@ -155,8 +207,8 @@ def _run_joint_trajectory(
     if disable_boundary_collision:
         _configure_far_boundary_geometry(env.unwrapped)
 
-    reset_out = env.reset()
-    obs_run = np.array(reset_out[0] if isinstance(reset_out, tuple) else reset_out, dtype=np.float32)
+    env.reset()
+    obs_run = _restore_reference_joint_initialization(env.unwrapped, reference_init)
     done = False
     step_num = 0
     run_rnn_states = init_rnn_states.clone()
@@ -298,6 +350,11 @@ def main() -> None:
     filter_fn = make_joint_cbf_filter(args.r_mismatch, separation_radius, gamma)
     init_rnn_states = torch.zeros((num_agents, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
 
+    if disable_boundary_collision:
+        _configure_far_boundary_geometry(env.unwrapped)
+    env.reset()
+    reference_init = _capture_reference_joint_initialization(env.unwrapped)
+
     run_logs = []
     for _ in tqdm(range(args.num_trajectories), desc="Collecting trajectories", unit="traj"):
         run_logs.append(
@@ -307,6 +364,7 @@ def main() -> None:
                 init_rnn_states=init_rnn_states,
                 solo_obs_dim=solo_obs_dim,
                 joint_action_fn=filter_fn,
+                reference_init=reference_init,
                 num_agents=num_agents,
                 max_steps=episode_length,
                 deterministic=deterministic,
