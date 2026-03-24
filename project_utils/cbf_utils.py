@@ -14,10 +14,10 @@ CBF_K1 = 1
 CBF_K0 = 1
 CBF_SLACK_WEIGHT = 1.0e4
 EPSILON = 1e-3
-CBF_4STEP_SAMPLED_COARSE_COUNT = 100
-CBF_4STEP_SAMPLED_TOPK = 10
-CBF_4STEP_SAMPLED_REFINEMENT_COUNT = 20
-CBF_4STEP_SAMPLED_REFINEMENT_RADII = (0.10, 0.02)
+CBF_4STEP_SAMPLED_COARSE_COUNT = 500
+CBF_4STEP_SAMPLED_TOPK = 5
+CBF_4STEP_SAMPLED_REFINEMENT_COUNT = 10
+CBF_4STEP_SAMPLED_REFINEMENT_RADII = (0.05, 0.01)
 CBF_4STEP_SAMPLED_IMPROVEMENT_TOL = 1.0e-9
 
 GRAVITY_VECTOR = np.array([0.0, 0.0, -9.81], dtype=np.float64)
@@ -224,6 +224,15 @@ class CBFObstacle:
     radius: float
     velocity: np.ndarray
 
+
+@dataclass
+class SampledCBFContext:
+    base_norm_cmds: np.ndarray
+    base_thrust: np.ndarray
+    obstacle_xy: np.ndarray
+    obstacle_radii: np.ndarray
+    h_now: np.ndarray
+
 def _cbf_h_values(
     pos: np.ndarray,
     vel: np.ndarray,
@@ -268,60 +277,84 @@ def _current_h_value(obs_pos: np.ndarray, radius: float, dynamics) -> float:
     return float(np.linalg.norm(pos[:2] - obs_pos[:2]) - radius)
 
 
-def _4step_h_values(
-    norm_cmds: np.ndarray,
-    obs_pos: np.ndarray,
-    radius: float,
-    dynamics,
-    dt: float,
-) -> Tuple[float, float]:
-    norm_cmds = np.clip(np.asarray(norm_cmds, dtype=np.float64), 0.0, 1.0)
-    obs_pos = np.asarray(obs_pos, dtype=np.float64)
-    h_value = _current_h_value(obs_pos, radius, dynamics)
-    next_pos, _, _, _ = cbf_dynamics(norm_cmds, dynamics, dt, steps=4)
-    h_next = float(np.linalg.norm(np.asarray(next_pos, dtype=np.float64)[:2] - obs_pos[:2]) - radius)
-    return h_value, h_next
-
-
-def _shared_slack_for_cmd(
-    norm_cmds: np.ndarray,
+def _prepare_sampled_cbf_context(
+    base_action: np.ndarray,
     obstacles,
+    dynamics,
+) -> SampledCBFContext:
+    base_action = np.asarray(base_action, dtype=np.float64)
+    base_norm_cmds = np.clip(0.5 * (base_action + 1.0), 0.0, 1.0)
+    base_thrust, _ = _normalized_to_thrust(base_norm_cmds, dynamics)
+
+    if len(obstacles) == 0:
+        return SampledCBFContext(
+            base_norm_cmds=base_norm_cmds,
+            base_thrust=np.asarray(base_thrust, dtype=np.float64),
+            obstacle_xy=np.zeros((0, 2), dtype=np.float64),
+            obstacle_radii=np.zeros((0,), dtype=np.float64),
+            h_now=np.zeros((0,), dtype=np.float64),
+        )
+
+    pos_xy = np.asarray(dynamics.pos, dtype=np.float64)[:2]
+    obstacle_xy = np.asarray(
+        [np.asarray(obs["position"], dtype=np.float64)[:2] for obs in obstacles],
+        dtype=np.float64,
+    ).reshape(-1, 2)
+    obstacle_radii = np.asarray([float(obs["radius"]) for obs in obstacles], dtype=np.float64)
+    h_now = np.linalg.norm(obstacle_xy - pos_xy[None, :], axis=1) - obstacle_radii
+
+    return SampledCBFContext(
+        base_norm_cmds=base_norm_cmds,
+        base_thrust=np.asarray(base_thrust, dtype=np.float64),
+        obstacle_xy=obstacle_xy,
+        obstacle_radii=obstacle_radii,
+        h_now=h_now,
+    )
+
+
+def _4step_next_pos(norm_cmds: np.ndarray, dynamics, dt: float) -> np.ndarray:
+    norm_cmds = np.clip(np.asarray(norm_cmds, dtype=np.float64), 0.0, 1.0)
+    next_pos, _, _, _ = cbf_dynamics(norm_cmds, dynamics, dt, steps=4)
+    return np.asarray(next_pos, dtype=np.float64)
+
+
+def _shared_slack_from_next_pos(
+    next_pos: np.ndarray,
+    obstacle_xy: np.ndarray,
+    obstacle_radii: np.ndarray,
+    h_now: np.ndarray,
     r: float,
     gamma: float,
-    dynamics,
-    dt: float,
 ) -> float:
-    if len(obstacles) == 0:
+    if obstacle_xy.shape[0] == 0:
         return 0.0
 
-    shared_slack = 0.0
-    for obs in obstacles:
-        obs_pos = np.asarray(obs["position"], dtype=np.float64)
-        radius = float(obs["radius"])
-        h_value, h_next = _4step_h_values(norm_cmds, obs_pos, radius, dynamics, dt)
-        needed_slack = float(r) - (h_next - (1.0 - float(gamma)) * h_value)
-        if needed_slack > shared_slack:
-            shared_slack = needed_slack
-    return max(shared_slack, 0.0)
+    next_pos_xy = np.asarray(next_pos, dtype=np.float64)[:2]
+    h_next = np.linalg.norm(obstacle_xy - next_pos_xy[None, :], axis=1) - obstacle_radii
+    needed_slack = float(r) - (h_next - (1.0 - float(gamma)) * h_now)
+    return float(max(0.0, np.max(needed_slack)))
 
 
 def _evaluate_cmd(
-    base_action: np.ndarray,
     norm_cmds: np.ndarray,
-    obstacles,
-    r: float,
-    gamma: float,
+    context: SampledCBFContext,
     dynamics,
     dt: float,
+    r: float,
+    gamma: float,
 ) -> float:
-    base_action = np.asarray(base_action, dtype=np.float64)
     norm_cmds = np.clip(np.asarray(norm_cmds, dtype=np.float64), 0.0, 1.0)
-
-    base_norm_cmds = np.clip(0.5 * (base_action + 1.0), 0.0, 1.0)
-    u_ref_thrust, _ = _normalized_to_thrust(base_norm_cmds, dynamics)
     u_candidate_thrust, _ = _normalized_to_thrust(norm_cmds, dynamics)
-    slack = _shared_slack_for_cmd(norm_cmds, obstacles, r, gamma, dynamics, dt)
-    return float(np.sum((u_candidate_thrust - u_ref_thrust) ** 2) + CBF_SLACK_WEIGHT * (slack ** 2))
+    next_pos = _4step_next_pos(norm_cmds, dynamics, dt)
+    slack = _shared_slack_from_next_pos(
+        next_pos=next_pos,
+        obstacle_xy=context.obstacle_xy,
+        obstacle_radii=context.obstacle_radii,
+        h_now=context.h_now,
+        r=r,
+        gamma=gamma,
+    )
+    return float(np.sum((u_candidate_thrust - context.base_thrust) ** 2) + CBF_SLACK_WEIGHT * (slack ** 2))
 
 
 def _sample_uniform_norm_cmds(count: int) -> np.ndarray:
@@ -365,7 +398,8 @@ def _solve_cbf_sampled(
 ) -> np.ndarray:
     base_action = np.asarray(base_action, dtype=np.float64)
     cbf_action = np.asarray(cbf_action, dtype=np.float64)
-    base_norm_cmds = np.clip(0.5 * (base_action + 1.0), 0.0, 1.0)
+    context = _prepare_sampled_cbf_context(base_action, obstacles, dynamics)
+    base_norm_cmds = context.base_norm_cmds
     cbf_norm_cmds = np.clip(0.5 * (cbf_action + 1.0), 0.0, 1.0)
 
     if len(obstacles) == 0:
@@ -379,10 +413,11 @@ def _solve_cbf_sampled(
         ]
     )
     objectives = np.asarray(
-        [_evaluate_cmd(base_action, cmd, obstacles, r, gamma, dynamics, dt) for cmd in candidates],
+        [_evaluate_cmd(cmd, context, dynamics, dt, r, gamma) for cmd in candidates],
         dtype=np.float64,
     )
     survivors, survivor_objectives = _select_topk_by_objective(candidates, objectives, CBF_4STEP_SAMPLED_TOPK)
+    cbf_objective = _evaluate_cmd(cbf_norm_cmds, context, dynamics, dt, r, gamma)
 
     for radius in CBF_4STEP_SAMPLED_REFINEMENT_RADII:
         refined_candidates = np.vstack(
@@ -393,7 +428,7 @@ def _solve_cbf_sampled(
             ]
         )
         refined_objectives = np.asarray(
-            [_evaluate_cmd(base_action, cmd, obstacles, r, gamma, dynamics, dt) for cmd in refined_candidates],
+            [_evaluate_cmd(cmd, context, dynamics, dt, r, gamma) for cmd in refined_candidates],
             dtype=np.float64,
         )
         survivors, survivor_objectives = _select_topk_by_objective(
@@ -405,7 +440,6 @@ def _solve_cbf_sampled(
     best_idx = int(np.argmin(survivor_objectives))
     best_norm_cmds = survivors[best_idx]
     best_objective = float(survivor_objectives[best_idx])
-    cbf_objective = _evaluate_cmd(base_action, cbf_norm_cmds, obstacles, r, gamma, dynamics, dt)
     if best_objective < cbf_objective - CBF_4STEP_SAMPLED_IMPROVEMENT_TOL:
         return best_norm_cmds.copy()
     return cbf_norm_cmds.copy()
@@ -513,6 +547,9 @@ def apply_cbf_filter(
     gamma :
         CBF contraction factor in (0, 1].
     """
+    if use_4step_sampled:
+        r = r / 2.0
+
     quad = env_state.envs[-1]
     dynamics = quad.dynamics
 
@@ -530,7 +567,7 @@ def apply_cbf_filter(
             u_ref_thrust=u_ref_thrust,
             state=quad_state,
             obstacles=obstacles,
-            r=r / 2.0, # Only operating over 1 control step / 2 env steps
+            r=r, # Only operating over 1 control step / 2 env steps
             mass=float(dynamics.mass),
             dt=float(env_state.control_dt),
             thrust_bounds=(u_min, u_max),
@@ -547,7 +584,7 @@ def apply_cbf_filter(
             cbf_action=clipped_action,
             dynamics=dynamics,
             gamma=gamma,
-            r=r,
+            r=r * 2,
             dt=float(env_state.control_dt),
             obstacles=obstacles,
         )
