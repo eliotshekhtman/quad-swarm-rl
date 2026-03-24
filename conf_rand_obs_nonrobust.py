@@ -49,7 +49,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode_length", type=int, default=1500)
     parser.add_argument("--num_trajectories", type=int, default=200)
     parser.add_argument("--num_eval_trajs", type=int, default=100)
-    parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--deterministic", action="store_true")
 
     parser.add_argument("--quads_mode", default="o_static_same_goal", choices=["o_static_same_goal", "o_random", "o_dynamic_same_goal"])
@@ -461,7 +460,7 @@ def main() -> None:
     metrics_path = os.path.join(experiment_dir, "conformal_obstacles_metrics.npz")
     np.savez(
         metrics_path,
-        episodes=np.arange(args.num_episodes),
+        episodes=np.arange(1),
         qj_per_episode=np.asarray(qj_per_episode, dtype=np.float32),
         r_mismatch_per_episode=np.asarray(r_mismatch_per_episode, dtype=np.float32),
         crashes_per_episode=np.asarray(crashes_per_episode, dtype=np.float32),
