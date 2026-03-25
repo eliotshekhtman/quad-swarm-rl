@@ -74,6 +74,20 @@ def ensure_len(name: str, arr: np.ndarray, expected: int) -> None:
         raise ValueError(f"{name} has length {np.asarray(arr).shape[0]}, expected {expected}.")
 
 
+def compute_tube_coverage(mismatch_runs: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+    mismatch_runs = np.asarray(mismatch_runs)
+    thresholds = np.asarray(thresholds)
+    if mismatch_runs.ndim != 2:
+        raise ValueError(f"Expected mismatch_runs to have shape (num_episodes, num_runs), got {mismatch_runs.shape}.")
+    if thresholds.ndim != 1:
+        raise ValueError(f"Expected thresholds to have shape (num_episodes,), got {thresholds.shape}.")
+    if mismatch_runs.shape[0] != thresholds.shape[0]:
+        raise ValueError(
+            f"Mismatch run episode count {mismatch_runs.shape[0]} does not match threshold count {thresholds.shape[0]}."
+        )
+    return np.mean(mismatch_runs <= thresholds[:, None], axis=1)
+
+
 def validate_episode_grids(robust: Dict[str, np.ndarray], naive: Dict[str, np.ndarray], nonrobust: Dict[str, np.ndarray]) -> None:
     robust_eps = np.asarray(robust["episodes"])
     naive_eps = np.asarray(naive["episodes"])
@@ -139,6 +153,9 @@ def main() -> None:
     nonrobust_h_violation = pad_repeat(nonrobust["h_violation"], num_episodes)
     nonrobust_h_violation_runs = pad_repeat(nonrobust["h_violation_runs"], num_episodes)
     nonrobust_reward_runs = pad_repeat(nonrobust["cumulative_reward_runs"], num_episodes)
+    robust_coverage = compute_tube_coverage(robust["mismatch_runs"], robust["radius"])
+    naive_coverage = compute_tube_coverage(naive["mismatch_runs"], naive["radius"])
+    nonrobust_coverage = pad_repeat(compute_tube_coverage(nonrobust["mismatch_runs"], nonrobust["radius"]), num_episodes)
 
     robust_radius = prepare_radius(robust["radius"], ROBUST_INITIAL_RADIUS)
     naive_radius = prepare_radius(naive["radius"], NAIVE_INITIAL_RADIUS)
@@ -171,6 +188,8 @@ def main() -> None:
     cal_once_mismatch = np.repeat(naive["mismatch"][0], x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
     cal_once_mismatch_err_low = np.repeat(np.maximum(naive["mismatch"][0] - naive_mismatch_q10[0], 0.0), x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
     cal_once_mismatch_err_high = np.repeat(np.maximum(naive_mismatch_q90[0] - naive["mismatch"][0], 0.0), x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
+    cal_once_coverage_value = float(np.mean(np.asarray(naive["mismatch_runs"])[0] <= float(np.asarray(naive["radius"])[0])))
+    cal_once_coverage = np.repeat(cal_once_coverage_value, x_other.shape[0]) if x_other.shape[0] > 0 else np.array([])
     x_radius_ticks = np.arange(0, num_episodes, 1)
     x_other_ticks = np.arange(1, num_episodes, 1)
     x_radius_lim = (0, max(num_episodes - 1, 0))
@@ -328,6 +347,25 @@ def main() -> None:
     fig.savefig(path, bbox_inches="tight", format="pdf")
     plt.close(fig)
     plot_paths["mismatch"] = path
+
+    # Tube coverage
+    fig, ax = plt.subplots()
+    ax.axhline(1.0 - target_alpha, linestyle=":", color="gray", label=r"Target $1-\alpha$")
+    ax.plot(x_other, robust_coverage[:-1], label="Robust tube coverage", color="tab:blue", marker="s")
+    ax.plot(x_other, naive_coverage[:-1], label="Naive tube coverage", color="tab:orange", marker="o")
+    ax.plot(x_other, cal_once_coverage, label="Calibrate-once tube coverage", color="tab:green", marker="^")
+    ax.plot(x_other, nonrobust_coverage[:-1], label="Nonrobust tube coverage", color="tab:red", marker="v")
+    ax.set_title("Tube Coverage Across Episodes")
+    ax.set_xlabel("Episode (j)")
+    ax.set_xlim(*x_other_lim)
+    ax.set_xticks(x_other_ticks)
+    ax.set_ylabel(r"Frac. trajectories with max mismatch $\leq r_j$")
+    ax.set_ylim(0.0, 1.0)
+    ax.legend()
+    path = os.path.join(output_dir, "tube_coverage_across_episodes.pdf")
+    fig.savefig(path, bbox_inches="tight", format="pdf")
+    plt.close(fig)
+    plot_paths["tube_coverage"] = path
 
     # Clearance
     fig, ax = plt.subplots()
