@@ -2,10 +2,10 @@
 """
 Conformal-style joint CBF evaluation for multi-agent patrol.
 
-Each agent runs the same solo policy. A joint CBF filter (full_cbf_utils) modifies
+Each agent runs the same solo policy. A joint CBF filter (fast_cbf_utils) modifies
 the stacked actions for all agents simultaneously. The conformal radius is updated
-from trajectory-level mismatch between cbf_dynamics and real_dynamics on the
-concatenated full swarm state.
+from trajectory-level mismatch between the CBF next-state model and the realized
+post-step simulator state on the concatenated full swarm state.
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ from project_utils.fast_cbf_utils import (
     CBF_K1,
     apply_cbf_filter,
     cbf_dynamics,
-    real_dynamics,
 )
 from project_utils.restart_utils import extract_positions_velocities
 from project_utils.utils import OBS_KEY, load_actor, load_cfg, latest_checkpoint
@@ -65,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--separation_radius", type=float, default=0.5, help="Desired pairwise separation distance enforced by CBF.")
     parser.add_argument("--gamma", type=float, default=0.8, help="CBF gamma in (0, 1].")
     parser.add_argument("--disable_boundary_collision", action="store_true", help="Move room boundaries far enough to effectively disable wall/ceiling/floor collisions.")
+    parser.add_argument("--use_downwash", action="store_true", help="Enable simulator downwash in the rollout environment.")
     parser.add_argument("--policy_refresh_interval", type=int, default=1, help="Call the policy every N control steps (N=1 keeps existing behavior).")
     return parser.parse_args()
 
@@ -104,23 +104,32 @@ def _unpack_step_result(step_result):
     return obs, rewards, np.asarray(dones), infos
 
 
-def _joint_state_model_mismatch(actions: np.ndarray, env_unwrapped) -> float:
+def _joint_cbf_predicted_next_state(actions: np.ndarray, env_unwrapped) -> np.ndarray:
     """
-    One-step full-state mismatch on concatenated swarm state:
-    || concat_i x_i^cbf(next) - concat_i x_i^real(next) ||_2
+    Predict the next concatenated swarm state under the simplified CBF model.
     """
-    actions = np.asarray(actions, dtype=np.float64)
+    actions = np.asarray(actions, dtype=np.float64).copy()
+    num_agents = len(env_unwrapped.envs)
+    if actions.shape != (num_agents, 4):
+        raise ValueError(f"actions shape {actions.shape} does not match expected ({num_agents}, 4)")
+
     dt = float(env_unwrapped.control_dt)
-    states_cbf = []
-    states_real = []
+    predicted_states = []
     for agent_id, quad in enumerate(env_unwrapped.envs):
-        dynamics = quad.dynamics
         normalized = np.clip(0.5 * (actions[agent_id] + 1.0), 0.0, 1.0)
-        states_cbf.append(_pack_state_tuple(*cbf_dynamics(normalized, dynamics, dt)))
-        states_real.append(_pack_state_tuple(*real_dynamics(normalized, dynamics, dt)))
-    concat_cbf = np.concatenate(states_cbf, axis=0)
-    concat_real = np.concatenate(states_real, axis=0)
-    return float(np.linalg.norm(concat_cbf - concat_real))
+        predicted_states.append(_pack_state_tuple(*cbf_dynamics(normalized, quad.dynamics, dt)))
+    return np.concatenate(predicted_states, axis=0)
+
+
+def _joint_actual_swarm_state(env_unwrapped) -> np.ndarray:
+    """
+    Read the realized post-step simulator state in the same packed layout used by the CBF prediction.
+    """
+    actual_states = []
+    for quad in env_unwrapped.envs:
+        dynamics = quad.dynamics
+        actual_states.append(_pack_state_tuple(dynamics.pos, dynamics.vel, dynamics.rot, dynamics.omega))
+    return np.concatenate(actual_states, axis=0)
 
 
 def make_joint_cbf_filter(r_mismatch: float, separation_radius: float, gamma: float):
@@ -231,10 +240,12 @@ def run_joint_agents(
             actions = cached_nominal_action
 
             actions = joint_action_fn(base_action=actions, env_state=env)
-            mismatch = _joint_state_model_mismatch(actions, env.unwrapped)
-            run_max_mismatch = max(run_max_mismatch, float(mismatch))
+            predicted_next = _joint_cbf_predicted_next_state(actions, env.unwrapped)
 
             obs_run, rewards, dones, infos = _unpack_step_result(env.step(actions))
+            actual_next = _joint_actual_swarm_state(env.unwrapped)
+            mismatch = float(np.linalg.norm(predicted_next - actual_next))
+            run_max_mismatch = max(run_max_mismatch, mismatch)
             obs_run = np.array(obs_run, dtype=np.float32)
             pos, vel = extract_positions_velocities(env.unwrapped)
             step_h = _pairwise_h_min(pos, sep_radius)
@@ -360,6 +371,7 @@ def main() -> None:
         "--quads_collision_falloff_radius=5.0",
         "--quads_collision_smooth_max_penalty=12.0",
         "--quads_use_numba=False",
+        f"--quads_use_downwash={args.use_downwash}",
         "--max_num_episodes=1",
         "--quads_render=True",
         "--quads_view_mode=topdown",

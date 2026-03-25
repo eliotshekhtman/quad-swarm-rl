@@ -27,7 +27,7 @@ from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
 from project_utils.conformal_utils import explicit_radius_update, get_alpha_bar
-from project_utils.cbf_utils import CBF_K0, CBF_K1, apply_cbf_filter, cbf_dynamics, real_dynamics
+from project_utils.cbf_utils import CBF_K0, CBF_K1, apply_cbf_filter, cbf_dynamics
 from project_utils.restart_utils import extract_positions_velocities, set_global_seed
 from project_utils.utils import OBS_KEY, SwarmState, load_actor, load_cfg, latest_checkpoint
 
@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obstacle_radius_margin", type=float, default=0.05, help="Extra radius added to each obstacle for CBF constraints.")
     parser.add_argument("--disable_boundary_collision", action="store_true", help="Move room boundaries far enough to effectively disable wall/ceiling/floor collisions.")
     parser.add_argument("--environment_geometry", default=None, help="Optional path to authoritative environment JSON with start/goal/obstacle geometry.")
+    parser.add_argument("--use_downwash", action="store_true", help="Enable simulator downwash in the rollout environment.")
     parser.add_argument("--spawn_ball_radius", type=float, default=0.0, help="Radius of the full 3D ball used to resample the initial quad position every trajectory.")
     parser.add_argument("--spawn_ball_max_tries", type=int, default=1000, help="Maximum number of spawn samples to try before failing.")
     parser.add_argument("--action_repeat", type=int, default=1, help="Hold each chosen filtered action for this many environment timesteps before recomputing it.")
@@ -327,20 +328,26 @@ def make_obstacle_cbf_filter(
     return _filter
 
 
-def _state_model_mismatch(
+def _cbf_predicted_next_state(
     action: np.ndarray,
     dynamics,
     dt: float,
     steps: int = 2,
-) -> float:
+) -> np.ndarray:
     """
-    One-step full-state mismatch between cbf_dynamics and real_dynamics.
+    Predict the next state under the simplified CBF dynamics model.
     """
-    action = np.asarray(action, dtype=np.float64)
+    action = np.asarray(action, dtype=np.float64).copy()
     normalized = np.clip(0.5 * (action + 1.0), 0.0, 1.0)
-    state_cbf = _pack_state_tuple(*cbf_dynamics(normalized, dynamics, dt, steps=steps))
-    state_real = _pack_state_tuple(*real_dynamics(normalized, dynamics, dt, steps=steps))
-    return float(np.linalg.norm(state_cbf - state_real)) # TODO: maybe I should be dividing by dt for CT?
+    return _pack_state_tuple(*cbf_dynamics(normalized, dynamics, dt, steps=steps))
+
+
+def _actual_state_from_env(env_unwrapped) -> np.ndarray:
+    """
+    Read the realized post-step simulator state for the single quadrotor.
+    """
+    dynamics = env_unwrapped.envs[0].dynamics
+    return _pack_state_tuple(dynamics.pos, dynamics.vel, dynamics.rot, dynamics.omega)
 
 
 def conformal_qj(logs: List[Dict[str, np.ndarray]], alpha: float, episode_length: int) -> float:
@@ -442,7 +449,7 @@ def run_single_agent(
                 ).copy()
 
             action_solo = np.asarray(held_filtered_action, dtype=np.float64).copy()
-            mismatch_state = _state_model_mismatch(
+            predicted_next = _cbf_predicted_next_state(
                 action_solo,
                 env.unwrapped.envs[0].dynamics,
                 float(env.unwrapped.control_dt),
@@ -451,6 +458,8 @@ def run_single_agent(
 
             actions = action_solo[None, :]
             obs_run, rewards, dones, infos = _step_env(env, actions)
+            actual_next = _actual_state_from_env(env.unwrapped)
+            mismatch_state = float(np.linalg.norm(predicted_next - actual_next))
 
             pos, vel = extract_positions_velocities(env.unwrapped)
             solo_pos = pos[0]
@@ -543,6 +552,7 @@ def main() -> None:
         "--quads_collision_hitbox_radius=2.5",
         "--quads_collision_falloff_radius=5.0",
         "--quads_collision_smooth_max_penalty=12.0",
+        f"--quads_use_downwash={args.use_downwash}",
         "--quads_use_numba=False",
         "--max_num_episodes=1",
         "--quads_render=True",
