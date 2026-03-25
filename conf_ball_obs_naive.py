@@ -631,7 +631,7 @@ def main() -> None:
             action_repeat=args.action_repeat,
         )
         qj = conformal_qj(cal_logs, alpha, args.episode_length)
-        new_r = explicit_radius_update(r_mismatch, qj, args.kappa, 0.0, MAX_R)
+        new_r = np.clip(qj, 0.0, MAX_R)
         print("r_mismatch", r_mismatch, "qj", qj, "new_r_mismatch", new_r)
         r_mismatch = float(new_r)
         filter_fn = make_obstacle_cbf_filter(

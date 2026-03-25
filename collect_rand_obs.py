@@ -21,7 +21,7 @@ from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
 from project_utils.cbf_utils import apply_cbf_filter, cbf_dynamics, real_dynamics
 from project_utils.restart_utils import extract_positions_velocities, set_global_seed
-from project_utils.utils import OBS_KEY, load_actor, load_cfg, latest_checkpoint
+from project_utils.utils import OBS_KEY, SwarmState, load_actor, load_cfg, latest_checkpoint
 
 
 DEVICE = torch.device("cpu")
@@ -69,18 +69,16 @@ def parse_args() -> argparse.Namespace:
         help="If set, initialize each trajectory with a level yaw pointing toward the goal.",
     )
     parser.add_argument(
-        "--disable_4step_sampled",
-        dest="use_4step_sampled",
-        action="store_false",
-        help="Disable the 4-step sampled CBF refinement that is enabled by default.",
-    )
-    parser.add_argument(
         "--action_repeat",
         type=int,
         default=1,
         help="Hold each chosen action fixed for this many environment timesteps before recomputing it.",
     )
-    parser.set_defaults(use_4step_sampled=True)
+    parser.add_argument(
+        "--use_repeated_linearization",
+        action="store_true",
+        help="Run a second ECBF QP solve after re-linearizing h^(4) around the first solution.",
+    )
     return parser.parse_args()
 
 
@@ -136,9 +134,8 @@ def _pack_state_tuple(pos: np.ndarray, vel: np.ndarray, rot: np.ndarray, omega: 
 
 def make_obstacle_cbf_filter(
     r_mismatch: float,
-    gamma: float,
     obstacle_radius_margin: float,
-    use_4step_sampled: bool,
+    use_repeated_linearization: bool,
 ):
     def _filter(base_action: np.ndarray, env_state, _unused_swarm_state=None):
         env_unwrapped = env_state.unwrapped
@@ -149,35 +146,24 @@ def make_obstacle_cbf_filter(
         if obstacle_centers.size == 0:
             return np.asarray(base_action, dtype=np.float32)
 
-        quad = env_unwrapped.envs[0]
-        dynamics = quad.dynamics
-        quad_state = _pack_state_tuple(
-            np.asarray(dynamics.pos, dtype=np.float64),
-            np.asarray(dynamics.vel, dtype=np.float64),
-            np.asarray(dynamics.rot, dtype=np.float64),
-            np.asarray(dynamics.omega, dtype=np.float64),
-        )
         cbf_obstacle_radius = (
             float(env_unwrapped.obstacles.obstacle_radius)
             + float(env_unwrapped.quad_arm)
             + float(obstacle_radius_margin)
         )
-        obstacles = [
-            {
-                "position": np.asarray(center, dtype=np.float64),
-                "velocity": np.zeros(3, dtype=np.float64),
-                "radius": cbf_obstacle_radius,
-            }
-            for center in obstacle_centers
-        ]
+        radii = np.full(obstacle_centers.shape[0], cbf_obstacle_radius, dtype=np.float64)
+        swarm_state = SwarmState(
+            positions=obstacle_centers.copy(),
+            velocities=np.zeros_like(obstacle_centers, dtype=np.float64),
+            rotations=np.tile(np.eye(3, dtype=np.float64), (obstacle_centers.shape[0], 1, 1)),
+        )
         return apply_cbf_filter(
             base_action=base_action,
+            radii=radii,
+            r_mismatch=float(r_mismatch),
             env_state=env_unwrapped,
-            quad_state=quad_state,
-            obstacles=obstacles,
-            r=float(r_mismatch),
-            gamma=float(gamma),
-            use_4step_sampled=use_4step_sampled,
+            swarm_state=swarm_state,
+            use_repeated_linearization=use_repeated_linearization,
         )
 
     return _filter
@@ -425,7 +411,7 @@ def _run_obstacle_trajectory(
 
         obstacle_centers = np.asarray(env.unwrapped.obstacles.pos_arr, dtype=np.float64).reshape(-1, 3)
         obstacle_radius = float(env.unwrapped.obstacles.obstacle_radius)
-        quad_radius = float(env.unwrapped.obstacles.quad_radius)
+        quad_radius = float(env.unwrapped.quad_arm)
         if obstacle_centers.size == 0:
             boundary_dist = float("inf")
             clearance = float("inf")
@@ -491,14 +477,11 @@ def main() -> None:
 
     geometry = _load_environment_geometry(args.conformal_obstacles_environment)
     saved_args = _load_json(args.conf_rand_obs_args)
-    gamma = float(saved_args["gamma"])
     obstacle_radius_margin = float(saved_args["obstacle_radius_margin"])
     episode_length = int(saved_args["episode_length"])
     deterministic = bool(saved_args.get("deterministic", False))
     disable_boundary_collision = bool(saved_args.get("disable_boundary_collision", False))
 
-    if not (0.0 < gamma <= 1.0):
-        raise ValueError("Saved --gamma must satisfy 0 < gamma <= 1.")
     if episode_length <= 0:
         raise ValueError("Saved --episode_length must be positive.")
 
@@ -519,9 +502,8 @@ def main() -> None:
     solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
     filter_fn = make_obstacle_cbf_filter(
         args.r_mismatch,
-        gamma,
         obstacle_radius_margin,
-        use_4step_sampled=bool(args.use_4step_sampled),
+        bool(args.use_repeated_linearization),
     )
 
     trajectories = []
@@ -599,12 +581,10 @@ def main() -> None:
         r_mismatch=float(args.r_mismatch),
         seed=int(args.seed),
         episode_length=episode_length,
-        gamma=gamma,
         deterministic=deterministic,
         disable_boundary_collision=disable_boundary_collision,
         obstacle_radius_margin=obstacle_radius_margin,
         point_towards_goal=bool(args.point_towards_goal),
-        use_4step_sampled=bool(args.use_4step_sampled),
         action_repeat=int(args.action_repeat),
         conformal_obstacles_environment_path=os.path.abspath(args.conformal_obstacles_environment),
         conf_rand_obs_args_path=os.path.abspath(args.conf_rand_obs_args),
@@ -616,7 +596,6 @@ def main() -> None:
     print(f"[collect_rand_obs] Max trajectory length: {max_len}")
     print(f"[collect_rand_obs] Obstacle count: {np.asarray(geometry['obstacle_positions']).shape[0]}")
     print(f"[collect_rand_obs] point_towards_goal={bool(args.point_towards_goal)}")
-    print(f"[collect_rand_obs] use_4step_sampled={bool(args.use_4step_sampled)}")
     print(f"[collect_rand_obs] action_repeat={int(args.action_repeat)}")
 
 
