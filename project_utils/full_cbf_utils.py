@@ -299,12 +299,12 @@ def _solve_cbf_qp(
         raise ValueError(f"Invalid scalar thrust bounds: u_min={u_min} > u_max={u_max}")
 
     constraints: List[cp.Constraint] = []
-    u_var = cp.Variable(expected_dim)
+    u_var = cp.Variable(expected_dim) #
     slack = cp.Variable()
 
     # Pairwise constraints across all agent pairs.
     for i in range(num_agents):
-        for j in range(i + 1, num_agents):
+        for j in range(i + 1, num_agents): # h(zi, zj) = || xi - xj || - radius, Lh = 1
             h_value, h_next = _cbf_h_values(i, j, swarm_state, separation_radius, mass, dt, u_var, u_ref)
             constraints.append(h_next - (1 - gamma) * h_value >= r - slack)
 

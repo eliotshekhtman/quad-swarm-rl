@@ -13,7 +13,6 @@ from project_utils.full_cbf_utils import (
     EPSILON,
     GRAVITY_VECTOR,
     cbf_dynamics,
-    real_dynamics,
     _normalized_to_thrust,
     _thrust_to_normalized,
 )

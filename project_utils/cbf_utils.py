@@ -133,8 +133,10 @@ def cbf_dynamics(norm_cmds, dynamics, dt, steps=2):
         omega_norm = np.linalg.norm(omega_vec)
         if omega_norm != 0:
             # See [7]
+            # u = omega_vec / omega_norm <-- Euler vector, below skew-sym K
             K = np.array([[0, -wz, wy], [wz, 0, -wx], [-wy, wx, 0]]) / omega_norm
             rot_angle = omega_norm * dt
+            # I + sin(theta) @ u + (1 - cos(theta)) * [u]^2 ?
             dRdt = np.eye(3) + np.sin(rot_angle) * K + (1. - np.cos(rot_angle)) * (K @ K)
             rot = dRdt @ rot
         else:
