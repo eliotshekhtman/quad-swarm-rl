@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--conformal_obstacles_environment",
-        required=True,
-        help="Path to geometry JSON containing authoritative start/goal/obstacle data.",
+        default=None,
+        help="Optional path to geometry JSON containing authoritative start/goal/obstacle data.",
     )
     parser.add_argument(
         "--conf_rand_obs_args",
@@ -78,6 +78,18 @@ def parse_args() -> argparse.Namespace:
         "--use_repeated_linearization",
         action="store_true",
         help="Run a second ECBF QP solve after re-linearizing h^(4) around the first solution.",
+    )
+    parser.add_argument(
+        "--spawn_ball_radius",
+        type=float,
+        default=0.0,
+        help="Radius of the full 3D ball used to resample the initial quad position every trajectory.",
+    )
+    parser.add_argument(
+        "--spawn_ball_max_tries",
+        type=int,
+        default=1000,
+        help="Maximum number of spawn samples to try before failing.",
     )
     return parser.parse_args()
 
@@ -111,6 +123,16 @@ def _load_environment_geometry(path: str) -> Dict[str, np.ndarray | float]:
     }
 
 
+def _capture_runtime_geometry(env) -> Dict[str, np.ndarray | float]:
+    env_unwrapped = env.unwrapped
+    return {
+        "start_point": np.asarray(env_unwrapped.envs[0].dynamics.pos, dtype=np.float64).copy(),
+        "goal_point": np.asarray(env_unwrapped.envs[0].goal, dtype=np.float64).copy(),
+        "obstacle_positions": np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64).reshape(-1, 3).copy(),
+        "obstacle_radius": float(env_unwrapped.obstacles.obstacle_radius),
+    }
+
+
 def _configure_far_boundary_geometry(env_unwrapped, far_distance: float = COLLISION_FAR_DISTANCE) -> None:
     far_distance = float(far_distance)
     if far_distance <= 0.0:
@@ -130,6 +152,35 @@ def _configure_far_boundary_geometry(env_unwrapped, far_distance: float = COLLIS
 
 def _pack_state_tuple(pos: np.ndarray, vel: np.ndarray, rot: np.ndarray, omega: np.ndarray) -> np.ndarray:
     return np.concatenate([pos.reshape(-1), vel.reshape(-1), rot.reshape(-1), omega.reshape(-1)], axis=0).astype(np.float64)
+
+
+def _sample_point_in_ball(center: np.ndarray, radius: float) -> np.ndarray:
+    center = np.asarray(center, dtype=np.float64)
+    radius = float(radius)
+    if radius <= 0.0:
+        return center.copy()
+    direction = np.random.normal(size=3)
+    direction_norm = float(np.linalg.norm(direction))
+    if direction_norm <= 1e-12:
+        return center.copy()
+    direction = direction / direction_norm
+    distance = radius * (np.random.uniform(0.0, 1.0) ** (1.0 / 3.0))
+    return center + distance * direction
+
+
+def _spawn_is_valid_cbf_clearance(
+    pos: np.ndarray,
+    obstacle_positions: np.ndarray,
+    obstacle_radius: float,
+    quad_radius: float,
+    obstacle_radius_margin: float,
+) -> bool:
+    obstacle_positions = np.asarray(obstacle_positions, dtype=np.float64).reshape(-1, 3)
+    if obstacle_positions.size == 0:
+        return True
+    center_dists_xy = np.linalg.norm(obstacle_positions[:, :2] - np.asarray(pos, dtype=np.float64)[None, :2], axis=1)
+    cbf_clearance = np.min(center_dists_xy - (float(obstacle_radius) + float(quad_radius) + float(obstacle_radius_margin)))
+    return bool(cbf_clearance > 0.0)
 
 
 def make_obstacle_cbf_filter(
@@ -217,7 +268,14 @@ def _make_yaw_towards_goal_rotation(pos: np.ndarray, goal: np.ndarray, fallback_
     return np.column_stack([x_axis, y_axis, z_axis]).astype(np.float64)
 
 
-def _apply_authoritative_obstacle_environment(env, geometry: Dict[str, np.ndarray | float], point_towards_goal: bool):
+def _apply_authoritative_obstacle_environment(
+    env,
+    geometry: Dict[str, np.ndarray | float],
+    point_towards_goal: bool,
+    spawn_ball_radius: float,
+    spawn_ball_max_tries: int,
+    obstacle_radius_margin: float,
+):
     env_unwrapped = env.unwrapped
     if not getattr(env_unwrapped, "use_obstacles", False):
         raise ValueError("collect_rand_obs requires an obstacle-enabled environment.")
@@ -227,10 +285,28 @@ def _apply_authoritative_obstacle_environment(env, geometry: Dict[str, np.ndarra
     quad = env_unwrapped.envs[0]
     dynamics = quad.dynamics
 
-    pos = np.asarray(geometry["start_point"], dtype=np.float64).copy()
+    start_center = np.asarray(geometry["start_point"], dtype=np.float64).copy()
     vel = np.zeros(3, dtype=np.float64)
     omega = np.zeros(3, dtype=np.float64)
     goal = np.asarray(geometry["goal_point"], dtype=np.float64).copy()
+
+    obstacle_positions = np.asarray(geometry["obstacle_positions"], dtype=np.float64).reshape(-1, 3)
+    obstacle_radius = float(geometry["obstacle_radius"])
+    env_unwrapped.num_obstacles = int(obstacle_positions.shape[0])
+    env_unwrapped.obst_size = 2.0 * obstacle_radius
+    env_unwrapped.obstacles.pos_arr = obstacle_positions.copy()
+    env_unwrapped.obstacles.obstacle_radius = obstacle_radius
+    env_unwrapped.obstacles.size = 2.0 * obstacle_radius
+
+    quad_radius = float(env_unwrapped.quad_arm)
+    pos = None
+    for _ in range(int(spawn_ball_max_tries)):
+        candidate = _sample_point_in_ball(start_center, float(spawn_ball_radius))
+        if _spawn_is_valid_cbf_clearance(candidate, obstacle_positions, obstacle_radius, quad_radius, obstacle_radius_margin):
+            pos = candidate
+            break
+    if pos is None:
+        raise RuntimeError("Failed to sample a valid initial position outside the CBF obstacle clearance region.")
 
     reset_rotation = np.asarray(dynamics.rot, dtype=np.float64).copy()
     rotation = reset_rotation.copy()
@@ -250,14 +326,6 @@ def _apply_authoritative_obstacle_environment(env, geometry: Dict[str, np.ndarra
 
     env_unwrapped.pos[0, :] = dynamics.pos
     env_unwrapped.vel[0, :] = dynamics.vel
-
-    obstacle_positions = np.asarray(geometry["obstacle_positions"], dtype=np.float64).reshape(-1, 3)
-    obstacle_radius = float(geometry["obstacle_radius"])
-    env_unwrapped.num_obstacles = int(obstacle_positions.shape[0])
-    env_unwrapped.obst_size = 2.0 * obstacle_radius
-    env_unwrapped.obstacles.pos_arr = obstacle_positions.copy()
-    env_unwrapped.obstacles.obstacle_radius = obstacle_radius
-    env_unwrapped.obstacles.size = 2.0 * obstacle_radius
 
     obs = [quad.state_vector(quad)]
     if env_unwrapped.num_use_neighbor_obs > 0:
@@ -311,6 +379,7 @@ def _build_eval_cfg(saved_args: Dict) -> "AttrDict":
         "--quads_collision_hitbox_radius=2.5",
         "--quads_collision_falloff_radius=5.0",
         "--quads_collision_smooth_max_penalty=12.0",
+        f"--quads_use_downwash={bool(saved_args.get('use_downwash', False))}",
         "--quads_use_numba=False",
         "--max_num_episodes=1",
         "--quads_render=False",
@@ -331,12 +400,23 @@ def _run_obstacle_trajectory(
     disable_boundary_collision: bool,
     point_towards_goal: bool,
     action_repeat: int,
+    spawn_ball_radius: float,
+    spawn_ball_max_tries: int,
 ):
     if disable_boundary_collision:
         _configure_far_boundary_geometry(env.unwrapped)
 
     _reset_env(env)
-    obs_run, initial_state = _apply_authoritative_obstacle_environment(env, geometry, point_towards_goal)
+    if disable_boundary_collision:
+        _configure_far_boundary_geometry(env.unwrapped)
+    obs_run, initial_state = _apply_authoritative_obstacle_environment(
+        env,
+        geometry,
+        point_towards_goal,
+        spawn_ball_radius,
+        spawn_ball_max_tries,
+        obstacle_radius_margin,
+    )
     done = False
     step_num = 0
     run_rnn_states = init_rnn_states.clone()
@@ -474,13 +554,17 @@ def main() -> None:
         raise ValueError("--num_trajectories must be positive.")
     if args.action_repeat <= 0:
         raise ValueError("--action_repeat must be positive.")
+    if args.spawn_ball_radius < 0.0:
+        raise ValueError("--spawn_ball_radius must be non-negative.")
+    if args.spawn_ball_max_tries <= 0:
+        raise ValueError("--spawn_ball_max_tries must be positive.")
 
-    geometry = _load_environment_geometry(args.conformal_obstacles_environment)
     saved_args = _load_json(args.conf_rand_obs_args)
     obstacle_radius_margin = float(saved_args["obstacle_radius_margin"])
     episode_length = int(saved_args["episode_length"])
     deterministic = bool(saved_args.get("deterministic", False))
     disable_boundary_collision = bool(saved_args.get("disable_boundary_collision", False))
+    use_downwash = bool(saved_args.get("use_downwash", False))
 
     if episode_length <= 0:
         raise ValueError("Saved --episode_length must be positive.")
@@ -492,6 +576,16 @@ def main() -> None:
     cfg_solo = load_cfg(saved_args["solo_train_dir"], saved_args["solo_experiment"])
     eval_cfg = _build_eval_cfg(saved_args)
     env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=None)
+
+    if disable_boundary_collision:
+        _configure_far_boundary_geometry(env.unwrapped)
+    _reset_env(env)
+    if disable_boundary_collision:
+        _configure_far_boundary_geometry(env.unwrapped)
+    if args.conformal_obstacles_environment is not None:
+        geometry = _load_environment_geometry(args.conformal_obstacles_environment)
+    else:
+        geometry = _capture_runtime_geometry(env)
 
     solo_ckpt = latest_checkpoint(saved_args["solo_train_dir"], saved_args["solo_experiment"], policy_index=0)
     solo_env = make_quadrotor_env("quadrotor_multi", cfg=cfg_solo, render_mode=None)
@@ -522,6 +616,8 @@ def main() -> None:
             disable_boundary_collision=disable_boundary_collision,
             point_towards_goal=args.point_towards_goal,
             action_repeat=int(args.action_repeat),
+            spawn_ball_radius=float(args.spawn_ball_radius),
+            spawn_ball_max_tries=int(args.spawn_ball_max_tries),
         )
         trajectories.append(traj)
         progress_bar.set_postfix_str(f"last_len={traj['trajectory_length']}")
@@ -583,10 +679,15 @@ def main() -> None:
         episode_length=episode_length,
         deterministic=deterministic,
         disable_boundary_collision=disable_boundary_collision,
+        use_downwash=use_downwash,
         obstacle_radius_margin=obstacle_radius_margin,
         point_towards_goal=bool(args.point_towards_goal),
         action_repeat=int(args.action_repeat),
-        conformal_obstacles_environment_path=os.path.abspath(args.conformal_obstacles_environment),
+        spawn_ball_radius=float(args.spawn_ball_radius),
+        spawn_ball_max_tries=int(args.spawn_ball_max_tries),
+        conformal_obstacles_environment_path=np.array(
+            os.path.abspath(args.conformal_obstacles_environment) if args.conformal_obstacles_environment is not None else ""
+        ),
         conf_rand_obs_args_path=os.path.abspath(args.conf_rand_obs_args),
     )
 

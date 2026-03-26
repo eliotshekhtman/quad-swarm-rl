@@ -71,6 +71,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=0.8, help="CBF gamma in (0, 1].")
     parser.add_argument("--disable_boundary_collision", action="store_true", help="Move room boundaries far enough to effectively disable wall/ceiling/floor collisions.")
     parser.add_argument("--use_downwash", action="store_true", help="Enable simulator downwash in the rollout environment.")
+    parser.add_argument(
+        "--environment_layout",
+        default=None,
+        help="Optional path to a canonical joint environment JSON with saved start_points and goal_pairs.",
+    )
     parser.add_argument("--spawn_ball_radius", type=float, default=1.0, help="Radius of the 3D ball used to resample each quad around its saved canonical patrol start.")
     parser.add_argument("--spawn_ball_max_tries", type=int, default=1000, help="Maximum number of joint ball-spawn attempts before failing.")
     parser.add_argument("--policy_refresh_interval", type=int, default=1, help="Call the policy every N control steps (N=1 keeps existing behavior).")
@@ -137,6 +142,24 @@ def _capture_initial_patrol_layout(env) -> Dict[str, np.ndarray]:
         raise ValueError(f"Unexpected goal_pairs shape: {goal_pairs.shape}")
     if start_points.ndim != 2 or start_points.shape[1] != 3:
         raise ValueError(f"Unexpected start_points shape: {start_points.shape}")
+    if goal_pairs.shape[0] != start_points.shape[0]:
+        raise ValueError("Saved patrol goal_pairs and start_points disagree on agent count")
+    return {
+        "goal_pairs": goal_pairs,
+        "start_points": start_points,
+    }
+
+
+def _load_patrol_layout(path: str) -> Dict[str, np.ndarray]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    goal_pairs = np.asarray(data["goal_pairs"], dtype=np.float64)
+    start_points = np.asarray(data["start_points"], dtype=np.float64)
+    if goal_pairs.ndim != 3 or goal_pairs.shape[1:] != (2, 3):
+        raise ValueError(f"Saved goal_pairs must have shape (num_agents, 2, 3), got {goal_pairs.shape}")
+    if start_points.ndim != 2 or start_points.shape[1] != 3:
+        raise ValueError(f"Saved start_points must have shape (num_agents, 3), got {start_points.shape}")
     if goal_pairs.shape[0] != start_points.shape[0]:
         raise ValueError("Saved patrol goal_pairs and start_points disagree on agent count")
     return {
@@ -585,12 +608,17 @@ def main() -> None:
     min_r = arm_len * 2.5
     min_spawn_pairwise_distance = min_r + float(args.separation_radius)
 
-    if args.disable_boundary_collision:
-        _configure_far_boundary_geometry(env.unwrapped)
-    env.reset()
-    if args.disable_boundary_collision:
-        _configure_far_boundary_geometry(env.unwrapped)
-    saved_layout = _capture_initial_patrol_layout(env)
+    if args.environment_layout is not None:
+        saved_layout = _load_patrol_layout(args.environment_layout)
+        if int(saved_layout["start_points"].shape[0]) != args.num_agents:
+            raise ValueError("--environment_layout agent count does not match --num_agents")
+    else:
+        if args.disable_boundary_collision:
+            _configure_far_boundary_geometry(env.unwrapped)
+        env.reset()
+        if args.disable_boundary_collision:
+            _configure_far_boundary_geometry(env.unwrapped)
+        saved_layout = _capture_initial_patrol_layout(env)
     patrol_json_path = os.path.join(experiment_dir, "conformal_joint_environment.json")
     with open(patrol_json_path, "w", encoding="utf-8") as f:
         json.dump(_serializable_patrol_layout(saved_layout), f, indent=2)

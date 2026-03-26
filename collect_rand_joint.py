@@ -68,6 +68,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to the canonical joint environment JSON saved by conf_ball_joint.",
     )
+    parser.add_argument(
+        "--spawn_ball_radius",
+        type=float,
+        default=0.0,
+        help="Radius of the 3D ball used to resample each quad around its saved canonical joint start.",
+    )
+    parser.add_argument(
+        "--spawn_ball_max_tries",
+        type=int,
+        default=1000,
+        help="Maximum number of pairwise-valid joint spawn-ball attempts before failing.",
+    )
     return parser.parse_args()
 
 
@@ -88,6 +100,22 @@ def _load_conformal_joint_environment(path: str) -> Dict[str, np.ndarray]:
         raise ValueError(f"goal_pairs must have shape (num_agents, 2, 3), got {goal_pairs.shape}")
     if start_points.shape[0] != goal_pairs.shape[0]:
         raise ValueError("start_points and goal_pairs disagree on agent count")
+    return {
+        "start_points": start_points,
+        "goal_pairs": goal_pairs,
+    }
+
+
+def _capture_canonical_joint_layout(env_unwrapped) -> Dict[str, np.ndarray]:
+    scenario = env_unwrapped.scenario
+    start_points = np.asarray(scenario.start_points, dtype=np.float64).copy()
+    goal_pairs = np.asarray(scenario.goal_pairs, dtype=np.float64).copy()
+    if start_points.ndim != 2 or start_points.shape[1] != 3:
+        raise ValueError(f"scenario.start_points must have shape (num_agents, 3), got {start_points.shape}")
+    if goal_pairs.ndim != 3 or goal_pairs.shape[1:] != (2, 3):
+        raise ValueError(f"scenario.goal_pairs must have shape (num_agents, 2, 3), got {goal_pairs.shape}")
+    if start_points.shape[0] != goal_pairs.shape[0]:
+        raise ValueError("scenario.start_points and scenario.goal_pairs disagree on agent count")
     return {
         "start_points": start_points,
         "goal_pairs": goal_pairs,
@@ -129,6 +157,59 @@ def _make_yaw_towards_goal_rotation(pos: np.ndarray, goal: np.ndarray) -> np.nda
         return np.eye(3, dtype=np.float64)
     y_axis /= y_norm
     return np.column_stack([x_axis, y_axis, z_axis]).astype(np.float64)
+
+
+def _sample_point_in_ball(center: np.ndarray, radius: float) -> np.ndarray:
+    center = np.asarray(center, dtype=np.float64)
+    radius = float(radius)
+    if radius <= 0.0:
+        return center.copy()
+    direction = np.random.normal(size=3)
+    direction_norm = float(np.linalg.norm(direction))
+    if direction_norm <= 1e-12:
+        return center.copy()
+    direction = direction / direction_norm
+    distance = radius * (np.random.uniform(0.0, 1.0) ** (1.0 / 3.0))
+    return center + distance * direction
+
+
+def _sample_joint_ball_spawn_positions(
+    saved_start_points: np.ndarray,
+    radius: float,
+    min_pairwise_distance: float,
+    max_tries: int,
+) -> np.ndarray:
+    saved_start_points = np.asarray(saved_start_points, dtype=np.float64)
+    radius = float(radius)
+    min_pairwise_distance = float(min_pairwise_distance)
+    if saved_start_points.ndim != 2 or saved_start_points.shape[1] != 3:
+        raise ValueError(f"saved_start_points must have shape (num_agents, 3), got {saved_start_points.shape}")
+    if radius < 0.0:
+        raise ValueError("--spawn_ball_radius must be non-negative")
+    if max_tries <= 0:
+        raise ValueError("--spawn_ball_max_tries must be positive")
+    if radius == 0.0:
+        return saved_start_points.copy()
+
+    num_agents = saved_start_points.shape[0]
+    for _ in range(int(max_tries)):
+        sampled = np.zeros_like(saved_start_points, dtype=np.float64)
+        valid = True
+        for agent_id in range(num_agents):
+            sampled[agent_id] = _sample_point_in_ball(saved_start_points[agent_id], radius)
+            for other_id in range(agent_id):
+                if np.linalg.norm(sampled[agent_id] - sampled[other_id]) < min_pairwise_distance:
+                    valid = False
+                    break
+            if not valid:
+                break
+        if valid:
+            return sampled
+
+    raise RuntimeError(
+        "Failed to sample pairwise-valid joint spawn positions inside the requested balls. "
+        "Try reducing --spawn_ball_radius or increasing --spawn_ball_max_tries."
+    )
 
 
 def _unpack_step_result(step_result):
@@ -273,7 +354,13 @@ def _restore_reference_joint_initialization(env_unwrapped, reference_init: Dict[
     return np.asarray(obs, dtype=np.float32)
 
 
-def _apply_authoritative_joint_environment(env_unwrapped, saved_layout: Dict[str, np.ndarray]) -> np.ndarray:
+def _apply_authoritative_joint_environment(
+    env_unwrapped,
+    saved_layout: Dict[str, np.ndarray],
+    spawn_ball_radius: float,
+    spawn_ball_max_tries: int,
+    min_pairwise_distance: float,
+) -> np.ndarray:
     scenario = env_unwrapped.scenario
     start_points = np.asarray(saved_layout["start_points"], dtype=np.float64)
     goal_pairs = np.asarray(saved_layout["goal_pairs"], dtype=np.float64)
@@ -287,6 +374,13 @@ def _apply_authoritative_joint_environment(env_unwrapped, saved_layout: Dict[str
             f"Saved goal_pairs shape {goal_pairs.shape} does not match expected ({len(env_unwrapped.envs)}, 2, 3)"
         )
 
+    sampled_positions = _sample_joint_ball_spawn_positions(
+        start_points,
+        spawn_ball_radius,
+        min_pairwise_distance,
+        spawn_ball_max_tries,
+    )
+
     scenario.goal_pairs = goal_pairs.copy()
     if hasattr(scenario, "start_points"):
         scenario.start_points = start_points.copy()
@@ -295,11 +389,11 @@ def _apply_authoritative_joint_environment(env_unwrapped, saved_layout: Dict[str
         scenario.steps_since_switch = np.zeros(len(env_unwrapped.envs), dtype=np.int64)
     scenario.goals = goal_pairs[:, 0].copy()
     if hasattr(scenario, "spawn_points"):
-        scenario.spawn_points = start_points.copy()
+        scenario.spawn_points = sampled_positions.copy()
 
     for agent_id, quad in enumerate(env_unwrapped.envs):
         goal = goal_pairs[agent_id, 0].copy()
-        pos = start_points[agent_id].copy()
+        pos = sampled_positions[agent_id].copy()
         vel = np.zeros(3, dtype=np.float64)
         omega = np.zeros(3, dtype=np.float64)
         rotation = _make_yaw_towards_goal_rotation(pos, goal)
@@ -331,7 +425,10 @@ def _run_joint_trajectory(
     init_rnn_states: torch.Tensor,
     solo_obs_dim: int,
     joint_action_fn,
-    reference_init: Dict[str, np.ndarray],
+    saved_layout: Dict[str, np.ndarray],
+    spawn_ball_radius: float,
+    spawn_ball_max_tries: int,
+    min_spawn_pairwise_distance: float,
     num_agents: int,
     max_steps: int,
     deterministic: bool,
@@ -341,7 +438,15 @@ def _run_joint_trajectory(
         _configure_far_boundary_geometry(env.unwrapped)
 
     env.reset()
-    obs_run = _restore_reference_joint_initialization(env.unwrapped, reference_init)
+    if disable_boundary_collision:
+        _configure_far_boundary_geometry(env.unwrapped)
+    obs_run = _apply_authoritative_joint_environment(
+        env.unwrapped,
+        saved_layout,
+        spawn_ball_radius,
+        spawn_ball_max_tries,
+        min_spawn_pairwise_distance,
+    )
     done = False
     step_num = 0
     run_rnn_states = init_rnn_states.clone()
@@ -443,7 +548,7 @@ def _run_joint_trajectory(
     }
 
 
-def _build_eval_cfg(num_agents: int) -> "AttrDict":
+def _build_eval_cfg(num_agents: int, use_downwash: bool) -> "AttrDict":
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
@@ -456,6 +561,7 @@ def _build_eval_cfg(num_agents: int) -> "AttrDict":
         "--quads_collision_hitbox_radius=2.5",
         "--quads_collision_falloff_radius=5.0",
         "--quads_collision_smooth_max_penalty=12.0",
+        f"--quads_use_downwash={bool(use_downwash)}",
         "--quads_use_numba=False",
         "--max_num_episodes=1",
         "--quads_render=False",
@@ -467,6 +573,10 @@ def main() -> None:
     args = parse_args()
     if args.num_trajectories <= 0:
         raise ValueError("--num_trajectories must be positive.")
+    if args.spawn_ball_radius < 0.0:
+        raise ValueError("--spawn_ball_radius must be non-negative.")
+    if args.spawn_ball_max_tries <= 0:
+        raise ValueError("--spawn_ball_max_tries must be positive.")
 
     conf_args = _load_conformal_joint_args(args.conformal_joint_args)
 
@@ -481,11 +591,8 @@ def main() -> None:
     gamma = float(conf_args.get("gamma", 0.8))
     disable_boundary_collision = bool(conf_args.get("disable_boundary_collision", False))
     deterministic = bool(conf_args.get("deterministic", False))
+    use_downwash = bool(conf_args.get("use_downwash", False))
     use_repeated_linearization = bool(conf_args.get("use_repeated_linearization", False))
-    saved_layout = None
-    if args.conformal_joint_environment is not None:
-        saved_layout = _load_conformal_joint_environment(args.conformal_joint_environment)
-
     if num_agents < 2:
         raise ValueError("--num_agents must be >= 2 for joint collection.")
 
@@ -496,8 +603,10 @@ def main() -> None:
     cfg_path = os.path.abspath(args.conformal_joint_args)
     print(f"[collect_rand_joint] Loading conformal config from {cfg_path}")
 
-    eval_cfg = _build_eval_cfg(num_agents=num_agents)
+    eval_cfg = _build_eval_cfg(num_agents=num_agents, use_downwash=use_downwash)
     env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=None)
+    arm_len = float(env.quad_arm)
+    min_spawn_pairwise_distance = arm_len * 2.5 + separation_radius
 
     cfg_solo = load_cfg(conf_args["solo_train_dir"], conf_args["solo_experiment"])
     solo_ckpt = latest_checkpoint(conf_args["solo_train_dir"], conf_args["solo_experiment"], policy_index=0)
@@ -517,13 +626,14 @@ def main() -> None:
     if disable_boundary_collision:
         _configure_far_boundary_geometry(env.unwrapped)
     env.reset()
-    if saved_layout is not None:
+    if disable_boundary_collision:
+        _configure_far_boundary_geometry(env.unwrapped)
+    if args.conformal_joint_environment is not None:
+        saved_layout = _load_conformal_joint_environment(args.conformal_joint_environment)
         if int(saved_layout["start_points"].shape[0]) != num_agents:
-            raise ValueError(
-                "--conformal_joint_environment agent count does not match num_agents from conformal_joint_args"
-            )
-        _apply_authoritative_joint_environment(env.unwrapped, saved_layout)
-    reference_init = _capture_reference_joint_initialization(env.unwrapped)
+            raise ValueError("--conformal_joint_environment agent count does not match num_agents from conformal_joint_args")
+    else:
+        saved_layout = _capture_canonical_joint_layout(env.unwrapped)
 
     run_logs = []
     for _ in tqdm(range(args.num_trajectories), desc="Collecting trajectories", unit="traj"):
@@ -534,7 +644,10 @@ def main() -> None:
                 init_rnn_states=init_rnn_states,
                 solo_obs_dim=solo_obs_dim,
                 joint_action_fn=filter_fn,
-                reference_init=reference_init,
+                saved_layout=saved_layout,
+                spawn_ball_radius=args.spawn_ball_radius,
+                spawn_ball_max_tries=args.spawn_ball_max_tries,
+                min_spawn_pairwise_distance=min_spawn_pairwise_distance,
                 num_agents=num_agents,
                 max_steps=episode_length,
                 deterministic=deterministic,
@@ -579,12 +692,15 @@ def main() -> None:
         trajectory_lengths=trajectory_lengths,
         initial_positions=initial_positions,
         initial_goals=initial_goals,
+        canonical_start_points=np.asarray(saved_layout["start_points"], dtype=np.float64),
+        canonical_goal_pairs=np.asarray(saved_layout["goal_pairs"], dtype=np.float64),
         r_mismatch=np.array(float(args.r_mismatch), dtype=np.float64),
         seed=np.array(int(args.seed), dtype=np.int64),
         num_agents=np.array(int(num_agents), dtype=np.int64),
         episode_length=np.array(int(episode_length), dtype=np.int64),
         separation_radius=np.array(float(separation_radius), dtype=np.float64),
         gamma=np.array(float(gamma), dtype=np.float64),
+        use_downwash=np.array(bool(use_downwash)),
         use_repeated_linearization=np.array(bool(use_repeated_linearization)),
         deterministic=np.array(bool(deterministic)),
         disable_boundary_collision=np.array(bool(disable_boundary_collision)),
@@ -592,6 +708,8 @@ def main() -> None:
         conformal_joint_environment_path=np.array(
             os.path.abspath(args.conformal_joint_environment) if args.conformal_joint_environment is not None else ""
         ),
+        spawn_ball_radius=np.array(float(args.spawn_ball_radius), dtype=np.float64),
+        spawn_ball_max_tries=np.array(int(args.spawn_ball_max_tries), dtype=np.int64),
         num_trajectories=np.array(int(args.num_trajectories), dtype=np.int64),
     )
 

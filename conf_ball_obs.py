@@ -126,10 +126,10 @@ def _serializable_environment_geometry(geometry: Dict[str, np.ndarray | float], 
     return {
         "start_point": np.asarray(geometry["start_point"], dtype=np.float64).tolist(),
         "goal_point": np.asarray(geometry["goal_point"], dtype=np.float64).tolist(),
-        "obstacle_radius": obstacle_radius,
+        "obstacles": np.asarray(geometry["obstacle_positions"], dtype=np.float64).tolist(),
+        "radius": obstacle_radius,
         "quad_radius": float(quad_radius),
         "cbf_obstacle_radius": cbf_radius,
-        "obstacle_positions": np.asarray(geometry["obstacle_positions"], dtype=np.float64).tolist(),
     }
 
 
@@ -638,7 +638,7 @@ def main() -> None:
             num_runs=args.num_trajectories,
             deterministic=args.deterministic,
             disable_boundary_collision=args.disable_boundary_collision,
-            environment_geometry=initial_geometry if args.environment_geometry is not None else None,
+            environment_geometry=initial_geometry,
             spawn_ball_radius=args.spawn_ball_radius,
             spawn_ball_max_tries=args.spawn_ball_max_tries,
             action_repeat=args.action_repeat,
@@ -665,7 +665,7 @@ def main() -> None:
             num_runs=args.num_eval_trajs,
             deterministic=args.deterministic,
             disable_boundary_collision=args.disable_boundary_collision,
-            environment_geometry=initial_geometry if args.environment_geometry is not None else None,
+            environment_geometry=initial_geometry,
             spawn_ball_radius=args.spawn_ball_radius,
             spawn_ball_max_tries=args.spawn_ball_max_tries,
             action_repeat=args.action_repeat,
