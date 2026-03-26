@@ -19,7 +19,12 @@ from sample_factory.model.model_utils import get_rnn_size
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
-from project_utils.full_cbf_utils import apply_cbf_filter, cbf_dynamics, real_dynamics
+from project_utils.joint_cbf_utils import (
+    _normalized_to_thrust,
+    apply_cbf_filter,
+    cbf_dynamics,
+    real_dynamics,
+)
 from project_utils.restart_utils import extract_positions_velocities, set_global_seed
 from project_utils.utils import OBS_KEY, load_actor, load_cfg, latest_checkpoint
 
@@ -58,12 +63,35 @@ def parse_args() -> argparse.Namespace:
         default="rand_joint_trajectories.npz",
         help="Path to save the collected rollout dataset.",
     )
+    parser.add_argument(
+        "--conformal_joint_environment",
+        default=None,
+        help="Optional path to the canonical joint environment JSON saved by conf_ball_joint.",
+    )
     return parser.parse_args()
 
 
 def _load_conformal_joint_args(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _load_conformal_joint_environment(path: str) -> Dict[str, np.ndarray]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    start_points = np.asarray(data["start_points"], dtype=np.float64)
+    goal_pairs = np.asarray(data["goal_pairs"], dtype=np.float64)
+    if start_points.ndim != 2 or start_points.shape[1] != 3:
+        raise ValueError(f"start_points must have shape (num_agents, 3), got {start_points.shape}")
+    if goal_pairs.ndim != 3 or goal_pairs.shape[1:] != (2, 3):
+        raise ValueError(f"goal_pairs must have shape (num_agents, 2, 3), got {goal_pairs.shape}")
+    if start_points.shape[0] != goal_pairs.shape[0]:
+        raise ValueError("start_points and goal_pairs disagree on agent count")
+    return {
+        "start_points": start_points,
+        "goal_pairs": goal_pairs,
+    }
 
 
 def _configure_far_boundary_geometry(env_unwrapped, far_distance: float = COLLISION_FAR_DISTANCE) -> None:
@@ -85,6 +113,22 @@ def _configure_far_boundary_geometry(env_unwrapped, far_distance: float = COLLIS
 
 def _pack_state_tuple(pos: np.ndarray, vel: np.ndarray, rot: np.ndarray, omega: np.ndarray) -> np.ndarray:
     return np.concatenate([pos.reshape(-1), vel.reshape(-1), rot.reshape(-1), omega.reshape(-1)], axis=0).astype(np.float64)
+
+
+def _make_yaw_towards_goal_rotation(pos: np.ndarray, goal: np.ndarray) -> np.ndarray:
+    direction_xy = np.asarray(goal[:2] - pos[:2], dtype=np.float64)
+    direction_norm = float(np.linalg.norm(direction_xy))
+    if direction_norm <= 1e-9:
+        return np.eye(3, dtype=np.float64)
+
+    x_axis = np.array([direction_xy[0] / direction_norm, direction_xy[1] / direction_norm, 0.0], dtype=np.float64)
+    z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    y_axis = np.cross(z_axis, x_axis)
+    y_norm = float(np.linalg.norm(y_axis))
+    if y_norm <= 1e-9:
+        return np.eye(3, dtype=np.float64)
+    y_axis /= y_norm
+    return np.column_stack([x_axis, y_axis, z_axis]).astype(np.float64)
 
 
 def _unpack_step_result(step_result):
@@ -113,7 +157,33 @@ def _joint_state_model_mismatch(actions: np.ndarray, env_unwrapped) -> float:
     return float(np.linalg.norm(np.concatenate(states_cbf, axis=0) - np.concatenate(states_real, axis=0)))
 
 
-def make_joint_cbf_filter(r_mismatch: float, separation_radius: float, gamma: float):
+def _joint_action_thrusts_and_accelerations(actions: np.ndarray, env_unwrapped):
+    actions = np.asarray(actions, dtype=np.float64)
+    if actions.ndim != 2 or actions.shape[1] != 4:
+        raise ValueError(f"Expected actions with shape (num_agents, 4), got {actions.shape}")
+
+    dt = float(env_unwrapped.control_dt)
+    thrusts = []
+    accelerations = []
+    for agent_id, quad in enumerate(env_unwrapped.envs):
+        dynamics = quad.dynamics
+        normalized = np.clip(0.5 * (actions[agent_id] + 1.0), 0.0, 1.0)
+        thrust_vec, _ = _normalized_to_thrust(normalized, dynamics)
+        current_vel = np.asarray(dynamics.vel, dtype=np.float64).copy()
+        _, next_vel, _, _ = cbf_dynamics(normalized, dynamics, dt)
+        accel = (np.asarray(next_vel, dtype=np.float64) - current_vel) / dt
+        thrusts.append(np.asarray(thrust_vec, dtype=np.float64))
+        accelerations.append(np.asarray(accel, dtype=np.float64))
+
+    return np.stack(thrusts, axis=0), np.stack(accelerations, axis=0)
+
+
+def make_joint_cbf_filter(
+    r_mismatch: float,
+    separation_radius: float,
+    gamma: float,
+    use_repeated_linearization: bool = False,
+):
     def _filter(base_action: np.ndarray, env_state):
         return apply_cbf_filter(
             base_action=base_action,
@@ -121,6 +191,7 @@ def make_joint_cbf_filter(r_mismatch: float, separation_radius: float, gamma: fl
             r=float(r_mismatch),
             separation_radius=float(separation_radius),
             gamma=float(gamma),
+            use_repeated_linearization=use_repeated_linearization,
         )
 
     return _filter
@@ -144,17 +215,23 @@ def _pad_with_nan(values: np.ndarray, target_len: int) -> np.ndarray:
 def _capture_reference_joint_initialization(env_unwrapped) -> Dict[str, np.ndarray]:
     scenario = env_unwrapped.scenario
     positions = []
+    velocities = []
     rotations = []
+    omegas = []
     goals = []
     for quad in env_unwrapped.envs:
         dynamics = quad.dynamics
         positions.append(np.asarray(dynamics.pos, dtype=np.float64).copy())
+        velocities.append(np.asarray(dynamics.vel, dtype=np.float64).copy())
         rotations.append(np.asarray(dynamics.rot, dtype=np.float64).copy())
+        omegas.append(np.asarray(dynamics.omega, dtype=np.float64).copy())
         goals.append(np.asarray(quad.goal, dtype=np.float64).copy())
 
     return {
         "positions": np.stack(positions, axis=0),
+        "velocities": np.stack(velocities, axis=0),
         "rotations": np.stack(rotations, axis=0),
+        "omegas": np.stack(omegas, axis=0),
         "goals": np.stack(goals, axis=0),
         "goal_pairs": np.asarray(scenario.goal_pairs, dtype=np.float64).copy(),
         "active_goal_index": np.asarray(scenario.active_goal_index, dtype=np.int64).copy(),
@@ -167,14 +244,18 @@ def _restore_reference_joint_initialization(env_unwrapped, reference_init: Dict[
     scenario.active_goal_index = np.asarray(reference_init["active_goal_index"], dtype=np.int64).copy()
 
     saved_positions = np.asarray(reference_init["positions"], dtype=np.float64)
+    saved_velocities = np.asarray(reference_init["velocities"], dtype=np.float64)
     saved_rotations = np.asarray(reference_init["rotations"], dtype=np.float64)
+    saved_omegas = np.asarray(reference_init["omegas"], dtype=np.float64)
     saved_goals = np.asarray(reference_init["goals"], dtype=np.float64)
 
     for agent_id, quad in enumerate(env_unwrapped.envs):
-        dynamics = quad.dynamics
-        vel = np.asarray(dynamics.vel, dtype=np.float64).copy()
-        omega = np.asarray(dynamics.omega, dtype=np.float64).copy()
-        quad.dynamics.set_state(saved_positions[agent_id], vel, saved_rotations[agent_id], omega)
+        quad.dynamics.set_state(
+            saved_positions[agent_id],
+            saved_velocities[agent_id],
+            saved_rotations[agent_id],
+            saved_omegas[agent_id],
+        )
         quad.dynamics.reset()
         quad.dynamics.on_floor = False
         quad.dynamics.crashed_floor = quad.dynamics.crashed_wall = quad.dynamics.crashed_ceiling = False
@@ -185,6 +266,58 @@ def _restore_reference_joint_initialization(env_unwrapped, reference_init: Dict[
         env_unwrapped.vel[agent_id, :] = quad.dynamics.vel
 
     scenario.goals = saved_goals.copy()
+
+    obs = [quad.state_vector(quad) for quad in env_unwrapped.envs]
+    if env_unwrapped.num_use_neighbor_obs > 0:
+        obs = env_unwrapped.add_neighborhood_obs(obs)
+    return np.asarray(obs, dtype=np.float32)
+
+
+def _apply_authoritative_joint_environment(env_unwrapped, saved_layout: Dict[str, np.ndarray]) -> np.ndarray:
+    scenario = env_unwrapped.scenario
+    start_points = np.asarray(saved_layout["start_points"], dtype=np.float64)
+    goal_pairs = np.asarray(saved_layout["goal_pairs"], dtype=np.float64)
+
+    if start_points.shape != (len(env_unwrapped.envs), 3):
+        raise ValueError(
+            f"Saved start_points shape {start_points.shape} does not match expected ({len(env_unwrapped.envs)}, 3)"
+        )
+    if goal_pairs.shape != (len(env_unwrapped.envs), 2, 3):
+        raise ValueError(
+            f"Saved goal_pairs shape {goal_pairs.shape} does not match expected ({len(env_unwrapped.envs)}, 2, 3)"
+        )
+
+    scenario.goal_pairs = goal_pairs.copy()
+    if hasattr(scenario, "start_points"):
+        scenario.start_points = start_points.copy()
+    scenario.active_goal_index = np.zeros(len(env_unwrapped.envs), dtype=np.int64)
+    if hasattr(scenario, "steps_since_switch"):
+        scenario.steps_since_switch = np.zeros(len(env_unwrapped.envs), dtype=np.int64)
+    scenario.goals = goal_pairs[:, 0].copy()
+    if hasattr(scenario, "spawn_points"):
+        scenario.spawn_points = start_points.copy()
+
+    for agent_id, quad in enumerate(env_unwrapped.envs):
+        goal = goal_pairs[agent_id, 0].copy()
+        pos = start_points[agent_id].copy()
+        vel = np.zeros(3, dtype=np.float64)
+        omega = np.zeros(3, dtype=np.float64)
+        rotation = _make_yaw_towards_goal_rotation(pos, goal)
+
+        quad.goal = goal.copy()
+        if hasattr(quad, "spawn_point"):
+            quad.spawn_point = pos.copy()
+        quad.dynamics.set_state(pos, vel, rotation, omega)
+        quad.dynamics.reset()
+        quad.dynamics.on_floor = False
+        quad.dynamics.crashed_floor = False
+        quad.dynamics.crashed_wall = False
+        quad.dynamics.crashed_ceiling = False
+        quad.tick = 0
+        quad.actions = [np.zeros(4, dtype=np.float64), np.zeros(4, dtype=np.float64)]
+
+        env_unwrapped.pos[agent_id, :] = quad.dynamics.pos
+        env_unwrapped.vel[agent_id, :] = quad.dynamics.vel
 
     obs = [quad.state_vector(quad) for quad in env_unwrapped.envs]
     if env_unwrapped.num_use_neighbor_obs > 0:
@@ -229,6 +362,10 @@ def _run_joint_trajectory(
         "goal_dist": [],
         "goal_swap": [],
         "model_mismatch_state": [],
+        "nominal_thrust": [],
+        "filtered_thrust": [],
+        "nominal_acceleration": [],
+        "filtered_acceleration": [],
     }
 
     while not done and step_num < max_steps:
@@ -241,14 +378,24 @@ def _run_joint_trajectory(
         actions = policy_out["actions"]
         if deterministic:
             actions = argmax_actions(solo_actor.action_distribution())
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(-1)
-        actions = actions.detach().cpu().numpy()
+        nominal_actions = np.asarray(actions.detach().cpu().numpy(), dtype=np.float64)
+        if nominal_actions.ndim == 1:
+            if nominal_actions.size != 4 * num_agents:
+                raise ValueError(
+                    f"Flat joint policy action has size {nominal_actions.size}, expected {4 * num_agents}"
+                )
+            nominal_actions = nominal_actions.reshape(num_agents, 4)
+        if nominal_actions.shape != (num_agents, 4):
+            raise ValueError(
+                f"Joint policy action has shape {nominal_actions.shape}, expected ({num_agents}, 4)"
+            )
 
-        actions = joint_action_fn(base_action=actions, env_state=env)
-        mismatch = _joint_state_model_mismatch(actions, env.unwrapped)
+        filtered_actions = np.asarray(joint_action_fn(base_action=nominal_actions, env_state=env), dtype=np.float64)
+        nominal_thrust, nominal_acc = _joint_action_thrusts_and_accelerations(nominal_actions, env.unwrapped)
+        filtered_thrust, filtered_acc = _joint_action_thrusts_and_accelerations(filtered_actions, env.unwrapped)
+        mismatch = _joint_state_model_mismatch(filtered_actions, env.unwrapped)
 
-        obs_run, rewards, dones, infos = _unpack_step_result(env.step(actions))
+        obs_run, rewards, dones, infos = _unpack_step_result(env.step(filtered_actions))
         obs_run = np.array(obs_run, dtype=np.float32)
         pos, vel = extract_positions_velocities(env.unwrapped)
 
@@ -269,6 +416,10 @@ def _run_joint_trajectory(
         run_logs["goal_dist"].append(np.asarray(step_goal_dist, dtype=np.float64))
         run_logs["goal_swap"].append(np.asarray(step_goal_swap, dtype=np.bool_))
         run_logs["model_mismatch_state"].append(float(mismatch))
+        run_logs["nominal_thrust"].append(nominal_thrust.astype(np.float32))
+        run_logs["filtered_thrust"].append(filtered_thrust.astype(np.float32))
+        run_logs["nominal_acceleration"].append(nominal_acc.astype(np.float32))
+        run_logs["filtered_acceleration"].append(filtered_acc.astype(np.float32))
 
         done = np.all(dones)
         step_num += 1
@@ -282,6 +433,10 @@ def _run_joint_trajectory(
         "goal_dist": run_logs["goal_dist"],
         "goal_swap": run_logs["goal_swap"],
         "model_mismatch_state": run_logs["model_mismatch_state"],
+        "nominal_thrust": np.asarray(run_logs["nominal_thrust"], dtype=np.float32),
+        "filtered_thrust": np.asarray(run_logs["filtered_thrust"], dtype=np.float32),
+        "nominal_acceleration": np.asarray(run_logs["nominal_acceleration"], dtype=np.float32),
+        "filtered_acceleration": np.asarray(run_logs["filtered_acceleration"], dtype=np.float32),
         "initial_positions": np.asarray(initial_positions, dtype=np.float64),
         "initial_goals": initial_goals,
         "trajectory_length": int(step_num),
@@ -326,6 +481,10 @@ def main() -> None:
     gamma = float(conf_args.get("gamma", 0.8))
     disable_boundary_collision = bool(conf_args.get("disable_boundary_collision", False))
     deterministic = bool(conf_args.get("deterministic", False))
+    use_repeated_linearization = bool(conf_args.get("use_repeated_linearization", False))
+    saved_layout = None
+    if args.conformal_joint_environment is not None:
+        saved_layout = _load_conformal_joint_environment(args.conformal_joint_environment)
 
     if num_agents < 2:
         raise ValueError("--num_agents must be >= 2 for joint collection.")
@@ -347,12 +506,23 @@ def main() -> None:
     solo_obs_dim = solo_env.observation_space.shape[0]
     solo_env.close()
 
-    filter_fn = make_joint_cbf_filter(args.r_mismatch, separation_radius, gamma)
+    filter_fn = make_joint_cbf_filter(
+        args.r_mismatch,
+        separation_radius,
+        gamma,
+        use_repeated_linearization=use_repeated_linearization,
+    )
     init_rnn_states = torch.zeros((num_agents, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
 
     if disable_boundary_collision:
         _configure_far_boundary_geometry(env.unwrapped)
     env.reset()
+    if saved_layout is not None:
+        if int(saved_layout["start_points"].shape[0]) != num_agents:
+            raise ValueError(
+                "--conformal_joint_environment agent count does not match num_agents from conformal_joint_args"
+            )
+        _apply_authoritative_joint_environment(env.unwrapped, saved_layout)
     reference_init = _capture_reference_joint_initialization(env.unwrapped)
 
     run_logs = []
@@ -383,6 +553,10 @@ def main() -> None:
     goal_dist = np.stack([_pad_with_nan(run["goal_dist"], max_len) for run in run_logs], axis=0)
     goal_swap = np.stack([_pad_with_nan(run["goal_swap"], max_len) for run in run_logs], axis=0)
     model_mismatch_state = np.stack([_pad_with_nan(run["model_mismatch_state"], max_len) for run in run_logs], axis=0)
+    nominal_thrusts = np.stack([_pad_with_nan(run["nominal_thrust"], max_len) for run in run_logs], axis=0)
+    filtered_thrusts = np.stack([_pad_with_nan(run["filtered_thrust"], max_len) for run in run_logs], axis=0)
+    nominal_accelerations = np.stack([_pad_with_nan(run["nominal_acceleration"], max_len) for run in run_logs], axis=0)
+    filtered_accelerations = np.stack([_pad_with_nan(run["filtered_acceleration"], max_len) for run in run_logs], axis=0)
     initial_positions = np.stack([run["initial_positions"] for run in run_logs], axis=0)
     initial_goals = np.stack([run["initial_goals"] for run in run_logs], axis=0)
     trajectory_lengths = np.asarray([run["trajectory_length"] for run in run_logs], dtype=np.int32)
@@ -398,6 +572,10 @@ def main() -> None:
         goal_dist=goal_dist,
         goal_swap=goal_swap,
         model_mismatch_state=model_mismatch_state,
+        nominal_thrusts=nominal_thrusts,
+        filtered_thrusts=filtered_thrusts,
+        nominal_accelerations=nominal_accelerations,
+        filtered_accelerations=filtered_accelerations,
         trajectory_lengths=trajectory_lengths,
         initial_positions=initial_positions,
         initial_goals=initial_goals,
@@ -407,9 +585,13 @@ def main() -> None:
         episode_length=np.array(int(episode_length), dtype=np.int64),
         separation_radius=np.array(float(separation_radius), dtype=np.float64),
         gamma=np.array(float(gamma), dtype=np.float64),
+        use_repeated_linearization=np.array(bool(use_repeated_linearization)),
         deterministic=np.array(bool(deterministic)),
         disable_boundary_collision=np.array(bool(disable_boundary_collision)),
         conformal_joint_args_path=np.array(cfg_path),
+        conformal_joint_environment_path=np.array(
+            os.path.abspath(args.conformal_joint_environment) if args.conformal_joint_environment is not None else ""
+        ),
         num_trajectories=np.array(int(args.num_trajectories), dtype=np.int64),
     )
 
