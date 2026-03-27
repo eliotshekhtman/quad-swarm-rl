@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
         default="filtered",
         help="Which predicted acceleration arrows to draw when --action_stride >= 1.",
     )
+    parser.add_argument(
+        "--color_by",
+        choices=("trajectory", "quad"),
+        default="trajectory",
+        help="Color trajectories by trajectory id or by quad id. In obstacle plots there is one quad, so quad coloring uses one shared color.",
+    )
     return parser.parse_args()
 
 
@@ -241,6 +247,18 @@ def _prediction_bases_from_rollout(positions: np.ndarray, initial_positions: np.
     return base_positions
 
 
+def _make_palette(count: int) -> np.ndarray:
+    if count <= 20:
+        return plt.cm.tab20(np.linspace(0.0, 1.0, count))
+    return plt.cm.plasma(np.linspace(0.0, 1.0, count))
+
+
+def _color_for_run(run_id: int, color_by: str, colors: np.ndarray) -> np.ndarray:
+    if color_by == "trajectory":
+        return colors[run_id % len(colors)]
+    return colors[0]
+
+
 def _add_action_arrows_2d(
     ax,
     base_positions: np.ndarray,
@@ -330,17 +348,14 @@ def _plot_2d(
     highlight_distance: float,
     action_stride: int,
     action_source: str,
+    color_by: str,
     initial_positions: np.ndarray,
     nominal_accelerations: np.ndarray | None,
     filtered_accelerations: np.ndarray | None,
 ) -> None:
     num_runs = positions.shape[0]
     max_steps = positions.shape[1]
-    colors = (
-        plt.cm.tab20(np.linspace(0.0, 1.0, num_runs))
-        if num_runs <= 20
-        else plt.cm.plasma(np.linspace(0.0, 1.0, num_runs))
-    )
+    colors = _make_palette(num_runs if color_by == "trajectory" else 1)
 
     fig, ax = plt.subplots(figsize=(9, 9))
 
@@ -357,7 +372,7 @@ def _plot_2d(
         if run_len <= 0:
             continue
         traj = positions[run_id, :run_len, :]
-        color = colors[run_id % len(colors)]
+        color = _color_for_run(run_id, color_by, colors)
         ax.plot(traj[:, 0], traj[:, 1], linewidth=1.0, alpha=0.28, color=color, zorder=2)
         ax.scatter(traj[0, 0], traj[0, 1], s=10, alpha=0.45, color=color, zorder=3)
 
@@ -463,6 +478,7 @@ def _plot_3d(
     highlight_distance: float,
     action_stride: int,
     action_source: str,
+    color_by: str,
     initial_positions: np.ndarray,
     nominal_accelerations: np.ndarray | None,
     filtered_accelerations: np.ndarray | None,
@@ -471,6 +487,7 @@ def _plot_3d(
     max_steps = positions.shape[1]
     room_height = infer_room_height_from_collection(obstacle_positions)
     cylinder_z_min, cylinder_z_max = 0.0, room_height
+    colors = _make_palette(num_runs if color_by == "trajectory" else 1)
 
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
@@ -481,7 +498,8 @@ def _plot_3d(
         if run_len <= 0:
             continue
         traj = positions[run_id, :run_len, :]
-        ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], color="tab:red", alpha=0.12, linewidth=0.9)
+        color = _color_for_run(run_id, color_by, colors)
+        ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], color=color, alpha=0.12, linewidth=0.9)
 
     base_positions = _prediction_bases_from_rollout(positions, initial_positions)
     arrow_length = 0.45
@@ -619,6 +637,7 @@ def main() -> None:
             highlight_distance=args.highlight_distance,
             action_stride=args.action_stride,
             action_source=args.action_source,
+            color_by=args.color_by,
             initial_positions=initial_positions,
             nominal_accelerations=nominal_accelerations,
             filtered_accelerations=filtered_accelerations,
@@ -639,6 +658,7 @@ def main() -> None:
             highlight_distance=args.highlight_distance,
             action_stride=args.action_stride,
             action_source=args.action_source,
+            color_by=args.color_by,
             initial_positions=initial_positions,
             nominal_accelerations=nominal_accelerations,
             filtered_accelerations=filtered_accelerations,

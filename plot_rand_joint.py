@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
         default="rand_joint_trajectories.pdf",
         help="Output file name.",
     )
+    parser.add_argument(
+        "--color_by",
+        choices=("trajectory", "quad"),
+        default="trajectory",
+        help="Color lines by trajectory id or by quad id.",
+    )
     return parser.parse_args()
 
 
@@ -44,6 +50,12 @@ def _finite_bounds(positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         return np.zeros((3,), dtype=np.float64), np.ones((3,), dtype=np.float64)
     finite = flat[finite_mask]
     return np.min(finite, axis=0), np.max(finite, axis=0)
+
+
+def _make_palette(count: int) -> np.ndarray:
+    if count <= 20:
+        return plt.cm.tab20(np.linspace(0.0, 1.0, count))
+    return plt.cm.plasma(np.linspace(0.0, 1.0, count))
 
 
 def main() -> None:
@@ -64,7 +76,8 @@ def main() -> None:
 
     num_runs = positions.shape[0]
     max_steps = positions.shape[1]
-    colors = plt.cm.tab20(np.linspace(0.0, 1.0, num_runs)) if num_runs <= 20 else plt.cm.plasma(np.linspace(0.0, 1.0, num_runs))
+    palette_size = num_runs if args.color_by == "trajectory" else num_agents
+    colors = _make_palette(palette_size)
 
     output_dir = args.output_dir or os.path.join("./", "plots", Path(data_path).stem)
     os.makedirs(output_dir, exist_ok=True)
@@ -76,11 +89,12 @@ def main() -> None:
     for run_id in range(num_runs):
         run_len = int(trajectory_lengths[run_id])
         run_len = max(1, min(run_len, max_steps))
-        color = colors[run_id % len(colors)]
         for agent_id in range(num_agents):
             traj = positions[run_id, :run_len, agent_id, :]
             if traj.shape[0] < 2:
                 continue
+            color_idx = run_id if args.color_by == "trajectory" else agent_id
+            color = colors[color_idx % len(colors)]
             ax.plot(
                 traj[:, 0],
                 traj[:, 1],
