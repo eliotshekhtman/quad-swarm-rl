@@ -8,6 +8,7 @@ from typing import Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 
 plt.rcParams.update({
     "text.usetex": True,
@@ -26,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nonrobust", required=True, help="Path to nonrobust conformal_obstacles metrics .npz.")
     parser.add_argument("--output_dir", help="Directory to save plots.")
     parser.add_argument("--alpha", type=float, help="Alpha for performance error bars; defaults to robust alpha.")
+    parser.add_argument(
+        "--cap_nonrobust",
+        action="store_true",
+        help="If set, omit the nonrobust q_j curve from the radius plot and omit the nonrobust mismatch curve from the mismatch plot.",
+    )
     return parser.parse_args()
 
 
@@ -204,6 +210,7 @@ def main() -> None:
     plot_paths = {}
 
     # Radius + q_j
+    print(robust_radius)
     fig, ax = plt.subplots()
     ax.plot(x_radius, robust_radius, label="Robust $r_j$", color="tab:blue", marker="s")
     ax.plot(x_radius, naive_radius, label="Naive $r_j$", color="tab:orange", marker="s")
@@ -212,13 +219,20 @@ def main() -> None:
     ax.plot(x_radius, robust["qj"], label="Robust $q_j$", color="tab:blue", marker="x")
     ax.plot(x_radius, naive["qj"], label="Naive $q_j$", color="tab:orange", marker="x")
     ax.plot(x_radius, cal_once_qj, label="Calibrate-once $q_j$", color="tab:green", marker="x")
-    ax.plot(x_radius, nonrobust_qj, label="Nonrobust $q_j$", color="tab:red", marker="x")
+    if not args.cap_nonrobust:
+        ax.plot(x_radius, nonrobust_qj, label="Nonrobust $q_j$", color="tab:red", marker="x")
     ax.set_title(r"Radius Across Episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_radius_lim)
     ax.set_xticks(x_radius_ticks)
     ax.set_ylabel(r"Radius ($m$)")
-    ax.legend()
+    if args.cap_nonrobust:
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(Line2D([], [], color="tab:red", marker="x", label="Nonrobust $q_j$"))
+        labels.append("Nonrobust $q_j$")
+        ax.legend(handles=handles, labels=labels)
+    else:
+        ax.legend()
     path = os.path.join(output_dir, "radius_across_episodes.pdf")
     fig.savefig(path, bbox_inches="tight", format="pdf")
     plt.close(fig)
@@ -269,7 +283,13 @@ def main() -> None:
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("Frac. trajectories with min(h)<0")
     ax.set_ylim(0.0, 1.0)
-    ax.legend()
+    if args.cap_nonrobust:
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(Line2D([], [], color="tab:red", marker="v", label="Nonrobust mismatch"))
+        labels.append("Nonrobust mismatch")
+        ax.legend(handles=handles, labels=labels)
+    else:
+        ax.legend()
     path = os.path.join(output_dir, "h_violation_rate.pdf")
     fig.savefig(path, bbox_inches="tight", format="pdf")
     plt.close(fig)
@@ -319,15 +339,16 @@ def main() -> None:
         marker="o",
         capsize=4,
     )
-    ax.errorbar(
-        x_other,
-        nonrobust_mismatch[:-1],
-        yerr=np.vstack([nonrobust_mismatch_err_low[:-1], nonrobust_mismatch_err_high[:-1]]),
-        label="Nonrobust mismatch",
-        color="tab:red",
-        marker="v",
-        capsize=4,
-    )
+    if not args.cap_nonrobust:
+        ax.errorbar(
+            x_other,
+            nonrobust_mismatch[:-1],
+            yerr=np.vstack([nonrobust_mismatch_err_low[:-1], nonrobust_mismatch_err_high[:-1]]),
+            label="Nonrobust mismatch",
+            color="tab:red",
+            marker="v",
+            capsize=4,
+        )
     ax.errorbar(
         x_other,
         cal_once_mismatch,
@@ -342,7 +363,13 @@ def main() -> None:
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("Mismatch")
-    ax.legend()
+    if args.cap_nonrobust:
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(Line2D([], [], color="tab:red", marker="v", label="Nonrobust mismatch"))
+        labels.append("Nonrobust mismatch")
+        ax.legend(handles=handles, labels=labels)
+    else:
+        ax.legend()
     path = os.path.join(output_dir, "mismatch_across_episodes.pdf")
     fig.savefig(path, bbox_inches="tight", format="pdf")
     plt.close(fig)
