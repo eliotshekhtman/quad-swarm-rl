@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_boundary_collision", action="store_true", help="Move room boundaries far enough to effectively disable wall/ceiling/floor collisions.")
     parser.add_argument("--environment_geometry", default=None, help="Optional path to authoritative environment JSON with start/goal/obstacle geometry.")
     parser.add_argument("--use_downwash", action="store_true", help="Enable simulator downwash in the rollout environment.")
-    parser.add_argument("--spawn_ball_radius", type=float, default=0.0, help="Radius of the full 3D ball used to resample the initial quad position every trajectory.")
+    parser.add_argument("--spawn_ball_radius", type=float, default=1.0, help="Radius of the full 3D ball used to resample the initial quad position every trajectory.")
     parser.add_argument("--spawn_ball_max_tries", type=int, default=1000, help="Maximum number of spawn samples to try before failing.")
     parser.add_argument("--action_repeat", type=int, default=1, help="Hold each chosen filtered action for this many environment timesteps before recomputing it.")
     parser.add_argument("--use_repeated_linearization", action="store_true", help="Run a second ECBF QP solve after re-linearizing h^(4) around the first solution.")
@@ -126,10 +126,10 @@ def _serializable_environment_geometry(geometry: Dict[str, np.ndarray | float], 
     return {
         "start_point": np.asarray(geometry["start_point"], dtype=np.float64).tolist(),
         "goal_point": np.asarray(geometry["goal_point"], dtype=np.float64).tolist(),
-        "obstacle_radius": obstacle_radius,
+        "obstacles": np.asarray(geometry["obstacle_positions"], dtype=np.float64).tolist(),
+        "radius": obstacle_radius,
         "quad_radius": float(quad_radius),
         "cbf_obstacle_radius": cbf_radius,
-        "obstacle_positions": np.asarray(geometry["obstacle_positions"], dtype=np.float64).tolist(),
     }
 
 
@@ -461,7 +461,10 @@ def run_single_agent(
             actions = action_solo[None, :]
             obs_run, rewards, dones, infos = _step_env(env, actions)
             actual_next = _actual_state_from_env(env.unwrapped)
-            mismatch_state = float(np.linalg.norm(predicted_next - actual_next))
+            # TODO: integrate better
+            proj_posvel = np.array([1.0] * 6 + [0.0] * 12)
+            dt = env.unwrapped.control_dt
+            mismatch_state = float(np.linalg.norm(proj_posvel * (predicted_next - actual_next))) / dt
 
             pos, vel = extract_positions_velocities(env.unwrapped)
             solo_pos = pos[0]
@@ -635,13 +638,13 @@ def main() -> None:
             num_runs=args.num_trajectories,
             deterministic=args.deterministic,
             disable_boundary_collision=args.disable_boundary_collision,
-            environment_geometry=initial_geometry if args.environment_geometry is not None else None,
+            environment_geometry=initial_geometry,
             spawn_ball_radius=args.spawn_ball_radius,
             spawn_ball_max_tries=args.spawn_ball_max_tries,
             action_repeat=args.action_repeat,
         )
         qj = conformal_qj(cal_logs, alpha, args.episode_length)
-        new_r = np.clip(qj, 0.0, MAX_R)
+        new_r = np.clip(qj, 0, MAX_R)
         print("r_mismatch", r_mismatch, "qj", qj, "new_r_mismatch", new_r)
         r_mismatch = float(new_r)
         filter_fn = make_obstacle_cbf_filter(
@@ -662,7 +665,7 @@ def main() -> None:
             num_runs=args.num_eval_trajs,
             deterministic=args.deterministic,
             disable_boundary_collision=args.disable_boundary_collision,
-            environment_geometry=initial_geometry if args.environment_geometry is not None else None,
+            environment_geometry=initial_geometry,
             spawn_ball_radius=args.spawn_ball_radius,
             spawn_ball_max_tries=args.spawn_ball_max_tries,
             action_repeat=args.action_repeat,
