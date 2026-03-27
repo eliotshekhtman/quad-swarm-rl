@@ -37,7 +37,10 @@ class QuadrotorEnvMulti(gym.Env):
                  dynamics_randomize_every, dynamics_change, dyn_sampler_1,
                  sense_noise, init_random_state,
                  # Rendering
-                 render_mode='human'
+                 render_mode='human',
+                 # Simulation timing (optional, backward-compatible defaults)
+                 sim_freq=200.0,
+                 sim_steps=2,
                  ):
         super().__init__()
 
@@ -64,6 +67,7 @@ class QuadrotorEnvMulti(gym.Env):
                 dynamics_randomize_every=dynamics_randomize_every, dyn_sampler_1=dyn_sampler_1,
                 raw_control=raw_control, raw_control_zero_middle=raw_control_zero_middle, sense_noise=sense_noise,
                 init_random_state=init_random_state, obs_repr=obs_repr, ep_time=ep_time, room_dims=room_dims,
+                sim_freq=sim_freq, sim_steps=sim_steps,
                 use_numba=use_numba,
                 # Neighbor
                 num_agents=num_agents,
