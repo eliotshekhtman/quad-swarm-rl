@@ -83,6 +83,10 @@ def add_quadrotors_env_args(env, parser):
     # Aerodynamics
     # # Downwash
     p.add_argument('--quads_use_downwash', default=False, type=str2bool, help='Apply downwash or not')
+    p.add_argument('--quads_use_wind', default=False, type=str2bool, help='Apply spatially varying wind or not')
+    p.add_argument('--quads_wind_y_start', default=-2.0, type=float, help='Wind starts ramping in for y values above this threshold')
+    p.add_argument('--quads_wind_y_full', default=3.0, type=float, help='Wind reaches full strength for y values above this threshold')
+    p.add_argument('--quads_wind_accel_x', default=0.33, type=float, help='Maximum +x wind acceleration in m/s^2 once fully ramped in')
 
     # Numba Speed Up
     p.add_argument('--quads_use_numba', default=False, type=str2bool, help='Whether to use numba for jit or not')

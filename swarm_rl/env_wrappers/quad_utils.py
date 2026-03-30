@@ -65,6 +65,10 @@ def make_quadrotor_env_multi(cfg, render_mode=None, **kwargs):
 
         # Aerodynamics
         use_downwash=cfg.quads_use_downwash,
+        use_wind=getattr(cfg, "quads_use_wind", False),
+        wind_y_start=getattr(cfg, "quads_wind_y_start", -2.0),
+        wind_y_full=getattr(cfg, "quads_wind_y_full", 3.0),
+        wind_accel_x=getattr(cfg, "quads_wind_accel_x", 0.33),
         # Numba Speed Up
         use_numba=cfg.quads_use_numba,
         # Scenarios

@@ -29,7 +29,7 @@ class QuadrotorEnvMulti(gym.Env):
                  use_obstacles, obst_density, obst_size, obst_spawn_area,
 
                  # Aerodynamics, Numba Speed Up, Scenarios, Room, Replay Buffer, Rendering
-                 use_downwash, use_numba, quads_mode, room_dims, use_replay_buffer, quads_view_mode,
+                 use_downwash, use_wind, wind_y_start, wind_y_full, wind_accel_x, use_numba, quads_mode, room_dims, use_replay_buffer, quads_view_mode,
                  quads_render,
 
                  # Quadrotor Specific (Do Not Change)
@@ -183,6 +183,14 @@ class QuadrotorEnvMulti(gym.Env):
 
         # Aerodynamics
         self.use_downwash = use_downwash
+        self.use_wind = bool(use_wind)
+        self.wind_y_start = float(wind_y_start)
+        self.wind_y_full = float(wind_y_full)
+        self.wind_accel_x = float(wind_accel_x)
+        if self.wind_y_full <= self.wind_y_start:
+            raise ValueError('wind_y_full must be greater than wind_y_start')
+        if self.wind_accel_x < 0.0:
+            raise ValueError('wind_accel_x must be non-negative')
 
         # Rendering
         # # set to true whenever we need to reset the OpenGL scene in render()
@@ -289,6 +297,45 @@ class QuadrotorEnvMulti(gym.Env):
         """
         res = abs(np.mean(self.crashes_in_recent_episodes)) < 1 and len(self.crashes_in_recent_episodes) >= 10
         return res
+
+    def _wind_ramp(self, y):
+        if y <= self.wind_y_start:
+            return 0.0
+        if y >= self.wind_y_full:
+            return 1.0
+        s = (y - self.wind_y_start) / (self.wind_y_full - self.wind_y_start)
+        return s * s * (3.0 - 2.0 * s)
+
+    def _wind_accel_from_position(self, pos):
+        if (not self.use_wind) or self.wind_accel_x <= 0.0:
+            return np.zeros(3, dtype=np.float64)
+        ramp = self._wind_ramp(float(pos[1]))
+        return np.array([self.wind_accel_x * ramp, 0.0, 0.0], dtype=np.float64)
+
+    def _apply_wind_to_dynamics(self, quad_env):
+        drone_dyn = quad_env.dynamics
+        wind_acc = self._wind_accel_from_position(drone_dyn.pos)
+        if not np.any(wind_acc):
+            return False
+
+        inner_dt = float(quad_env.dt)
+        num_substeps = int(quad_env.sim_steps)
+        control_dt = inner_dt * num_substeps
+
+        # Match the simulator's explicit-Euler integration over `sim_steps` substeps.
+        pos_correction = wind_acc * (inner_dt ** 2) * (num_substeps * (num_substeps - 1) / 2.0)
+        vel_correction = wind_acc * control_dt
+
+        drone_dyn.pos = drone_dyn.pos + pos_correction
+        drone_dyn.vel = drone_dyn.vel + vel_correction
+        drone_dyn.acc = drone_dyn.acc + wind_acc
+        drone_dyn.accelerometer = np.matmul(drone_dyn.rot.T, drone_dyn.acc + [0, 0, drone_dyn.gravity])
+
+        pos_before_clip = drone_dyn.pos.copy()
+        drone_dyn.pos = np.clip(drone_dyn.pos, a_min=drone_dyn.room_box[0], a_max=drone_dyn.room_box[1])
+        drone_dyn.crashed_wall = drone_dyn.crashed_wall or (not np.array_equal(pos_before_clip[:2], drone_dyn.pos[:2]))
+        drone_dyn.crashed_ceiling = drone_dyn.crashed_ceiling or (pos_before_clip[2] > drone_dyn.pos[2])
+        return True
 
     def calculate_room_collision(self):
         floor_collisions = np.array([env.dynamics.crashed_floor for env in self.envs])
@@ -417,16 +464,21 @@ class QuadrotorEnvMulti(gym.Env):
     def step(self, actions):
         obs, rewards, dones, infos = [], [], [], []
 
+        wind_applied_any = False
         for i, a in enumerate(actions):
             self.envs[i].rew_coeff = self.rew_coeff
 
             observation, reward, done, info = self.envs[i].step(a)
+            if self._apply_wind_to_dynamics(self.envs[i]):
+                wind_applied_any = True
+                observation = self.envs[i].state_vector(self.envs[i])
             obs.append(observation)
             rewards.append(reward)
             dones.append(done)
             infos.append(info)
 
             self.pos[i, :] = self.envs[i].dynamics.pos
+            self.vel[i, :] = self.envs[i].dynamics.vel
 
         # 1. Calculate collisions: 1) between drones 2) with obstacles 3) with room
         # 1) Collisions between drones
@@ -550,7 +602,7 @@ class QuadrotorEnvMulti(gym.Env):
                 self.reached_goal[i] = True
 
         # 3. Applying random forces: 1) aerodynamics 2) between drones 3) obstacles 4) room
-        self_state_update_flag = False
+        self_state_update_flag = wind_applied_any
 
         # # 1) aerodynamics
         if self.use_downwash:
