@@ -61,6 +61,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_boundary_collision", action="store_true", help="Move room boundaries far enough to effectively disable wall/ceiling/floor collisions.")
     parser.add_argument("--environment_geometry", default=None, help="Optional path to authoritative environment JSON with start/goal/obstacle geometry.")
     parser.add_argument("--use_downwash", action="store_true", help="Enable simulator downwash in the rollout environment.")
+    parser.add_argument("--use_wind", action="store_true", help="Enable a spatial +x wind field in the rollout environment.")
+    parser.add_argument("--wind_y_start", type=float, default=-2.0, help="Wind is zero at and below this y coordinate.")
+    parser.add_argument("--wind_y_full", type=float, default=3.0, help="Wind reaches full strength at and above this y coordinate.")
+    parser.add_argument("--wind_accel_x", type=float, default=0.33, help="Maximum +x wind acceleration in m/s^2 once fully ramped in.")
     parser.add_argument("--spawn_ball_radius", type=float, default=1.0, help="Radius of the full 3D ball used to resample the initial quad position every trajectory.")
     parser.add_argument("--spawn_ball_max_tries", type=int, default=1000, help="Maximum number of spawn samples to try before failing.")
     parser.add_argument("--action_repeat", type=int, default=1, help="Hold each chosen filtered action for this many environment timesteps before recomputing it.")
@@ -555,6 +559,10 @@ def main() -> None:
         "--quads_collision_falloff_radius=5.0",
         "--quads_collision_smooth_max_penalty=12.0",
         f"--quads_use_downwash={args.use_downwash}",
+        f"--quads_use_wind={args.use_wind}",
+        f"--quads_wind_y_start={args.wind_y_start}",
+        f"--quads_wind_y_full={args.wind_y_full}",
+        f"--quads_wind_accel_x={args.wind_accel_x}",
         "--quads_use_numba=False",
         "--max_num_episodes=1",
         "--quads_render=True",

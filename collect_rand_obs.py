@@ -228,6 +228,17 @@ def _state_model_mismatch(action: np.ndarray, dynamics, dt: float) -> float:
     return float(np.linalg.norm(state_cbf - state_real))
 
 
+def _cbf_predicted_next_state(action: np.ndarray, dynamics, dt: float, steps: int = 2) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float64)
+    normalized = np.clip(0.5 * (action + 1.0), 0.0, 1.0)
+    return _pack_state_tuple(*cbf_dynamics(normalized, dynamics, dt, steps=steps))
+
+
+def _actual_state_from_env(env_unwrapped) -> np.ndarray:
+    dynamics = env_unwrapped.envs[0].dynamics
+    return _pack_state_tuple(dynamics.pos, dynamics.vel, dynamics.rot, dynamics.omega)
+
+
 def _reset_env(env) -> np.ndarray:
     reset_result = env.reset()
     if isinstance(reset_result, tuple):
@@ -380,6 +391,10 @@ def _build_eval_cfg(saved_args: Dict) -> "AttrDict":
         "--quads_collision_falloff_radius=5.0",
         "--quads_collision_smooth_max_penalty=12.0",
         f"--quads_use_downwash={bool(saved_args.get('use_downwash', False))}",
+        f"--quads_use_wind={bool(saved_args.get('use_wind', False))}",
+        f"--quads_wind_y_start={float(saved_args.get('wind_y_start', -2.0))}",
+        f"--quads_wind_y_full={float(saved_args.get('wind_y_full', 3.0))}",
+        f"--quads_wind_accel_x={float(saved_args.get('wind_accel_x', 0.33))}",
         "--quads_use_numba=False",
         "--max_num_episodes=1",
         "--quads_render=False",
@@ -474,14 +489,28 @@ def _run_obstacle_trajectory(
         filtered_norm = np.clip(0.5 * (filtered_action + 1.0), 0.0, 1.0)
         _, filtered_next_vel, _, _ = cbf_dynamics(filtered_norm, dynamics, dt)
         filtered_acc = (np.asarray(filtered_next_vel, dtype=np.float64) - current_vel) / dt
-        mismatch_state = _state_model_mismatch(
-            filtered_action,
-            dynamics,
-            dt,
-        )
+        wind_active = False
+        if bool(getattr(env.unwrapped, "use_wind", False)) and hasattr(env.unwrapped, "_wind_accel_from_position"):
+            wind_active = bool(np.any(np.asarray(env.unwrapped._wind_accel_from_position(dynamics.pos), dtype=np.float64)))
+        use_true_step_mismatch = wind_active
+        mismatch_state = None
+        if use_true_step_mismatch:
+            predicted_next = _cbf_predicted_next_state(
+                filtered_action,
+                dynamics,
+                dt,
+                steps=2,
+            )
+        else:
+            mismatch_state = _state_model_mismatch(filtered_action, dynamics, dt)
 
         actions = filtered_action[None, :]
         obs_run, rewards, dones, infos = _step_env(env, actions)
+
+        if use_true_step_mismatch:
+            actual_next = _actual_state_from_env(env.unwrapped)
+            proj_posvel = np.array([1.0] * 6 + [0.0] * 12)
+            mismatch_state = float(np.linalg.norm(proj_posvel * (predicted_next - actual_next))) / dt
 
         pos, vel = extract_positions_velocities(env.unwrapped)
         solo_pos = np.asarray(pos[0], dtype=np.float64)
@@ -548,8 +577,8 @@ def _run_obstacle_trajectory(
 
 def main() -> None:
     args = parse_args()
-    if not (0.0 < args.r_mismatch):
-        raise ValueError("--r_mismatch must be positive.")
+    if not (0.0 <= args.r_mismatch):
+        raise ValueError("--r_mismatch must be positive or zero.")
     if args.num_trajectories <= 0:
         raise ValueError("--num_trajectories must be positive.")
     if args.action_repeat <= 0:
