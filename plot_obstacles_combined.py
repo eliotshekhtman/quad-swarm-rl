@@ -8,12 +8,16 @@ from typing import Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.lines import Line2D
 
 plt.rcParams.update({
     "text.usetex": True,
     "font.family": "serif",
 })
+
+ROBUST_COLOR = "tab:blue"
+NAIVE_COLOR = "tab:orange"
+CALIBRATE_COLOR = "tab:green"
+NONROBUST_COLOR = "tab:red"
 
 ROBUST_INITIAL_RADIUS = 2.0
 NAIVE_INITIAL_RADIUS = 2.0
@@ -78,6 +82,22 @@ def pad_repeat(arr: np.ndarray, target_len: int) -> np.ndarray:
 def ensure_len(name: str, arr: np.ndarray, expected: int) -> None:
     if np.asarray(arr).shape[0] != expected:
         raise ValueError(f"{name} has length {np.asarray(arr).shape[0]}, expected {expected}.")
+
+
+def _ordered_legend(ax, entries):
+    handles = []
+    labels = []
+    for handle, label in entries:
+        if handle is not None:
+            handles.append(handle)
+            labels.append(label)
+    if handles:
+        ax.legend(handles, labels, loc="best")
+
+
+def _save_pdf(fig, path: str) -> None:
+    fig.savefig(path, bbox_inches="tight", format="pdf")
+    plt.close(fig)
 
 
 def compute_tube_coverage(mismatch_runs: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
@@ -210,42 +230,44 @@ def main() -> None:
     plot_paths = {}
 
     # Radius + q_j
-    print(robust_radius)
     fig, ax = plt.subplots()
-    ax.plot(x_radius, robust_radius, label="Robust $r_j$", color="tab:blue", marker="s")
-    ax.plot(x_radius, naive_radius, label="Naive $r_j$", color="tab:orange", marker="s")
-    ax.plot(x_radius, cal_once_radius, label="Calibrate-once $r_j$", color="tab:green", marker="s")
-    ax.plot(x_radius, nonrobust_radius, label="Nonrobust $r_j$", color="tab:red", marker="s")
-    ax.plot(x_radius, robust["qj"], label="Robust $q_j$", color="tab:blue", marker="x")
-    ax.plot(x_radius, naive["qj"], label="Naive $q_j$", color="tab:orange", marker="x")
-    ax.plot(x_radius, cal_once_qj, label="Calibrate-once $q_j$", color="tab:green", marker="x")
+    cal_r_handle = ax.plot(x_radius, cal_once_radius, color=CALIBRATE_COLOR, marker="s", zorder=1)[0]
+    nonrobust_r_handle = ax.plot(x_radius, nonrobust_radius, color=NONROBUST_COLOR, marker="s", zorder=2)[0]
+    naive_r_handle = ax.plot(x_radius, naive_radius, color=NAIVE_COLOR, marker="s", zorder=3)[0]
+    robust_r_handle = ax.plot(x_radius, robust_radius, color=ROBUST_COLOR, marker="s", zorder=4)[0]
+    robust_q_handle = ax.plot(x_radius, robust["qj"], color=ROBUST_COLOR, marker="x", zorder=4)[0]
+    ax.plot(x_radius, naive["qj"], color=NAIVE_COLOR, marker="x", zorder=3)
+    ax.plot(x_radius, cal_once_qj, color=CALIBRATE_COLOR, marker="x", zorder=1)
     if not args.cap_nonrobust:
-        ax.plot(x_radius, nonrobust_qj, label="Nonrobust $q_j$", color="tab:red", marker="x")
-    ax.set_title(r"Radius Across Episodes")
+        ax.plot(x_radius, nonrobust_qj, color=NONROBUST_COLOR, marker="x", zorder=2)
+    ax.set_title(r"$r_j$ and $q_j$ across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_radius_lim)
     ax.set_xticks(x_radius_ticks)
-    ax.set_ylabel(r"Radius ($m$)")
-    if args.cap_nonrobust:
-        handles, labels = ax.get_legend_handles_labels()
-        handles.append(Line2D([], [], color="tab:red", marker="x", label="Nonrobust $q_j$"))
-        labels.append("Nonrobust $q_j$")
-        ax.legend(handles=handles, labels=labels)
-    else:
-        ax.legend()
-    path = os.path.join(output_dir, "radius_across_episodes.pdf")
-    fig.savefig(path, bbox_inches="tight", format="pdf")
-    plt.close(fig)
+    ax.set_ylabel("")
+    _ordered_legend(
+        ax,
+        [
+            (robust_r_handle, r"Robust $r_j$"),
+            (naive_r_handle, r"Naive $r_j$"),
+            (cal_r_handle, r"Calibrate-once $r_j$"),
+            (nonrobust_r_handle, r"Nonrobust $r_j$"),
+            (robust_q_handle, r"Robust $q_j$"),
+        ],
+    )
+    path = os.path.join(output_dir, "rj_qj_across_episodes.pdf")
+    _save_pdf(fig, path)
     plot_paths["radius"] = path
 
     # Performance
     fig, ax = plt.subplots()
     perf_series = [
-        ("Robust performance", robust["cumulative_reward"], robust["cumulative_reward_runs"], "tab:blue", "s"),
-        ("Naive performance", naive["cumulative_reward"], naive["cumulative_reward_runs"], "tab:orange", "o"),
-        ("Calibrate-once performance", cal_once_performance, cal_once_performance_runs, "tab:green", "^"),
-        ("Nonrobust performance", nonrobust_reward, nonrobust_reward_runs, "tab:red", "v"),
+        ("Calibrate-once", cal_once_performance, cal_once_performance_runs, CALIBRATE_COLOR, "^"),
+        ("Nonrobust", nonrobust_reward, nonrobust_reward_runs, NONROBUST_COLOR, "v"),
+        ("Naive", naive["cumulative_reward"], naive["cumulative_reward_runs"], NAIVE_COLOR, "o"),
+        ("Robust", robust["cumulative_reward"], robust["cumulative_reward_runs"], ROBUST_COLOR, "s"),
     ]
+    perf_handles = {}
     for label, y, runs, color, marker in perf_series:
         if runs is not None:
             runs = np.asarray(runs)
@@ -255,61 +277,78 @@ def main() -> None:
             lower_plot = lower
             upper_plot = upper
             yerr = np.vstack([np.maximum(y_plot - lower_plot, 0), np.maximum(upper_plot - y_plot, 0)])
-            ax.errorbar(x_other, y_plot, yerr=yerr, label=label, color=color, marker=marker, capsize=4)
+            handle = ax.errorbar(x_other, y_plot, yerr=yerr, color=color, marker=marker, capsize=4)
+            perf_handles[label] = handle.lines[0]
         else:
             y_plot = y[:-1]
-            ax.plot(x_other, y_plot, label=label, color=color, marker=marker)
-    ax.set_title(r"Performance Across Episodes")
+            perf_handles[label] = ax.plot(x_other, y_plot, color=color, marker=marker)[0]
+    ax.set_title("Cumulative reward across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
-    ax.set_ylabel(r"Cumulative reward ($m$)")
-    ax.legend(loc="center right")
+    ax.set_ylabel("")
+    _ordered_legend(
+        ax,
+        [
+            (perf_handles.get("Robust"), "Robust"),
+            (perf_handles.get("Naive"), "Naive"),
+            (perf_handles.get("Calibrate-once"), "Calibrate-once"),
+            (perf_handles.get("Nonrobust"), "Nonrobust"),
+        ],
+    )
     path = os.path.join(output_dir, "performance_cumulative_reward.pdf")
-    fig.savefig(path, bbox_inches="tight", format="pdf")
-    plt.close(fig)
+    _save_pdf(fig, path)
     plot_paths["performance"] = path
 
     # H-value violation rate
     fig, ax = plt.subplots()
-    ax.axhline(target_alpha, linestyle=":", color="gray", label=r"Target $\alpha$")
-    ax.plot(x_other, robust["h_violation"][:-1], label="Robust h-violation", color="tab:blue", marker="s")
-    ax.plot(x_other, naive["h_violation"][:-1], label="Naive h-violation", color="tab:orange", marker="o")
-    ax.plot(x_other, cal_once_h_violation, label="Calibrate-once h-violation", color="tab:green", marker="^")
-    ax.plot(x_other, nonrobust_h_violation[:-1], label="Nonrobust h-violation", color="tab:red", marker="v")
-    ax.set_title("Trajectory H-Violation Rate")
+    reference_handle = ax.axhline(target_alpha, linestyle=":", color="gray")
+    cal_handle = ax.plot(x_other, cal_once_h_violation, color=CALIBRATE_COLOR, marker="^", zorder=1)[0]
+    nonrobust_handle = ax.plot(x_other, nonrobust_h_violation[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
+    naive_handle = ax.plot(x_other, naive["h_violation"][:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
+    robust_handle = ax.plot(x_other, robust["h_violation"][:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
+    ax.set_title(r"Fraction of trajectories with $\min(h) < 0$")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
-    ax.set_ylabel("Frac. trajectories with min(h)<0")
+    ax.set_ylabel("")
     ax.set_ylim(0.0, 1.0)
-    if args.cap_nonrobust:
-        handles, labels = ax.get_legend_handles_labels()
-        handles.append(Line2D([], [], color="tab:red", marker="v", label="Nonrobust mismatch"))
-        labels.append("Nonrobust mismatch")
-        ax.legend(handles=handles, labels=labels)
-    else:
-        ax.legend()
+    _ordered_legend(
+        ax,
+        [
+            (robust_handle, "Robust"),
+            (naive_handle, "Naive"),
+            (cal_handle, "Calibrate-once"),
+            (nonrobust_handle, "Nonrobust"),
+            (reference_handle, r"$\alpha$"),
+        ],
+    )
     path = os.path.join(output_dir, "h_violation_rate.pdf")
-    fig.savefig(path, bbox_inches="tight", format="pdf")
-    plt.close(fig)
+    _save_pdf(fig, path)
     plot_paths["h_violation"] = path
 
     # Crash rate
     fig, ax = plt.subplots()
-    ax.plot(x_other, robust["crashes"][:-1], label="Robust crash rate", color="tab:blue", marker="s")
-    ax.plot(x_other, naive["crashes"][:-1], label="Naive crash rate", color="tab:orange", marker="o")
-    ax.plot(x_other, cal_once_crashes, label="Calibrate-once crash rate", color="tab:green", marker="^")
-    ax.plot(x_other, nonrobust_crashes[:-1], label="Nonrobust crash rate", color="tab:red", marker="v")
-    ax.set_title("Crash Rate Across Episodes")
+    cal_handle = ax.plot(x_other, cal_once_crashes, color=CALIBRATE_COLOR, marker="^", zorder=1)[0]
+    nonrobust_handle = ax.plot(x_other, nonrobust_crashes[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
+    naive_handle = ax.plot(x_other, naive["crashes"][:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
+    robust_handle = ax.plot(x_other, robust["crashes"][:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
+    ax.set_title("Crash rate across episodes")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
-    ax.set_ylabel("Crash rate")
-    ax.legend()
+    ax.set_ylabel("")
+    _ordered_legend(
+        ax,
+        [
+            (robust_handle, "Robust"),
+            (naive_handle, "Naive"),
+            (cal_handle, "Calibrate-once"),
+            (nonrobust_handle, "Nonrobust"),
+        ],
+    )
     path = os.path.join(output_dir, "crash_rate.pdf")
-    fig.savefig(path, bbox_inches="tight", format="pdf")
-    plt.close(fig)
+    _save_pdf(fig, path)
     plot_paths["crash_rate"] = path
 
     # Mismatch
@@ -321,95 +360,113 @@ def main() -> None:
     nonrobust_mismatch_err_low = np.maximum(nonrobust_mismatch - nonrobust_mismatch_q10, 0.0)
     nonrobust_mismatch_err_high = np.maximum(nonrobust_mismatch_q90 - nonrobust_mismatch, 0.0)
 
-    ax.errorbar(
-        x_other,
-        robust["mismatch"][:-1],
-        yerr=np.vstack([robust_mismatch_err_low[:-1], robust_mismatch_err_high[:-1]]),
-        label="Robust mismatch",
-        color="tab:blue",
-        marker="s",
-        capsize=4,
-    )
-    ax.errorbar(
-        x_other,
-        naive["mismatch"][:-1],
-        yerr=np.vstack([naive_mismatch_err_low[:-1], naive_mismatch_err_high[:-1]]),
-        label="Naive mismatch",
-        color="tab:orange",
-        marker="o",
-        capsize=4,
-    )
-    if not args.cap_nonrobust:
-        ax.errorbar(
-            x_other,
-            nonrobust_mismatch[:-1],
-            yerr=np.vstack([nonrobust_mismatch_err_low[:-1], nonrobust_mismatch_err_high[:-1]]),
-            label="Nonrobust mismatch",
-            color="tab:red",
-            marker="v",
-            capsize=4,
-        )
-    ax.errorbar(
+    cal_handle = ax.errorbar(
         x_other,
         cal_once_mismatch,
         yerr=np.vstack([cal_once_mismatch_err_low, cal_once_mismatch_err_high]),
-        label="Calibrate-once mismatch",
-        color="tab:green",
+        color=CALIBRATE_COLOR,
         marker="^",
         capsize=4,
+        zorder=1,
     )
-    ax.set_title("Mismatch Across Episodes")
+    nonrobust_handle = None
+    if not args.cap_nonrobust:
+        nonrobust_handle = ax.errorbar(
+            x_other,
+            nonrobust_mismatch[:-1],
+            yerr=np.vstack([nonrobust_mismatch_err_low[:-1], nonrobust_mismatch_err_high[:-1]]),
+            color=NONROBUST_COLOR,
+            marker="v",
+            capsize=4,
+            zorder=2,
+        )
+    naive_handle = ax.errorbar(
+        x_other,
+        naive["mismatch"][:-1],
+        yerr=np.vstack([naive_mismatch_err_low[:-1], naive_mismatch_err_high[:-1]]),
+        color=NAIVE_COLOR,
+        marker="o",
+        capsize=4,
+        zorder=3,
+    )
+    robust_handle = ax.errorbar(
+        x_other,
+        robust["mismatch"][:-1],
+        yerr=np.vstack([robust_mismatch_err_low[:-1], robust_mismatch_err_high[:-1]]),
+        color=ROBUST_COLOR,
+        marker="s",
+        capsize=4,
+        zorder=4,
+    )
+    ax.set_title(r"$\max_t \|(\hat x,\hat v)_{t+1} - (x,v)_{t+1}\| / \Delta t$")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
-    ax.set_ylabel("Mismatch")
-    if args.cap_nonrobust:
-        handles, labels = ax.get_legend_handles_labels()
-        handles.append(Line2D([], [], color="tab:red", marker="v", label="Nonrobust mismatch"))
-        labels.append("Nonrobust mismatch")
-        ax.legend(handles=handles, labels=labels)
-    else:
-        ax.legend()
-    path = os.path.join(output_dir, "mismatch_across_episodes.pdf")
-    fig.savefig(path, bbox_inches="tight", format="pdf")
-    plt.close(fig)
+    ax.set_ylabel("")
+    _ordered_legend(
+        ax,
+        [
+            (robust_handle.lines[0], "Robust"),
+            (naive_handle.lines[0], "Naive"),
+            (cal_handle.lines[0], "Calibrate-once"),
+            (None if nonrobust_handle is None else nonrobust_handle.lines[0], "Nonrobust"),
+        ],
+    )
+    path = os.path.join(output_dir, "state_prediction_error_across_episodes.pdf")
+    _save_pdf(fig, path)
     plot_paths["mismatch"] = path
 
     # Tube coverage
     fig, ax = plt.subplots()
-    ax.axhline(1.0 - target_alpha, linestyle=":", color="gray", label=r"Target $1-\alpha$")
-    ax.plot(x_other, robust_coverage[:-1], label="Robust tube coverage", color="tab:blue", marker="s")
-    ax.plot(x_other, naive_coverage[:-1], label="Naive tube coverage", color="tab:orange", marker="o")
-    ax.plot(x_other, cal_once_coverage, label="Calibrate-once tube coverage", color="tab:green", marker="^")
-    ax.plot(x_other, nonrobust_coverage[:-1], label="Nonrobust tube coverage", color="tab:red", marker="v")
-    ax.set_title("Tube Coverage Across Episodes")
+    reference_handle = ax.axhline(1.0 - target_alpha, linestyle=":", color="gray")
+    cal_handle = ax.plot(x_other, cal_once_coverage, color=CALIBRATE_COLOR, marker="^", zorder=1)[0]
+    nonrobust_handle = ax.plot(x_other, nonrobust_coverage[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
+    naive_handle = ax.plot(x_other, naive_coverage[:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
+    robust_handle = ax.plot(x_other, robust_coverage[:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
+    ax.set_title("Tube coverage across episodes")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
-    ax.set_ylabel(r"Frac. trajectories with max mismatch $\leq r_j$")
+    ax.set_ylabel("")
     ax.set_ylim(0.0, 1.0)
-    ax.legend()
+    _ordered_legend(
+        ax,
+        [
+            (robust_handle, "Robust"),
+            (naive_handle, "Naive"),
+            (cal_handle, "Calibrate-once"),
+            (nonrobust_handle, "Nonrobust"),
+            (reference_handle, r"$1-\alpha$"),
+        ],
+    )
     path = os.path.join(output_dir, "tube_coverage_across_episodes.pdf")
-    fig.savefig(path, bbox_inches="tight", format="pdf")
-    plt.close(fig)
+    _save_pdf(fig, path)
     plot_paths["tube_coverage"] = path
 
     # Clearance
     fig, ax = plt.subplots()
-    ax.axhline(0.0, linestyle="--", color="gray", label="Collision boundary")
-    ax.plot(x_other, robust["clearance"][:-1], label="Robust clearance", color="tab:blue", marker="s")
-    ax.plot(x_other, naive["clearance"][:-1], label="Naive clearance", color="tab:orange", marker="o")
-    ax.plot(x_other, cal_once_clearance, label="Calibrate-once clearance", color="tab:green", marker="^")
-    ax.plot(x_other, nonrobust_clearance[:-1], label="Nonrobust clearance", color="tab:red", marker="v")
-    ax.set_title("Clearance Across Episodes")
+    reference_handle = ax.axhline(0.0, linestyle="--", color="gray")
+    cal_handle = ax.plot(x_other, cal_once_clearance, color=CALIBRATE_COLOR, marker="^", zorder=1)[0]
+    nonrobust_handle = ax.plot(x_other, nonrobust_clearance[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
+    naive_handle = ax.plot(x_other, naive["clearance"][:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
+    robust_handle = ax.plot(x_other, robust["clearance"][:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
+    ax.set_title("Clearance across episodes")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
-    ax.set_ylabel("Clearance (m)")
-    ax.legend()
+    ax.set_ylabel("")
+    _ordered_legend(
+        ax,
+        [
+            (robust_handle, "Robust"),
+            (naive_handle, "Naive"),
+            (cal_handle, "Calibrate-once"),
+            (nonrobust_handle, "Nonrobust"),
+            (reference_handle, "Collision boundary"),
+        ],
+    )
     path = os.path.join(output_dir, "clearance_across_episodes.pdf")
-    fig.savefig(path, bbox_inches="tight", format="pdf")
-    plt.close(fig)
+    _save_pdf(fig, path)
     plot_paths["clearance"] = path
 
     print(f"[plot_obstacles_combined] Loaded robust from {os.path.abspath(args.robust)}")

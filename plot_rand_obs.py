@@ -61,9 +61,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--color_by",
-        choices=("trajectory", "quad"),
+        choices=("trajectory", "quad", "safety", "mismatch"),
         default="trajectory",
-        help="Color trajectories by trajectory id or by quad id. In obstacle plots there is one quad, so quad coloring uses one shared color.",
+        help=(
+            "Color trajectories by trajectory id, by quad id, by minimum CBF clearance "
+            "(green=safe, red if h<0), or by maximum nominal/true dynamics mismatch."
+        ),
     )
     return parser.parse_args()
 
@@ -186,6 +189,7 @@ def _finite_xy_bounds(
     positions: np.ndarray,
     obstacle_positions: np.ndarray,
     obstacle_radius: float,
+    cbf_obstacle_radius: float | None,
     start_point: np.ndarray,
     goal_point: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -198,8 +202,9 @@ def _finite_xy_bounds(
 
     if obstacle_positions.size > 0:
         obst_xy = obstacle_positions[:, :2]
-        xy_points.append(obst_xy + obstacle_radius)
-        xy_points.append(obst_xy - obstacle_radius)
+        plot_radius = obstacle_radius if cbf_obstacle_radius is None else max(obstacle_radius, cbf_obstacle_radius)
+        xy_points.append(obst_xy + plot_radius)
+        xy_points.append(obst_xy - plot_radius)
 
     xy_points.append(np.asarray(start_point[:2], dtype=np.float64)[None, :])
     xy_points.append(np.asarray(goal_point[:2], dtype=np.float64)[None, :])
@@ -253,10 +258,98 @@ def _make_palette(count: int) -> np.ndarray:
     return plt.cm.plasma(np.linspace(0.0, 1.0, count))
 
 
-def _color_for_run(run_id: int, color_by: str, colors: np.ndarray) -> np.ndarray:
+def _lerp_rgba(start: np.ndarray, end: np.ndarray, weight: float) -> np.ndarray:
+    weight = float(np.clip(weight, 0.0, 1.0))
+    return (1.0 - weight) * start + weight * end
+
+
+def _trajectory_scalar_over_prefix(
+    values: np.ndarray,
+    trajectory_lengths: np.ndarray,
+    reducer,
+    name: str,
+) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError(f"{name} must have shape (num_trajectories, T).")
+    if arr.shape[0] != trajectory_lengths.shape[0]:
+        raise ValueError(f"{name} length must match number of trajectories.")
+    out = np.full(arr.shape[0], np.nan, dtype=np.float64)
+    for run_id in range(arr.shape[0]):
+        run_len = max(0, min(int(trajectory_lengths[run_id]), arr.shape[1]))
+        if run_len <= 0:
+            continue
+        out[run_id] = float(reducer(arr[run_id, :run_len]))
+    return out
+
+
+def _safety_run_colors(cbf_clearance: np.ndarray, trajectory_lengths: np.ndarray) -> np.ndarray:
+    green = np.array([0.172, 0.627, 0.172, 1.0], dtype=np.float64)
+    orange = np.array([1.0, 0.549, 0.0, 1.0], dtype=np.float64)
+    red = np.array([0.839, 0.153, 0.157, 1.0], dtype=np.float64)
+    min_clearance = _trajectory_scalar_over_prefix(
+        cbf_clearance,
+        trajectory_lengths,
+        np.min,
+        "cbf_clearance",
+    )
+    colors = np.tile(green, (trajectory_lengths.shape[0], 1))
+    for run_id, clearance in enumerate(min_clearance):
+        if not np.isfinite(clearance):
+            colors[run_id] = green
+        elif clearance < 0.0:
+            colors[run_id] = red
+        elif clearance >= 0.5:
+            colors[run_id] = green
+        else:
+            weight = float(np.clip(clearance / 0.5, 0.0, 1.0))
+            colors[run_id] = _lerp_rgba(orange, green, weight)
+    return colors
+
+
+def _mismatch_run_colors(model_mismatch_state: np.ndarray, trajectory_lengths: np.ndarray) -> np.ndarray:
+    green = np.array([0.172, 0.627, 0.172, 1.0], dtype=np.float64)
+    red = np.array([0.839, 0.153, 0.157, 1.0], dtype=np.float64)
+    max_mismatch = _trajectory_scalar_over_prefix(
+        model_mismatch_state,
+        trajectory_lengths,
+        np.max,
+        "model_mismatch_state",
+    )
+    finite_values = max_mismatch[np.isfinite(max_mismatch)]
+    if finite_values.size == 0:
+        return np.tile(green, (trajectory_lengths.shape[0], 1))
+    mismatch_scale = max(float(np.percentile(finite_values, 95.0)), 1e-12)
+    colors = np.tile(green, (trajectory_lengths.shape[0], 1))
+    for run_id, mismatch in enumerate(max_mismatch):
+        if not np.isfinite(mismatch):
+            colors[run_id] = green
+            continue
+        weight = float(np.clip(mismatch / mismatch_scale, 0.0, 1.0))
+        colors[run_id] = _lerp_rgba(green, red, weight)
+    return colors
+
+
+def _run_colors(
+    color_by: str,
+    num_runs: int,
+    trajectory_lengths: np.ndarray,
+    cbf_clearance: np.ndarray | None,
+    model_mismatch_state: np.ndarray | None,
+) -> np.ndarray:
     if color_by == "trajectory":
-        return colors[run_id % len(colors)]
-    return colors[0]
+        return _make_palette(num_runs)
+    if color_by == "quad":
+        return np.repeat(_make_palette(1), num_runs, axis=0)
+    if color_by == "safety":
+        if cbf_clearance is None:
+            raise ValueError("plot data is missing cbf_clearance required for --color_by safety.")
+        return _safety_run_colors(cbf_clearance, trajectory_lengths)
+    if color_by == "mismatch":
+        if model_mismatch_state is None:
+            raise ValueError("plot data is missing model_mismatch_state required for --color_by mismatch.")
+        return _mismatch_run_colors(model_mismatch_state, trajectory_lengths)
+    raise ValueError(f"Unsupported color_by mode: {color_by}")
 
 
 def _add_action_arrows_2d(
@@ -352,10 +445,19 @@ def _plot_2d(
     initial_positions: np.ndarray,
     nominal_accelerations: np.ndarray | None,
     filtered_accelerations: np.ndarray | None,
+    cbf_clearance: np.ndarray | None,
+    model_mismatch_state: np.ndarray | None,
+    cbf_obstacle_radius: float | None,
 ) -> None:
     num_runs = positions.shape[0]
     max_steps = positions.shape[1]
-    colors = _make_palette(num_runs if color_by == "trajectory" else 1)
+    run_colors = _run_colors(
+        color_by=color_by,
+        num_runs=num_runs,
+        trajectory_lengths=trajectory_lengths,
+        cbf_clearance=cbf_clearance,
+        model_mismatch_state=model_mismatch_state,
+    )
 
     fig, ax = plt.subplots(figsize=(9, 9))
 
@@ -365,6 +467,18 @@ def _plot_2d(
         y = obstacle_center[1] + obstacle_radius * np.sin(theta)
         ax.fill(x, y, color="0.75", alpha=0.9, zorder=1)
         ax.plot(x, y, color="0.35", linewidth=1.0, zorder=1)
+        if cbf_obstacle_radius is not None and cbf_obstacle_radius > obstacle_radius:
+            x_cbf = obstacle_center[0] + cbf_obstacle_radius * np.cos(theta)
+            y_cbf = obstacle_center[1] + cbf_obstacle_radius * np.sin(theta)
+            ax.plot(
+                x_cbf,
+                y_cbf,
+                color="tab:orange",
+                linestyle=":",
+                linewidth=1.4,
+                zorder=1,
+                label="CBF obstacle boundary" if np.allclose(obstacle_center, obstacle_positions[0]) else None,
+            )
 
     for run_id in range(num_runs):
         run_len = int(trajectory_lengths[run_id])
@@ -372,7 +486,7 @@ def _plot_2d(
         if run_len <= 0:
             continue
         traj = positions[run_id, :run_len, :]
-        color = _color_for_run(run_id, color_by, colors)
+        color = run_colors[run_id]
         ax.plot(traj[:, 0], traj[:, 1], linewidth=1.0, alpha=0.28, color=color, zorder=2)
         ax.scatter(traj[0, 0], traj[0, 1], s=10, alpha=0.45, color=color, zorder=3)
 
@@ -408,17 +522,6 @@ def _plot_2d(
         )
 
     ax.scatter(
-        start_point[0],
-        start_point[1],
-        s=90,
-        marker="o",
-        facecolor="white",
-        edgecolor="black",
-        linewidth=1.2,
-        zorder=4,
-        label="start",
-    )
-    ax.scatter(
         goal_point[0],
         goal_point[1],
         s=110,
@@ -434,6 +537,7 @@ def _plot_2d(
         positions=positions,
         obstacle_positions=obstacle_positions,
         obstacle_radius=obstacle_radius,
+        cbf_obstacle_radius=cbf_obstacle_radius,
         start_point=start_point,
         goal_point=goal_point,
     )
@@ -453,7 +557,7 @@ def _plot_2d(
     boundary_tag = "far boundaries" if disable_boundary_collision else "normal room"
     heading_tag = ", yaw-to-goal" if point_towards_goal else ""
     ax.set_title(
-        rf"Obstacle CBF trajectories ($r_{{mismatch}}={r_mismatch:.4g}$, seed={seed}, {boundary_tag}{heading_tag})"
+        rf"Obstacle CBF trajectories ($r={r_mismatch:.4g}$)"
     )
     ax.set_xlabel(r"$x$ (m)")
     ax.set_ylabel(r"$y$ (m)")
@@ -482,12 +586,20 @@ def _plot_3d(
     initial_positions: np.ndarray,
     nominal_accelerations: np.ndarray | None,
     filtered_accelerations: np.ndarray | None,
+    cbf_clearance: np.ndarray | None,
+    model_mismatch_state: np.ndarray | None,
 ) -> None:
     num_runs = positions.shape[0]
     max_steps = positions.shape[1]
     room_height = infer_room_height_from_collection(obstacle_positions)
     cylinder_z_min, cylinder_z_max = 0.0, room_height
-    colors = _make_palette(num_runs if color_by == "trajectory" else 1)
+    run_colors = _run_colors(
+        color_by=color_by,
+        num_runs=num_runs,
+        trajectory_lengths=trajectory_lengths,
+        cbf_clearance=cbf_clearance,
+        model_mismatch_state=model_mismatch_state,
+    )
 
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
@@ -498,7 +610,7 @@ def _plot_3d(
         if run_len <= 0:
             continue
         traj = positions[run_id, :run_len, :]
-        color = _color_for_run(run_id, color_by, colors)
+        color = run_colors[run_id]
         ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], color=color, alpha=0.12, linewidth=0.9)
 
     base_positions = _prediction_bases_from_rollout(positions, initial_positions)
@@ -530,7 +642,7 @@ def _plot_3d(
             arrow_length=arrow_length,
         )
 
-    ax.scatter([start_point[0]], [start_point[1]], [start_point[2]], color="tab:green", marker="o", s=30, label="Start")
+    ax.scatter([start_point[0]], [start_point[1]], [start_point[2]], color="tab:green", marker="o", s=30)
     ax.scatter([goal_point[0]], [goal_point[1]], [goal_point[2]], color="tab:blue", marker="*", s=60, label="Goal")
 
     for obs_idx, center in enumerate(obstacle_positions):
@@ -605,6 +717,9 @@ def main() -> None:
         point_towards_goal = bool(data.get("point_towards_goal", False))
         nominal_accelerations = data["nominal_accelerations"] if "nominal_accelerations" in data.files else None
         filtered_accelerations = data["filtered_accelerations"] if "filtered_accelerations" in data.files else None
+        cbf_clearance = data["cbf_clearance"] if "cbf_clearance" in data.files else None
+        model_mismatch_state = data["model_mismatch_state"] if "model_mismatch_state" in data.files else None
+        cbf_obstacle_radius = float(data["cbf_obstacle_radius"]) if "cbf_obstacle_radius" in data.files else None
 
     if positions.ndim != 3 or positions.shape[2] != 3:
         raise ValueError("positions must have shape (num_trajectories, T, 3).")
@@ -641,6 +756,9 @@ def main() -> None:
             initial_positions=initial_positions,
             nominal_accelerations=nominal_accelerations,
             filtered_accelerations=filtered_accelerations,
+            cbf_clearance=cbf_clearance,
+            model_mismatch_state=model_mismatch_state,
+            cbf_obstacle_radius=cbf_obstacle_radius,
         )
     else:
         _plot_3d(
@@ -662,6 +780,8 @@ def main() -> None:
             initial_positions=initial_positions,
             nominal_accelerations=nominal_accelerations,
             filtered_accelerations=filtered_accelerations,
+            cbf_clearance=cbf_clearance,
+            model_mismatch_state=model_mismatch_state,
         )
 
     print(f"[plot_rand_obs] Loaded {positions.shape[0]} trajectories from {data_path}")
