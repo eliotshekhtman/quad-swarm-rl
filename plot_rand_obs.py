@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
             "(green=safe, red if h<0), or by maximum nominal/true dynamics mismatch."
         ),
     )
+    parser.add_argument(
+        "--index",
+        type=str,
+        default=None,
+        help="Add an (index) in front of the title."
+    )
     return parser.parse_args()
 
 
@@ -448,6 +454,7 @@ def _plot_2d(
     cbf_clearance: np.ndarray | None,
     model_mismatch_state: np.ndarray | None,
     cbf_obstacle_radius: float | None,
+    index = None
 ) -> None:
     num_runs = positions.shape[0]
     max_steps = positions.shape[1]
@@ -556,9 +563,14 @@ def _plot_2d(
 
     boundary_tag = "far boundaries" if disable_boundary_collision else "normal room"
     heading_tag = ", yaw-to-goal" if point_towards_goal else ""
-    ax.set_title(
-        rf"Obstacle CBF trajectories ($r={r_mismatch:.4g}$)"
-    )
+    if index is None:
+        ax.set_title(
+            rf"Obstacle CBF trajectories ($r={r_mismatch:.4g}$)"
+        )
+    else:
+        ax.set_title(
+            rf"\bf ({index}) Obstacle CBF trajectories ($r={r_mismatch:.4g}$)"
+        )
     ax.set_xlabel(r"$x$ (m)")
     ax.set_ylabel(r"$y$ (m)")
     ax.legend(loc="best")
@@ -759,6 +771,7 @@ def main() -> None:
             cbf_clearance=cbf_clearance,
             model_mismatch_state=model_mismatch_state,
             cbf_obstacle_radius=cbf_obstacle_radius,
+            index=args.index
         )
     else:
         _plot_3d(

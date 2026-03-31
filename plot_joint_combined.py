@@ -230,7 +230,7 @@ def main() -> None:
     ax.plot(x_radius, cal_once_qj, color=CALIBRATE_COLOR, marker="x", zorder=1)
     if not args.cap_nonrobust:
         ax.plot(x_radius, nonrobust_qj, color=NONROBUST_COLOR, marker="x", zorder=2)
-    ax.set_title(r"$r_j$ and $q_j$ across episodes")
+    ax.set_title(r"\bf{(a)} $r_j$ and $q_j$ across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_radius_lim)
     ax.set_xticks(x_radius_ticks)
@@ -274,7 +274,7 @@ def main() -> None:
         else:
             y_plot = y[:-1]
             perf_handles[label] = ax.plot(x_other, y_plot, color=color, marker=marker)[0]
-    ax.set_title("Cumulative reward across episodes")
+    ax.set_title(r"\bf{(b)} Cumulative reward across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
@@ -301,7 +301,7 @@ def main() -> None:
     nonrobust_handle = ax.plot(x_other, 1 - nonrobust_h_violation[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
     naive_handle = ax.plot(x_other, 1 - naive["h_violation"][:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
     robust_handle = ax.plot(x_other, 1 - robust["h_violation"][:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
-    ax.set_title(r"Empirical safety coverage across episodes")
+    ax.set_title(r"\bf{(d)} Empirical safety coverage across episodes")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
@@ -423,7 +423,7 @@ def main() -> None:
     nonrobust_handle = ax.plot(x_other, nonrobust_coverage[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
     naive_handle = ax.plot(x_other, naive_coverage[:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
     robust_handle = ax.plot(x_other, robust_coverage[:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
-    ax.set_title("Empirical score coverage across episodes")
+    ax.set_title(r"\bf{(c)} Empirical score coverage across episodes")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
