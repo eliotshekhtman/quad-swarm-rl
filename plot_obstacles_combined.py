@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nonrobust", required=True, help="Path to nonrobust conformal_obstacles metrics .npz.")
     parser.add_argument("--output_dir", help="Directory to save plots.")
     parser.add_argument("--alpha", type=float, help="Alpha for performance error bars; defaults to robust alpha.")
+    parser.add_argument("--grid", action="store_true", help="Show grid lines on plots.")
     parser.add_argument(
         "--cap_nonrobust",
         action="store_true",
@@ -245,6 +246,8 @@ def main() -> None:
     ax.set_xlim(*x_radius_lim)
     ax.set_xticks(x_radius_ticks)
     ax.set_ylabel("")
+    if args.grid:
+        ax.grid(True, alpha=0.3)
     _ordered_legend(
         ax,
         [
@@ -287,6 +290,8 @@ def main() -> None:
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("")
+    if args.grid:
+        ax.grid(True, alpha=0.3)
     _ordered_legend(
         ax,
         [
@@ -300,19 +305,21 @@ def main() -> None:
     _save_pdf(fig, path)
     plot_paths["performance"] = path
 
-    # H-value violation rate
+    # Safety coverage rate
     fig, ax = plt.subplots()
-    reference_handle = ax.axhline(target_alpha, linestyle=":", color="gray")
-    cal_handle = ax.plot(x_other, cal_once_h_violation, color=CALIBRATE_COLOR, marker="^", zorder=1)[0]
-    nonrobust_handle = ax.plot(x_other, nonrobust_h_violation[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
-    naive_handle = ax.plot(x_other, naive["h_violation"][:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
-    robust_handle = ax.plot(x_other, robust["h_violation"][:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
-    ax.set_title(r"Fraction of trajectories with $\min(h) < 0$")
+    reference_handle = ax.axhline(1 - target_alpha, linestyle=":", color="gray")
+    cal_handle = ax.plot(x_other, 1 - cal_once_h_violation, color=CALIBRATE_COLOR, marker="^", zorder=1)[0]
+    nonrobust_handle = ax.plot(x_other, 1 - nonrobust_h_violation[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
+    naive_handle = ax.plot(x_other, 1 - naive["h_violation"][:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
+    robust_handle = ax.plot(x_other, 1 - robust["h_violation"][:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
+    ax.set_title(r"Empirical safety coverage across episodes")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("")
     ax.set_ylim(0.0, 1.0)
+    if args.grid:
+        ax.grid(True, alpha=0.3)
     _ordered_legend(
         ax,
         [
@@ -320,12 +327,12 @@ def main() -> None:
             (naive_handle, "Naive"),
             (cal_handle, "Calibrate-once"),
             (nonrobust_handle, "Nonrobust"),
-            (reference_handle, r"$\alpha$"),
+            (reference_handle, r"$1 - \alpha$"),
         ],
     )
-    path = os.path.join(output_dir, "h_violation_rate.pdf")
+    path = os.path.join(output_dir, "safety_coverage_across_episodes.pdf")
     _save_pdf(fig, path)
-    plot_paths["h_violation"] = path
+    plot_paths["safety_coverage"] = path
 
     # Crash rate
     fig, ax = plt.subplots()
@@ -338,6 +345,8 @@ def main() -> None:
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("")
+    if args.grid:
+        ax.grid(True, alpha=0.3)
     _ordered_legend(
         ax,
         [
@@ -403,6 +412,8 @@ def main() -> None:
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("")
+    if args.grid:
+        ax.grid(True, alpha=0.3)
     _ordered_legend(
         ax,
         [
@@ -416,19 +427,21 @@ def main() -> None:
     _save_pdf(fig, path)
     plot_paths["mismatch"] = path
 
-    # Tube coverage
+    # Score coverage
     fig, ax = plt.subplots()
     reference_handle = ax.axhline(1.0 - target_alpha, linestyle=":", color="gray")
     cal_handle = ax.plot(x_other, cal_once_coverage, color=CALIBRATE_COLOR, marker="^", zorder=1)[0]
     nonrobust_handle = ax.plot(x_other, nonrobust_coverage[:-1], color=NONROBUST_COLOR, marker="v", zorder=2)[0]
     naive_handle = ax.plot(x_other, naive_coverage[:-1], color=NAIVE_COLOR, marker="o", zorder=3)[0]
     robust_handle = ax.plot(x_other, robust_coverage[:-1], color=ROBUST_COLOR, marker="s", zorder=4)[0]
-    ax.set_title("Tube coverage across episodes")
+    ax.set_title("Empirical score coverage across episodes")
     ax.set_xlabel("Episode (j)")
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("")
     ax.set_ylim(0.0, 1.0)
+    if args.grid:
+        ax.grid(True, alpha=0.3)
     _ordered_legend(
         ax,
         [
@@ -439,9 +452,9 @@ def main() -> None:
             (reference_handle, r"$1-\alpha$"),
         ],
     )
-    path = os.path.join(output_dir, "tube_coverage_across_episodes.pdf")
+    path = os.path.join(output_dir, "score_coverage_across_episodes.pdf")
     _save_pdf(fig, path)
-    plot_paths["tube_coverage"] = path
+    plot_paths["score_coverage"] = path
 
     # Clearance
     fig, ax = plt.subplots()
@@ -455,6 +468,8 @@ def main() -> None:
     ax.set_xlim(*x_other_lim)
     ax.set_xticks(x_other_ticks)
     ax.set_ylabel("")
+    if args.grid:
+        ax.grid(True, alpha=0.3)
     _ordered_legend(
         ax,
         [
