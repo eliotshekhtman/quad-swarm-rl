@@ -185,6 +185,9 @@ class QuadrotorEnvMulti(gym.Env):
         self.render_mode =render_mode
         self.quads_render = quads_render
         self.scenes = []
+        self.render_bubble_radius = 0.0
+        self.render_bubble_rgba = (0.0, 1.0, 0.0, 0.18)
+        self.render_bubble_positions = None
         if self.quads_render:
             self.reset_scene = False
             self.simulation_start_time = 0
@@ -333,7 +336,10 @@ class QuadrotorEnvMulti(gym.Env):
                 room_dims=self.room_dims, num_agents=self.num_agents,
                 render_speed=self.render_speed, formation_size=self.quads_formation_size, obstacles=self.obstacles,
                 vis_vel_arrows=False, vis_acc_arrows=True, viz_traces=25, viz_trace_nth_step=1,
-                num_obstacles=self.num_obstacles, scene_index=i
+                num_obstacles=self.num_obstacles, scene_index=i,
+                bubble_radius=self.render_bubble_radius,
+                bubble_rgba=self.render_bubble_rgba,
+                bubble_positions=self.render_bubble_positions,
             ))
 
     def reset(self, obst_density=None, obst_size=None):
@@ -725,6 +731,7 @@ class QuadrotorEnvMulti(gym.Env):
 
     def render(self, verbose=False):
         models = tuple(e.dynamics.model for e in self.envs)
+        rgb_array_mode = self.render_mode == "rgb_array"
 
         if len(self.scenes) == 0:
             self.init_scene_multi()
@@ -748,7 +755,7 @@ class QuadrotorEnvMulti(gym.Env):
                 self.scenes[i].formation_size = self.scenario.formation_size
         self.frames_since_last_render += 1
 
-        if self.render_skip_frames > 0:
+        if (not rgb_array_mode) and self.render_skip_frames > 0:
             self.render_skip_frames -= 1
             return None
 
@@ -765,6 +772,17 @@ class QuadrotorEnvMulti(gym.Env):
         frames = []
         first_spawn = None
         for i in range(len(self.scenes)):
+            self.scenes[i].bubble_radius = float(self.render_bubble_radius)
+            bubble_rgba = self.render_bubble_rgba
+            if isinstance(bubble_rgba, np.ndarray):
+                self.scenes[i].bubble_rgba = np.asarray(bubble_rgba, dtype=np.float64).copy()
+            else:
+                self.scenes[i].bubble_rgba = tuple(float(x) for x in bubble_rgba)
+            bubble_positions = self.render_bubble_positions
+            if bubble_positions is None:
+                self.scenes[i].bubble_positions = None
+            else:
+                self.scenes[i].bubble_positions = np.asarray(bubble_positions, dtype=np.float64).copy()
             frame, first_spawn = self.scenes[i].render_chase(all_dynamics=self.all_dynamics(), goals=goals,
                                                              collisions=self.all_collisions,
                                                              mode=self.render_mode, obstacles=self.obstacles,
@@ -787,23 +805,27 @@ class QuadrotorEnvMulti(gym.Env):
         if self.render_mode == "human" and time_to_sleep > 0:
             time.sleep(time_to_sleep)
 
-        if simulation_time + render_time > desired_time_between_frames:
-            self.render_every_nth_frame += 1
-            if verbose:
-                print(f"Last render + simulation time {render_time + simulation_time:.3f}")
-                print(f"Rendering does not keep up, rendering every {self.render_every_nth_frame} frames")
-        elif simulation_time + render_time < realtime_control_period * (
-                self.frames_since_last_render - 1) / self.render_speed:
-            self.render_every_nth_frame -= 1
-            if verbose:
-                print(f"We can increase rendering framerate, rendering every {self.render_every_nth_frame} frames")
+        if rgb_array_mode:
+            self.render_every_nth_frame = 1
+            self.render_skip_frames = 0
+        else:
+            if simulation_time + render_time > desired_time_between_frames:
+                self.render_every_nth_frame += 1
+                if verbose:
+                    print(f"Last render + simulation time {render_time + simulation_time:.3f}")
+                    print(f"Rendering does not keep up, rendering every {self.render_every_nth_frame} frames")
+            elif simulation_time + render_time < realtime_control_period * (
+                    self.frames_since_last_render - 1) / self.render_speed:
+                self.render_every_nth_frame -= 1
+                if verbose:
+                    print(f"We can increase rendering framerate, rendering every {self.render_every_nth_frame} frames")
 
-        if self.render_every_nth_frame > 5:
-            self.render_every_nth_frame = 5
-            if self.envs[0].tick % 20 == 0:
-                print(f"Rendering cannot keep up! Rendering every {self.render_every_nth_frame} frames")
+            if self.render_every_nth_frame > 5:
+                self.render_every_nth_frame = 5
+                if self.envs[0].tick % 20 == 0:
+                    print(f"Rendering cannot keep up! Rendering every {self.render_every_nth_frame} frames")
 
-        self.render_skip_frames = self.render_every_nth_frame - 1
+            self.render_skip_frames = self.render_every_nth_frame - 1
         self.frames_since_last_render = 0
 
         self.simulation_start_time = time.time()
