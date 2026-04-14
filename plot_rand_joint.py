@@ -43,7 +43,21 @@ def parse_args() -> argparse.Namespace:
             "(green=safe, red if h<0), or by maximum nominal/true dynamics mismatch."
         ),
     )
+    parser.add_argument("--title_fontsize", type=float, default=12.0, help="Font size for plot titles.")
+    parser.add_argument("--legend_fontsize", type=float, default=10.0, help="Font size for legend text.")
+    parser.add_argument("--other_fontsize", type=float, default=10.0, help="Font size for axis labels and tick labels.")
     return parser.parse_args()
+
+
+def _apply_font_sizes(other_fontsize: float, title_fontsize: float, legend_fontsize: float) -> None:
+    plt.rcParams.update({
+        "font.size": other_fontsize,
+        "axes.labelsize": other_fontsize,
+        "xtick.labelsize": other_fontsize,
+        "ytick.labelsize": other_fontsize,
+        "axes.titlesize": title_fontsize,
+        "legend.fontsize": legend_fontsize,
+    })
 
 
 def _finite_bounds(positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -198,6 +212,7 @@ def _run_colors(
 
 def main() -> None:
     args = parse_args()
+    _apply_font_sizes(args.other_fontsize, args.title_fontsize, args.legend_fontsize)
     data_path = os.path.abspath(args.plot_data)
     with np.load(data_path) as data:
         positions = data["positions"]
@@ -273,6 +288,9 @@ def main() -> None:
     ax.set_xlabel(r"$x$ (m)")
     ax.set_ylabel(r"$y$ (m)")
     ax.set_zlabel(r"$z$ (m)")
+    ax.tick_params(axis="x", labelsize=args.other_fontsize)
+    ax.tick_params(axis="y", labelsize=args.other_fontsize)
+    ax.zaxis.set_tick_params(labelsize=args.other_fontsize)
 
     fig.savefig(output_path, bbox_inches="tight", format="pdf")
     plt.close(fig)

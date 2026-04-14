@@ -74,7 +74,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Add an (index) in front of the title."
     )
+    parser.add_argument("--title_fontsize", type=float, default=12.0, help="Font size for plot titles.")
+    parser.add_argument("--legend_fontsize", type=float, default=10.0, help="Font size for legend text.")
+    parser.add_argument("--other_fontsize", type=float, default=10.0, help="Font size for axis labels and tick labels.")
     return parser.parse_args()
+
+
+def _apply_font_sizes(other_fontsize: float, title_fontsize: float, legend_fontsize: float) -> None:
+    plt.rcParams.update({
+        "font.size": other_fontsize,
+        "axes.labelsize": other_fontsize,
+        "xtick.labelsize": other_fontsize,
+        "ytick.labelsize": other_fontsize,
+        "axes.titlesize": title_fontsize,
+        "legend.fontsize": legend_fontsize,
+    })
 
 
 def draw_vertical_cylinder(
@@ -454,7 +468,8 @@ def _plot_2d(
     cbf_clearance: np.ndarray | None,
     model_mismatch_state: np.ndarray | None,
     cbf_obstacle_radius: float | None,
-    index = None
+    index=None,
+    other_fontsize: float = 10.0,
 ) -> None:
     num_runs = positions.shape[0]
     max_steps = positions.shape[1]
@@ -540,25 +555,12 @@ def _plot_2d(
         label="goal",
     )
 
-    min_xy, max_xy = _finite_xy_bounds(
-        positions=positions,
-        obstacle_positions=obstacle_positions,
-        obstacle_radius=obstacle_radius,
-        cbf_obstacle_radius=cbf_obstacle_radius,
-        start_point=start_point,
-        goal_point=goal_point,
-    )
-    if np.all(np.isclose(min_xy, max_xy)):
-        margin = 1.0
-        min_xy = min_xy - margin
-        max_xy = max_xy + margin
-
-    center = 0.5 * (min_xy + max_xy)
-    half_range = 0.5 * np.max(max_xy - min_xy)
-    half_range = max(half_range, 1.0)
-    margin = 0.08 * (2.0 * half_range)
-    ax.set_xlim(center[0] - half_range - margin, center[0] + half_range + margin)
-    ax.set_ylim(center[1] - half_range - margin, center[1] + half_range + margin)
+    ax.set_xlim(-6.0, 9.0)
+    ax.set_ylim(-10.0, 5.0)
+    ax.set_xticks(np.arange(-6, 10, 1))
+    ax.set_yticks(np.arange(-10, 6, 1))
+    ax.set_axisbelow(True)
+    ax.grid(True, which="major", alpha=0.3)
     ax.set_aspect("equal", adjustable="box")
 
     boundary_tag = "far boundaries" if disable_boundary_collision else "normal room"
@@ -573,6 +575,8 @@ def _plot_2d(
         )
     ax.set_xlabel(r"$x$ (m)")
     ax.set_ylabel(r"$y$ (m)")
+    ax.tick_params(axis="x", labelsize=other_fontsize)
+    ax.tick_params(axis="y", labelsize=other_fontsize)
     ax.legend(loc="best")
 
     fig.savefig(output_path, bbox_inches="tight", format="pdf")
@@ -600,6 +604,7 @@ def _plot_3d(
     filtered_accelerations: np.ndarray | None,
     cbf_clearance: np.ndarray | None,
     model_mismatch_state: np.ndarray | None,
+    other_fontsize: float = 10.0,
 ) -> None:
     num_runs = positions.shape[0]
     max_steps = positions.shape[1]
@@ -706,6 +711,9 @@ def _plot_3d(
     ax.set_xlabel(r"$x$ (m)")
     ax.set_ylabel(r"$y$ (m)")
     ax.set_zlabel(r"$z$ (m)")
+    ax.tick_params(axis="x", labelsize=other_fontsize)
+    ax.tick_params(axis="y", labelsize=other_fontsize)
+    ax.zaxis.set_tick_params(labelsize=other_fontsize)
     ax.legend()
 
     fig.savefig(output_path, bbox_inches="tight", format="pdf")
@@ -714,6 +722,7 @@ def _plot_3d(
 
 def main() -> None:
     args = parse_args()
+    _apply_font_sizes(args.other_fontsize, args.title_fontsize, args.legend_fontsize)
     data_path = os.path.abspath(args.plot_data)
     with np.load(data_path) as data:
         positions = data["positions"]
@@ -771,7 +780,8 @@ def main() -> None:
             cbf_clearance=cbf_clearance,
             model_mismatch_state=model_mismatch_state,
             cbf_obstacle_radius=cbf_obstacle_radius,
-            index=args.index
+            index=args.index,
+            other_fontsize=args.other_fontsize,
         )
     else:
         _plot_3d(
@@ -795,6 +805,7 @@ def main() -> None:
             filtered_accelerations=filtered_accelerations,
             cbf_clearance=cbf_clearance,
             model_mismatch_state=model_mismatch_state,
+            other_fontsize=args.other_fontsize,
         )
 
     print(f"[plot_rand_obs] Loaded {positions.shape[0]} trajectories from {data_path}")

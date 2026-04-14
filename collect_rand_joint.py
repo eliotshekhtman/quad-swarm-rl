@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from typing import Dict, List
 
 import numpy as np
@@ -14,7 +15,9 @@ from tqdm import tqdm
 
 from sample_factory.algo.utils.action_distributions import argmax_actions
 from sample_factory.algo.utils.rl_utils import prepare_and_normalize_obs
+from sample_factory.huggingface.huggingface_utils import generate_replay_video
 from sample_factory.model.model_utils import get_rnn_size
+from sample_factory.utils.attr_dict import AttrDict
 
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
@@ -31,6 +34,7 @@ from project_utils.utils import OBS_KEY, load_actor, load_cfg, latest_checkpoint
 
 DEVICE = torch.device("cpu")
 COLLISION_FAR_DISTANCE = 10000.0
+DEFAULT_BUBBLE_RGBA = (0.0, 1.0, 0.0, 0.18)
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +83,28 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1000,
         help="Maximum number of pairwise-valid joint spawn-ball attempts before failing.",
+    )
+    parser.add_argument(
+        "--video_name",
+        default=None,
+        help="Optional mp4 output path/name prefix. When provided, record every collected trajectory as separate videos.",
+    )
+    parser.add_argument(
+        "--video_fps",
+        type=int,
+        default=30,
+        help="Frames per second for the optional trajectory video.",
+    )
+    parser.add_argument(
+        "--video_trajectory_idx",
+        type=int,
+        default=0,
+        help="Trajectory index to record when --video_name is set. Use -1 to record all collected trajectories.",
+    )
+    parser.add_argument(
+        "--video_view_mode",
+        default="topdown",
+        help="Viewer mode for the optional trajectory video.",
     )
     return parser.parse_args()
 
@@ -433,6 +459,8 @@ def _run_joint_trajectory(
     max_steps: int,
     deterministic: bool,
     disable_boundary_collision: bool,
+    record_video: bool = False,
+    video_frames: List[np.ndarray] | None = None,
 ):
     if disable_boundary_collision:
         _configure_far_boundary_geometry(env.unwrapped)
@@ -460,6 +488,10 @@ def _run_joint_trajectory(
 
     initial_positions, _ = extract_positions_velocities(env.unwrapped)
     initial_goals = np.asarray(goals, dtype=np.float64).copy()
+    if record_video:
+        if video_frames is None:
+            raise ValueError("record_video=True requires video_frames")
+        _append_video_frame(env, video_frames)
 
     run_logs: Dict[str, List[np.ndarray]] = {
         "positions": [],
@@ -516,6 +548,9 @@ def _run_joint_trajectory(
             if goal_changed:
                 goals[agent_id] = np.asarray(target, dtype=np.float64).copy()
 
+        if record_video:
+            _append_video_frame(env, video_frames)
+
         run_logs["positions"].append(pos.copy())
         run_logs["velocities"].append(vel.copy())
         run_logs["goal_dist"].append(np.asarray(step_goal_dist, dtype=np.float64))
@@ -548,7 +583,7 @@ def _run_joint_trajectory(
     }
 
 
-def _build_eval_cfg(num_agents: int, use_downwash: bool) -> "AttrDict":
+def _build_eval_cfg(num_agents: int, use_downwash: bool, enable_render: bool, view_mode: str) -> "AttrDict":
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
@@ -564,9 +599,95 @@ def _build_eval_cfg(num_agents: int, use_downwash: bool) -> "AttrDict":
         f"--quads_use_downwash={bool(use_downwash)}",
         "--quads_use_numba=False",
         "--max_num_episodes=1",
-        "--quads_render=False",
+        f"--quads_render={bool(enable_render)}",
+        f"--quads_view_mode={view_mode}",
     ]
     return parse_swarm_cfg(eval_cli, evaluation=True)
+
+
+def _resolve_video_output(video_name: str | None, output_path: str) -> tuple[str, str] | None:
+    if not video_name:
+        return None
+    if os.path.isabs(video_name):
+        video_dir = os.path.dirname(video_name) or "."
+        video_file = os.path.basename(video_name)
+    else:
+        output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+        video_dir = output_dir
+        video_file = video_name
+    os.makedirs(video_dir, exist_ok=True)
+    return video_dir, video_file
+
+
+def _trajectory_video_path(
+    video_target: tuple[str, str],
+    traj_idx: int,
+    num_trajectories: int,
+    record_all_trajectories: bool,
+) -> str:
+    video_dir, video_file = video_target
+    if (not record_all_trajectories) or num_trajectories <= 1:
+        return os.path.abspath(os.path.join(video_dir, video_file))
+
+    stem, ext = os.path.splitext(video_file)
+    if ext == "":
+        ext = ".mp4"
+    digits = max(3, len(str(max(0, num_trajectories - 1))))
+    suffixed = f"{stem}_traj{traj_idx:0{digits}d}{ext}"
+    return os.path.abspath(os.path.join(video_dir, suffixed))
+
+
+def _append_video_frame(env, video_frames: List[np.ndarray]) -> None:
+    try:
+        frame = env.render()
+    except Exception as exc:
+        raise RuntimeError(
+            "collect_rand_joint video capture must use the normal simulator renderer, "
+            "but env.render() failed. Start an X display (for example XLaunch) and make "
+            "sure DISPLAY is set before running video capture."
+        ) from exc
+
+    if frame is None:
+        raise RuntimeError("collect_rand_joint expected an rgb_array frame, but env.render() returned None.")
+
+    video_frames.append(frame.copy())
+
+
+def _save_video_frames(video_path: str, video_frames: List[np.ndarray], fps: int) -> None:
+    if len(video_frames) == 0:
+        raise ValueError("No video frames to save")
+
+    if shutil.which("ffmpeg") is not None:
+        video_dir = os.path.dirname(video_path) or "."
+        video_file = os.path.basename(video_path)
+        video_cfg = AttrDict(video_name=video_file)
+        generate_replay_video(video_dir, video_frames, fps, video_cfg)
+        return
+
+    import cv2
+
+    first = np.asarray(video_frames[0])
+    if first.ndim != 3 or first.shape[2] != 3:
+        raise ValueError(f"Expected frames with shape (H, W, 3), got {first.shape}")
+
+    height, width = first.shape[:2]
+    writer = cv2.VideoWriter(
+        video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {video_path}")
+
+    try:
+        for frame in video_frames:
+            frame_arr = np.asarray(frame, dtype=np.uint8)
+            if frame_arr.shape[:2] != (height, width):
+                raise ValueError("All video frames must have the same resolution")
+            writer.write(cv2.cvtColor(frame_arr, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
 
 
 def main() -> None:
@@ -577,6 +698,10 @@ def main() -> None:
         raise ValueError("--spawn_ball_radius must be non-negative.")
     if args.spawn_ball_max_tries <= 0:
         raise ValueError("--spawn_ball_max_tries must be positive.")
+    if args.video_fps <= 0:
+        raise ValueError("--video_fps must be positive.")
+    if args.video_trajectory_idx < -1:
+        raise ValueError("--video_trajectory_idx must be >= -1.")
 
     conf_args = _load_conformal_joint_args(args.conformal_joint_args)
 
@@ -603,8 +728,28 @@ def main() -> None:
     cfg_path = os.path.abspath(args.conformal_joint_args)
     print(f"[collect_rand_joint] Loading conformal config from {cfg_path}")
 
-    eval_cfg = _build_eval_cfg(num_agents=num_agents, use_downwash=use_downwash)
-    env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=None)
+    record_video = args.video_name is not None
+    video_target = _resolve_video_output(args.video_name, args.output_path)
+    bubble_radius = separation_radius / 2.0
+    record_all_trajectories = record_video and args.video_trajectory_idx == -1
+    if record_video:
+        if record_all_trajectories:
+            print("[collect_rand_joint] Recording videos for all collected trajectories.")
+        else:
+            if args.video_trajectory_idx >= args.num_trajectories:
+                raise ValueError("--video_trajectory_idx must be smaller than --num_trajectories, or -1 for all.")
+            print(f"[collect_rand_joint] Recording only trajectory {args.video_trajectory_idx}.")
+
+    eval_cfg = _build_eval_cfg(
+        num_agents=num_agents,
+        use_downwash=use_downwash,
+        enable_render=record_video,
+        view_mode=args.video_view_mode,
+    )
+    env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode="rgb_array" if record_video else None)
+    if record_video:
+        env.unwrapped.render_bubble_radius = float(bubble_radius)
+        env.unwrapped.render_bubble_rgba = tuple(float(x) for x in DEFAULT_BUBBLE_RGBA)
     arm_len = float(env.quad_arm)
     min_spawn_pairwise_distance = arm_len * 2.5 + separation_radius
 
@@ -636,7 +781,12 @@ def main() -> None:
         saved_layout = _capture_canonical_joint_layout(env.unwrapped)
 
     run_logs = []
-    for _ in tqdm(range(args.num_trajectories), desc="Collecting trajectories", unit="traj"):
+    video_frame_sets: List[tuple[int, List[np.ndarray]]] = []
+    for traj_idx in tqdm(range(args.num_trajectories), desc="Collecting trajectories", unit="traj"):
+        should_record_this_trajectory = record_video and (
+            record_all_trajectories or traj_idx == args.video_trajectory_idx
+        )
+        traj_video_frames: List[np.ndarray] | None = [] if should_record_this_trajectory else None
         run_logs.append(
             _run_joint_trajectory(
                 env=env,
@@ -652,8 +802,12 @@ def main() -> None:
                 max_steps=episode_length,
                 deterministic=deterministic,
                 disable_boundary_collision=disable_boundary_collision,
+                record_video=should_record_this_trajectory,
+                video_frames=traj_video_frames,
             )
         )
+        if traj_video_frames is not None:
+            video_frame_sets.append((traj_idx, traj_video_frames))
 
     env.close()
 
@@ -715,6 +869,18 @@ def main() -> None:
 
     print(f"[collect_rand_joint] Saved trajectories to {os.path.abspath(args.output_path)}")
     print(f"[collect_rand_joint] Collected {len(run_logs)} trajectories, max_len={max_len}")
+    if video_target is not None:
+        for traj_idx, video_frames in video_frame_sets:
+            if len(video_frames) == 0:
+                continue
+            final_video_path = _trajectory_video_path(
+                video_target,
+                traj_idx,
+                len(video_frame_sets),
+                record_all_trajectories=record_all_trajectories,
+            )
+            _save_video_frames(final_video_path, video_frames, args.video_fps)
+            print(f"[collect_rand_joint] Saved trajectory video to {final_video_path}")
 
 
 if __name__ == "__main__":

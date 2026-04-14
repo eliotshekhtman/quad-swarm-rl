@@ -32,12 +32,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", help="Directory to save plots.")
     parser.add_argument("--alpha", type=float, help="Alpha for performance error bars; defaults to robust alpha.")
     parser.add_argument("--grid", action="store_true", help="Show grid lines on plots.")
+    parser.add_argument("--title_fontsize", type=float, default=12.0, help="Font size for plot titles.")
+    parser.add_argument("--legend_fontsize", type=float, default=10.0, help="Font size for legend text.")
+    parser.add_argument("--other_fontsize", type=float, default=10.0, help="Font size for axis labels and tick labels.")
     parser.add_argument(
         "--cap_nonrobust",
         action="store_true",
         help="If set, omit the nonrobust q_j curve from the radius plot and omit the nonrobust mismatch curve from the mismatch plot.",
     )
     return parser.parse_args()
+
+
+def _apply_font_sizes(other_fontsize: float, title_fontsize: float, legend_fontsize: float) -> None:
+    plt.rcParams.update({
+        "font.size": other_fontsize,
+        "axes.labelsize": other_fontsize,
+        "xtick.labelsize": other_fontsize,
+        "ytick.labelsize": other_fontsize,
+        "axes.titlesize": title_fontsize,
+        "legend.fontsize": legend_fontsize,
+    })
 
 
 def load_run(path: str) -> Dict[str, np.ndarray]:
@@ -132,6 +146,7 @@ def validate_episode_grids(robust: Dict[str, np.ndarray], naive: Dict[str, np.nd
 
 def main() -> None:
     args = parse_args()
+    _apply_font_sizes(args.other_fontsize, args.title_fontsize, args.legend_fontsize)
 
     robust = load_run(args.robust)
     naive = load_run(args.naive)

@@ -30,23 +30,20 @@ class GlobalCamera(object):
 
 class TopDownCamera(object):
     def __init__(self, view_dist=3.0):
-        self.radius = view_dist
-        self.theta = np.pi / 2
-        self.phi = 0.0
-        self.center = np.array([0., 0., 15.])
+        self.radius = float(view_dist)
+        self.center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
     def reset(self, view_dist=2.0, center=np.array([0., 0., 5.])):
-        self.center = np.array([0., 0., 15.])
-        #self.center = center
+        self.radius = float(view_dist)
+        self.center = np.asarray(center, dtype=np.float64).copy()
 
     def step(self, center=np.array([0., 0., 2.])):
-        pass
+        self.center = np.asarray(center, dtype=np.float64).copy()
 
     def look_at(self):
         up = npa(0, 1, 0)
-        eye = self.center  # pattern center
-        center = self.center - np.array([0, 0, 2])
-        center = (center/np.linalg.norm(center)) * self.radius
+        eye = self.center + np.array([0.0, 0.0, self.radius], dtype=np.float64)
+        center = self.center
         return eye, center, up
 
 class CornerCamera(object):
@@ -116,10 +113,11 @@ class Quadrotor3DSceneMulti:
 
     def __init__(
             self, w, h,
-            quad_arm=None, models=None, walls_visible=True, resizable=True, goal_diameter=None,
+            quad_arm=None, models=None, walls_visible=True, floor_visible=True, resizable=True, goal_diameter=None,
             viewpoint='chase', obs_hw=None, room_dims=(10, 10, 10), num_agents=8, obstacles=None,
             render_speed=1.0, formation_size=-1.0, vis_vel_arrows=True, vis_acc_arrows=True, viz_traces=100, viz_trace_nth_step=1,
-            num_obstacles=0, scene_index=0
+            num_obstacles=0, scene_index=0, bubble_radius=0.0, bubble_rgba=(0.0, 1.0, 0.0, 0.18),
+            dynamic_zoom=False, zoom_scale=1.0, obstacle_rgba=OBST_COLOR_4, bgcolor=(0.0, 0.0, 0.0)
     ):
         self.pygl_window = __import__('pyglet.window', fromlist=['key'])
         self.keys = None  # keypress handler, initialized later
@@ -133,6 +131,7 @@ class Quadrotor3DSceneMulti:
         self.viewpoint = viewpoint
         self.obs_hw = copy.deepcopy(obs_hw)
         self.walls_visible = walls_visible
+        self.floor_visible = floor_visible
         self.scene_index = scene_index
 
         self.quad_arm = quad_arm
@@ -194,6 +193,53 @@ class Quadrotor3DSceneMulti:
         self.store_path_every_n = 1
         self.store_path_count = 0
         self.path_store = [[] for _ in range(num_agents)]
+        self.bubble_radius = float(bubble_radius)
+        self.bubble_rgba = np.asarray(bubble_rgba, dtype=np.float64).copy()
+        self.dynamic_zoom = bool(dynamic_zoom)
+        self.zoom_scale = float(zoom_scale)
+        self.obstacle_rgba = np.asarray(obstacle_rgba, dtype=np.float64).copy()
+        self.bgcolor = tuple(float(x) for x in bgcolor)
+        self.topdown_default_radius = 15.0
+
+    def _bubble_rgba_for_agent(self, agent_id):
+        rgba = np.asarray(self.bubble_rgba, dtype=np.float64)
+        if rgba.ndim == 1 and rgba.shape == (4,):
+            return tuple(float(x) for x in rgba)
+        if rgba.ndim == 2 and rgba.shape[1] == 4 and agent_id < rgba.shape[0]:
+            return tuple(float(x) for x in rgba[agent_id])
+        return (0.0, 0.0, 0.0, 0.0)
+
+    def _obstacle_rgb(self):
+        rgba = np.asarray(self.obstacle_rgba, dtype=np.float64).reshape(-1)
+        if rgba.size >= 3:
+            return tuple(float(x) for x in rgba[:3])
+        return OBST_COLOR_3
+
+    def _obstacle_rgba(self):
+        rgba = np.asarray(self.obstacle_rgba, dtype=np.float64).reshape(-1)
+        if rgba.size >= 4:
+            return tuple(float(x) for x in rgba[:4])
+        if rgba.size == 3:
+            return tuple(float(x) for x in rgba) + (1.0,)
+        return OBST_COLOR_4
+
+    def _topdown_center_and_radius(self, positions):
+        positions = np.asarray(positions, dtype=np.float64)
+        center = np.mean(positions, axis=0)
+        if not self.dynamic_zoom:
+            return center, self.topdown_default_radius / self.zoom_scale
+
+        half_extent = max(
+            0.5 * float(np.ptp(positions[:, 0])),
+            0.5 * float(np.ptp(positions[:, 1])),
+            0.5 * float(self.diameter),
+        )
+        padding = max(float(self.bubble_radius), float(self.diameter)) + 0.25
+        required_half_width = half_extent + padding
+        half_fov = np.deg2rad(self.cam3p.fov * 0.5)
+        radius = required_half_width / max(np.tan(half_fov), 1e-6)
+        min_radius = max(3.0, float(self.diameter) * 6.0)
+        return center, max(min_radius, radius) / self.zoom_scale
 
     def update_goal_diameter(self):
         if self.quad_arm is not None:
@@ -217,11 +263,13 @@ class Quadrotor3DSceneMulti:
         self.cam3p = r3d.Camera(fov=45.0)
 
         self.quad_transforms, self.shadow_transforms, self.goal_transforms, self.collision_transforms = [], [], [], []
+        self.bubble_transforms = []
         self.obstacle_transforms, self.vec_cyl_transforms, self.vec_cone_transforms = [], [], []
         self.path_transforms = [[] for _ in range(self.num_agents)]
 
         shadow_circle = r3d.circle(0.75 * self.diameter, 32)
         collision_sphere = r3d.sphere(0.75 * self.diameter, 32)
+        bubble_sphere = r3d.sphere(max(self.bubble_radius, 1e-6), 32)
 
         arrow_cylinder = r3d.cylinder(0.005, 0.12, 16)
         arrow_cone = r3d.cone(0.01, 0.04, 16)
@@ -239,6 +287,9 @@ class Quadrotor3DSceneMulti:
             )
             self.collision_transforms.append(
                 r3d.transform_and_color(np.eye(4), (0, 0, 0, 0.0), collision_sphere)
+            )
+            self.bubble_transforms.append(
+                r3d.transform_and_color(np.eye(4), (0, 0, 0, 0.0), bubble_sphere)
             )
             if self.vis_vel_arrows:
                 self.vec_cyl_transforms.append(
@@ -260,15 +311,16 @@ class Quadrotor3DSceneMulti:
                 for j in range(self.viz_traces):
                     self.path_transforms[i].append(r3d.transform_and_color(np.eye(4), color, path_sphere))
 
-        # TODO make floor size or walls to indicate world_box
-        floor = r3d.ProceduralTexture(2, (0.85, 0.95),
-                                      r3d.rect((100, 100), (0, 100), (0, 100)))
         self.update_goal_diameter()
         self.chase_cam.view_dist = self.diameter * 15
 
         self.create_goals()
 
-        bodies = [r3d.BackToFront([floor, st]) for st in self.shadow_transforms]
+        bodies = []
+        if self.floor_visible:
+            # The shadow layer depends on the floor plane, so disable both together.
+            floor = r3d.ProceduralTexture(2, (0.85, 0.95), r3d.rect((100, 100), (0, 100), (0, 100)))
+            bodies.extend(r3d.BackToFront([floor, st]) for st in self.shadow_transforms)
         bodies.extend(self.goal_transforms)
         bodies.extend(self.quad_transforms)
         bodies.extend(self.vec_cyl_transforms)
@@ -287,12 +339,13 @@ class Quadrotor3DSceneMulti:
         world = r3d.World(bodies)
         batch = r3d.Batch()
         world.build(batch)
-        self.scene = r3d.Scene(batches=[batch], bgcolor=(0, 0, 0))
+        self.scene = r3d.Scene(batches=[batch], bgcolor=self.bgcolor)
         self.scene.initialize()
 
         # Collision spheres have to be added in the ending after everything has been rendered, as it transparent
         bodies = []
         bodies.extend(self.collision_transforms)
+        bodies.extend(self.bubble_transforms)
         world = r3d.World(bodies)
         batch = r3d.Batch()
         world.build(batch)
@@ -301,7 +354,7 @@ class Quadrotor3DSceneMulti:
     def create_obstacles(self):
         import gym_art.quadrotor_multi.rendering3d as r3d
         for item in self.obstacles.pos_arr:
-            color = OBST_COLOR_3
+            color = self._obstacle_rgb()
             obst_height = self.room_dims[2]
             obstacle_transform = r3d.transform_and_color(np.eye(4), color, r3d.cylinder(
                 radius=self.obstacles.size / 2.0, height=obst_height, sections=64))
@@ -319,7 +372,7 @@ class Quadrotor3DSceneMulti:
             pos_update = [g[0], g[1], g[2] - self.room_dims[2] / 2]
 
             # color = QUAD_COLOR
-            self.obstacle_transforms[i].set_transform_and_color(r3d.translate(pos_update), OBST_COLOR_4)
+            self.obstacle_transforms[i].set_transform_and_color(r3d.translate(pos_update), self._obstacle_rgba())
 
     #def create_arrows(self, envs):
     #
@@ -361,7 +414,11 @@ class Quadrotor3DSceneMulti:
         if self.viewpoint == 'global':
             goal = np.mean(goals, axis=0)
             self.chase_cam.reset(view_dist=2.5, center=goal)
-        elif self.viewpoint[:-1] == 'corner' or self.viewpoint == 'topdown':
+        elif self.viewpoint == 'topdown':
+            positions = np.asarray([dyn.pos for dyn in dynamics], dtype=np.float64)
+            center, radius = self._topdown_center_and_radius(positions)
+            self.chase_cam.reset(view_dist=radius, center=center)
+        elif self.viewpoint[:-1] == 'corner':
             self.chase_cam.reset()
         else:
             goal = goals[self.camera_drone_index]  # TODO: make a camera that can look at all drones
@@ -374,7 +431,12 @@ class Quadrotor3DSceneMulti:
         import gym_art.quadrotor_multi.rendering3d as r3d
 
         if self.scene:
-            if self.viewpoint == 'global' or self.viewpoint[:-1] == 'corner' or self.viewpoint == 'topdown':
+            if self.viewpoint == 'topdown':
+                positions = np.asarray([dyn.pos for dyn in all_dynamics], dtype=np.float64)
+                center, radius = self._topdown_center_and_radius(positions)
+                self.chase_cam.radius = radius
+                self.chase_cam.step(center=center)
+            elif self.viewpoint == 'global' or self.viewpoint[:-1] == 'corner':
                 goal = np.mean(goals, axis=0)
                 self.chase_cam.step(center=goal)
             else:
@@ -478,6 +540,12 @@ class Quadrotor3DSceneMulti:
                         (collisions['ground'][i] > 0.0) * 1.0, 0.4))
                 else:
                     self.collision_transforms[i].set_transform_and_color(matrix, (0, 0, 0, 0.0))
+
+                bubble_rgba = self._bubble_rgba_for_agent(i)
+                if self.bubble_radius > 0.0 and bubble_rgba[3] > 0.0:
+                    self.bubble_transforms[i].set_transform_and_color(matrix, bubble_rgba)
+                else:
+                    self.bubble_transforms[i].set_transform_and_color(matrix, (0, 0, 0, 0.0))
 
     def render_chase(self, all_dynamics, goals, collisions, mode='human', obstacles=None, first_spawn=None):
         import gym_art.quadrotor_multi.rendering3d as r3d

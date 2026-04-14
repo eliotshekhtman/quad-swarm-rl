@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from typing import Dict, List
 
 import numpy as np
@@ -14,7 +15,9 @@ from tqdm import tqdm
 
 from sample_factory.algo.utils.action_distributions import argmax_actions
 from sample_factory.algo.utils.rl_utils import prepare_and_normalize_obs
+from sample_factory.huggingface.huggingface_utils import generate_replay_video
 from sample_factory.model.model_utils import get_rnn_size
+from sample_factory.utils.attr_dict import AttrDict
 
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
@@ -26,6 +29,18 @@ from project_utils.utils import OBS_KEY, SwarmState, load_actor, load_cfg, lates
 
 DEVICE = torch.device("cpu")
 COLLISION_FAR_DISTANCE = 10000.0
+DEFAULT_BUBBLE_OK_RGBA = (0.0, 1.0, 0.0, 0.18)
+DEFAULT_BUBBLE_VIOLATION_RGBA = (1.0, 0.0, 0.0, 0.22)
+DEFAULT_BUBBLE_RECOVERED_RGBA = (1.0, 0.55, 0.0, 0.22)
+NAMED_VIDEO_COLORS = {
+    "white": (1.0, 1.0, 1.0),
+    "black": (0.0, 0.0, 0.0),
+    "gray": (0.5, 0.5, 0.5),
+    "grey": (0.5, 0.5, 0.5),
+    "green": (0.0, 0.5, 0.0),
+    "red": (1.0, 0.0, 0.0),
+    "blue": (0.0, 0.0, 1.0),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,12 +106,92 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="Maximum number of spawn samples to try before failing.",
     )
+    parser.add_argument(
+        "--video_name",
+        default=None,
+        help="Optional mp4 output path/name prefix. When provided, record selected collected trajectories as videos.",
+    )
+    parser.add_argument(
+        "--video_fps",
+        type=int,
+        default=30,
+        help="Frames per second for the optional trajectory video.",
+    )
+    parser.add_argument(
+        "--video_trajectory_idx",
+        type=int,
+        default=0,
+        help="Trajectory index to record when --video_name is set. Use -1 to record all collected trajectories.",
+    )
+    parser.add_argument(
+        "--video_view_mode",
+        default="topdown",
+        help="Viewer mode for the optional trajectory video.",
+    )
+    parser.add_argument(
+        "--video_composite_name",
+        default=None,
+        help="Optional mp4 output path/name for a replay-only composite video of the selected collected trajectories.",
+    )
+    parser.add_argument(
+        "--dynamic_zoom",
+        action="store_true",
+        help="If set, dynamically adjust the topdown camera radius from the per-frame quad spread.",
+    )
+    parser.add_argument(
+        "--video_zoom_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to the topdown camera radius. Values > 1 zoom in and values < 1 zoom out.",
+    )
+    parser.add_argument(
+        "--video_obstacle_color",
+        default="green",
+        help="Obstacle color for rendered videos. Use a named color like 'gray' or an RGB triplet like '128,128,128'.",
+    )
+    parser.add_argument(
+        "--video_background_color",
+        default="white",
+        help="Background color for rendered videos. Use a named color like 'white' or an RGB triplet like '255,255,255'.",
+    )
     return parser.parse_args()
 
 
 def _load_json(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _parse_video_color_arg(value: str, arg_name: str) -> tuple[float, float, float]:
+    color_text = value.strip().lower()
+    if color_text in NAMED_VIDEO_COLORS:
+        return NAMED_VIDEO_COLORS[color_text]
+    if color_text.startswith("#"):
+        hex_value = color_text[1:]
+        if len(hex_value) != 6:
+            raise ValueError(f"{arg_name} hex colors must be in #RRGGBB format.")
+        return tuple(int(hex_value[i:i + 2], 16) / 255.0 for i in range(0, 6, 2))
+
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 3:
+        raise ValueError(
+            f"{arg_name} must be a named color, #RRGGBB, or three comma-separated RGB values."
+        )
+
+    try:
+        channels = [float(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError(f"{arg_name} has invalid numeric color channels.") from exc
+
+    max_channel = max(channels)
+    if max_channel > 1.0:
+        if max_channel > 255.0:
+            raise ValueError(f"{arg_name} RGB channels must be in [0, 1] or [0, 255].")
+        channels = [channel / 255.0 for channel in channels]
+
+    if any(channel < 0.0 or channel > 1.0 for channel in channels):
+        raise ValueError(f"{arg_name} RGB channels must be in [0, 1] after normalization.")
+    return tuple(channels)
 
 
 def _load_environment_geometry(path: str) -> Dict[str, np.ndarray | float]:
@@ -369,7 +464,81 @@ def _pad_with_fill(values: np.ndarray, target_len: int) -> np.ndarray:
     return np.concatenate([values, pad], axis=0)
 
 
-def _build_eval_cfg(saved_args: Dict) -> "AttrDict":
+def _compute_obstacle_distance_metrics(
+    pos: np.ndarray,
+    obstacle_positions: np.ndarray,
+    obstacle_radius: float,
+    quad_radius: float,
+    obstacle_radius_margin: float,
+) -> tuple[float, float, float]:
+    obstacle_positions = np.asarray(obstacle_positions, dtype=np.float64).reshape(-1, 3)
+    pos = np.asarray(pos, dtype=np.float64)
+    if obstacle_positions.size == 0:
+        return float("inf"), float("inf"), float("inf")
+
+    center_dists_xy = np.linalg.norm(obstacle_positions[:, :2] - pos[None, :2], axis=1)
+    boundary_dist = float(np.min(center_dists_xy - float(obstacle_radius)))
+    clearance = float(np.min(center_dists_xy - (float(obstacle_radius) + float(quad_radius))))
+    cbf_clearance = float(
+        np.min(center_dists_xy - (float(obstacle_radius) + float(quad_radius) + float(obstacle_radius_margin)))
+    )
+    return boundary_dist, clearance, cbf_clearance
+
+
+def _obstacle_bubble_rgba(
+    cbf_clearance: float,
+    had_prior_violation: bool = False,
+) -> tuple[float, float, float, float]:
+    if float(cbf_clearance) <= 0.0:
+        return DEFAULT_BUBBLE_VIOLATION_RGBA
+    if bool(had_prior_violation):
+        return DEFAULT_BUBBLE_RECOVERED_RGBA
+    return DEFAULT_BUBBLE_OK_RGBA
+
+
+def _obstacle_bubble_rgba_array(cbf_clearances: np.ndarray, prior_violations: np.ndarray | None = None) -> np.ndarray:
+    cbf_clearances = np.asarray(cbf_clearances, dtype=np.float64).reshape(-1)
+    if prior_violations is None:
+        prior_violations = np.zeros(cbf_clearances.shape[0], dtype=bool)
+    else:
+        prior_violations = np.asarray(prior_violations, dtype=bool).reshape(-1)
+        if prior_violations.shape[0] != cbf_clearances.shape[0]:
+            raise ValueError("prior_violations must match cbf_clearances length.")
+    colors = np.zeros((cbf_clearances.shape[0], 4), dtype=np.float64)
+    for idx, clearance in enumerate(cbf_clearances):
+        colors[idx, :] = np.asarray(
+            _obstacle_bubble_rgba(float(clearance), had_prior_violation=bool(prior_violations[idx])),
+            dtype=np.float64,
+        )
+    return colors
+
+
+def _set_obstacle_overlay_state(
+    env_unwrapped,
+    obstacle_radius_margin: float,
+    had_prior_violation: bool = False,
+) -> float:
+    quad_radius = float(env_unwrapped.quad_arm)
+    bubble_radius = quad_radius + float(obstacle_radius_margin)
+    obstacle_positions = np.asarray(env_unwrapped.obstacles.pos_arr, dtype=np.float64).reshape(-1, 3)
+    obstacle_radius = float(env_unwrapped.obstacles.obstacle_radius)
+    quad_pos = np.asarray(env_unwrapped.envs[0].dynamics.pos, dtype=np.float64)
+    _, _, cbf_clearance = _compute_obstacle_distance_metrics(
+        pos=quad_pos,
+        obstacle_positions=obstacle_positions,
+        obstacle_radius=obstacle_radius,
+        quad_radius=quad_radius,
+        obstacle_radius_margin=obstacle_radius_margin,
+    )
+    env_unwrapped.render_bubble_radius = bubble_radius
+    env_unwrapped.render_bubble_rgba = _obstacle_bubble_rgba(
+        cbf_clearance,
+        had_prior_violation=had_prior_violation,
+    )
+    return cbf_clearance
+
+
+def _build_eval_cfg(saved_args: Dict, enable_render: bool, view_mode: str, num_agents: int = 1) -> "AttrDict":
     spawn_area = saved_args["quads_obst_spawn_area"]
     eval_cli = [
         "--algo=APPO",
@@ -377,7 +546,7 @@ def _build_eval_cfg(saved_args: Dict) -> "AttrDict":
         "--device=cpu",
         "--quads_use_obstacles=True",
         f"--quads_mode={saved_args['quads_mode']}",
-        "--quads_num_agents=1",
+        f"--quads_num_agents={int(num_agents)}",
         "--quads_neighbor_visible_num=0",
         "--quads_neighbor_obs_type=none",
         "--quads_obstacle_obs_type=octomap",
@@ -397,9 +566,252 @@ def _build_eval_cfg(saved_args: Dict) -> "AttrDict":
         f"--quads_wind_accel_x={float(saved_args.get('wind_accel_x', 0.33))}",
         "--quads_use_numba=False",
         "--max_num_episodes=1",
-        "--quads_render=False",
+        f"--quads_render={bool(enable_render)}",
+        f"--quads_view_mode={view_mode}",
     ]
     return parse_swarm_cfg(eval_cli, evaluation=True)
+
+
+def _resolve_video_output(video_name: str | None, output_path: str) -> tuple[str, str] | None:
+    if not video_name:
+        return None
+    if os.path.isabs(video_name):
+        video_dir = os.path.dirname(video_name) or "."
+        video_file = os.path.basename(video_name)
+    else:
+        output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+        video_dir = output_dir
+        video_file = video_name
+    os.makedirs(video_dir, exist_ok=True)
+    return video_dir, video_file
+
+
+def _trajectory_video_path(
+    video_target: tuple[str, str],
+    traj_idx: int,
+    num_trajectories: int,
+    record_all_trajectories: bool,
+) -> str:
+    video_dir, video_file = video_target
+    if (not record_all_trajectories) or num_trajectories <= 1:
+        return os.path.abspath(os.path.join(video_dir, video_file))
+
+    stem, ext = os.path.splitext(video_file)
+    if ext == "":
+        ext = ".mp4"
+    digits = max(3, len(str(max(0, num_trajectories - 1))))
+    suffixed = f"{stem}_traj{traj_idx:0{digits}d}{ext}"
+    return os.path.abspath(os.path.join(video_dir, suffixed))
+
+
+def _append_video_frame(env, video_frames: List[np.ndarray]) -> None:
+    try:
+        frame = env.render()
+    except Exception as exc:
+        raise RuntimeError(
+            "collect_rand_obs video capture must use the normal simulator renderer, "
+            "but env.render() failed. Start an X display (for example XLaunch) and make "
+            "sure DISPLAY is set before running video capture."
+        ) from exc
+
+    if frame is None:
+        raise RuntimeError("collect_rand_obs expected an rgb_array frame, but env.render() returned None.")
+
+    video_frames.append(frame.copy())
+
+
+def _save_video_frames(video_path: str, video_frames: List[np.ndarray], fps: int) -> None:
+    if len(video_frames) == 0:
+        raise ValueError("No video frames to save")
+
+    if shutil.which("ffmpeg") is not None:
+        video_dir = os.path.dirname(video_path) or "."
+        video_file = os.path.basename(video_path)
+        video_cfg = AttrDict(video_name=video_file)
+        generate_replay_video(video_dir, video_frames, fps, video_cfg)
+        return
+
+    import cv2
+
+    first = np.asarray(video_frames[0])
+    if first.ndim != 3 or first.shape[2] != 3:
+        raise ValueError(f"Expected frames with shape (H, W, 3), got {first.shape}")
+
+    height, width = first.shape[:2]
+    writer = cv2.VideoWriter(
+        video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {video_path}")
+
+    try:
+        for frame in video_frames:
+            frame_arr = np.asarray(frame, dtype=np.uint8)
+            if frame_arr.shape[:2] != (height, width):
+                raise ValueError("All video frames must have the same resolution")
+            writer.write(cv2.cvtColor(frame_arr, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+
+def _apply_authoritative_obstacle_geometry_multi(env_unwrapped, geometry: Dict[str, np.ndarray | float]) -> None:
+    if not getattr(env_unwrapped, "use_obstacles", False):
+        raise ValueError("Composite obstacle replay requires an obstacle-enabled environment.")
+
+    obstacle_positions = np.asarray(geometry["obstacle_positions"], dtype=np.float64).reshape(-1, 3)
+    obstacle_radius = float(geometry["obstacle_radius"])
+    env_unwrapped.num_obstacles = int(obstacle_positions.shape[0])
+    env_unwrapped.obst_size = 2.0 * obstacle_radius
+    env_unwrapped.obstacles.pos_arr = obstacle_positions.copy()
+    env_unwrapped.obstacles.obstacle_radius = obstacle_radius
+    env_unwrapped.obstacles.size = 2.0 * obstacle_radius
+
+
+def _trajectory_state_for_replay_frame(traj: Dict, frame_idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, bool]:
+    traj_len = int(traj["trajectory_length"])
+    if frame_idx <= 0 or traj_len <= 0:
+        return (
+            np.asarray(traj["initial_position"], dtype=np.float64),
+            np.asarray(traj["initial_velocity"], dtype=np.float64),
+            np.asarray(traj["initial_rotation"], dtype=np.float64),
+            np.asarray(traj["initial_omega"], dtype=np.float64),
+            float(traj["initial_cbf_clearance"]),
+            False,
+        )
+
+    step_idx = min(frame_idx - 1, traj_len - 1)
+    return (
+        np.asarray(traj["position"][step_idx], dtype=np.float64),
+        np.asarray(traj["velocity"][step_idx], dtype=np.float64),
+        np.asarray(traj["rotation"][step_idx], dtype=np.float64),
+        np.asarray(traj["omega"][step_idx], dtype=np.float64),
+        float(traj["cbf_clearance"][step_idx]),
+        bool(traj["collision_obstacle"][step_idx]),
+    )
+
+
+def _trajectory_had_prior_obstacle_violation(traj: Dict, frame_idx: int) -> bool:
+    if float(traj["initial_cbf_clearance"]) <= 0.0:
+        return True
+
+    traj_len = int(traj["trajectory_length"])
+    if frame_idx <= 1 or traj_len <= 0:
+        return False
+
+    step_idx = min(frame_idx - 1, traj_len - 1)
+    if step_idx <= 0:
+        return False
+
+    prior_clearances = np.asarray(traj["cbf_clearance"][:step_idx], dtype=np.float64)
+    return bool(np.any(prior_clearances <= 0.0))
+
+
+def _set_composite_replay_frame(
+    env_unwrapped,
+    trajectories: List[Dict],
+    frame_idx: int,
+    obstacle_radius_margin: float,
+) -> None:
+    num_agents = len(trajectories)
+    if len(env_unwrapped.envs) != num_agents:
+        raise ValueError("Composite replay env agent count does not match replay trajectory count.")
+
+    obstacle_collisions = np.zeros(num_agents, dtype=np.float64)
+    bubble_clearances = np.zeros(num_agents, dtype=np.float64)
+    prior_violations = np.zeros(num_agents, dtype=bool)
+    goals = []
+    quad_radius = float(env_unwrapped.quad_arm)
+
+    for agent_id, traj in enumerate(trajectories):
+        pos, vel, rot, omega, cbf_clearance, obstacle_collision = _trajectory_state_for_replay_frame(traj, frame_idx)
+        quad = env_unwrapped.envs[agent_id]
+        quad.goal = np.asarray(traj["initial_goal"], dtype=np.float64).copy()
+        quad.spawn_point = np.asarray(traj["initial_position"], dtype=np.float64).copy()
+        quad.dynamics.set_state(pos, vel, rot, omega)
+        quad.dynamics.on_floor = False
+        quad.dynamics.crashed_floor = False
+        quad.dynamics.crashed_wall = False
+        quad.dynamics.crashed_ceiling = False
+        quad.tick = int(frame_idx)
+        quad.actions = [np.zeros(4, dtype=np.float64), np.zeros(4, dtype=np.float64)]
+
+        env_unwrapped.pos[agent_id, :] = quad.dynamics.pos
+        env_unwrapped.vel[agent_id, :] = quad.dynamics.vel
+        goals.append(np.asarray(quad.goal, dtype=np.float64).copy())
+        bubble_clearances[agent_id] = cbf_clearance
+        prior_violations[agent_id] = _trajectory_had_prior_obstacle_violation(traj, frame_idx)
+        obstacle_collisions[agent_id] = 1.0 if obstacle_collision else 0.0
+
+    env_unwrapped.render_bubble_radius = quad_radius + float(obstacle_radius_margin)
+    env_unwrapped.render_bubble_rgba = _obstacle_bubble_rgba_array(
+        bubble_clearances,
+        prior_violations=prior_violations,
+    )
+    env_unwrapped.all_collisions = {
+        "drone": np.zeros(num_agents, dtype=np.float64),
+        "ground": np.zeros(num_agents, dtype=np.float64),
+        "obstacle": obstacle_collisions,
+    }
+    if hasattr(env_unwrapped.scenario, "goals"):
+        env_unwrapped.scenario.goals = np.asarray(goals, dtype=np.float64)
+
+
+def _record_composite_obstacle_video(
+    saved_args: Dict,
+    geometry: Dict[str, np.ndarray | float],
+    trajectories: List[Dict],
+    obstacle_radius_margin: float,
+    disable_boundary_collision: bool,
+    video_path: str,
+    video_fps: int,
+    video_view_mode: str,
+    dynamic_zoom: bool,
+    zoom_scale: float,
+    obstacle_rgb: tuple[float, float, float],
+    background_rgb: tuple[float, float, float],
+) -> None:
+    if len(trajectories) == 0:
+        raise ValueError("Composite obstacle replay requires at least one trajectory.")
+
+    replay_cfg = _build_eval_cfg(
+        saved_args,
+        enable_render=True,
+        view_mode=video_view_mode,
+        num_agents=len(trajectories),
+    )
+    replay_env = make_quadrotor_env("quadrotor_multi", cfg=replay_cfg, render_mode="rgb_array")
+    replay_env.unwrapped.render_floor_visible = False
+    replay_env.unwrapped.render_walls_visible = False
+    replay_env.unwrapped.render_dynamic_zoom = bool(dynamic_zoom)
+    replay_env.unwrapped.render_zoom_scale = float(zoom_scale)
+    replay_env.unwrapped.render_obstacle_rgba = tuple(float(x) for x in obstacle_rgb) + (1.0,)
+    replay_env.unwrapped.render_bgcolor = tuple(float(x) for x in background_rgb)
+
+    try:
+        if disable_boundary_collision:
+            _configure_far_boundary_geometry(replay_env.unwrapped)
+        _reset_env(replay_env)
+        if disable_boundary_collision:
+            _configure_far_boundary_geometry(replay_env.unwrapped)
+        _apply_authoritative_obstacle_geometry_multi(replay_env.unwrapped, geometry)
+
+        max_len = max(int(traj["trajectory_length"]) for traj in trajectories)
+        composite_frames: List[np.ndarray] = []
+        for frame_idx in range(max_len + 1):
+            _set_composite_replay_frame(
+                replay_env.unwrapped,
+                trajectories,
+                frame_idx,
+                obstacle_radius_margin=obstacle_radius_margin,
+            )
+            _append_video_frame(replay_env, composite_frames)
+
+        _save_video_frames(video_path, composite_frames, video_fps)
+    finally:
+        replay_env.close()
 
 
 def _run_obstacle_trajectory(
@@ -417,6 +829,8 @@ def _run_obstacle_trajectory(
     action_repeat: int,
     spawn_ball_radius: float,
     spawn_ball_max_tries: int,
+    record_video: bool = False,
+    video_frames: List[np.ndarray] | None = None,
 ):
     if disable_boundary_collision:
         _configure_far_boundary_geometry(env.unwrapped)
@@ -437,10 +851,23 @@ def _run_obstacle_trajectory(
     run_rnn_states = init_rnn_states.clone()
     held_nominal_action = None
     held_filtered_action = None
+    initial_cbf_clearance = _set_obstacle_overlay_state(
+        env.unwrapped,
+        obstacle_radius_margin,
+        had_prior_violation=False,
+    )
+    has_seen_bubble_violation = bool(initial_cbf_clearance <= 0.0)
+
+    if record_video:
+        if video_frames is None:
+            raise ValueError("record_video=True requires video_frames")
+        _append_video_frame(env, video_frames)
 
     run_logs: Dict[str, List] = {
         "position": [],
         "velocity": [],
+        "rotation": [],
+        "omega": [],
         "goal_dist": [],
         "collision_obstacle": [],
         "boundary_dist": [],
@@ -449,6 +876,7 @@ def _run_obstacle_trajectory(
         "model_mismatch_state": [],
         "nominal_acceleration": [],
         "filtered_acceleration": [],
+        "bubble_violation": [],
     }
 
     while not done and step_num < max_steps:
@@ -521,21 +949,31 @@ def _run_obstacle_trajectory(
         obstacle_centers = np.asarray(env.unwrapped.obstacles.pos_arr, dtype=np.float64).reshape(-1, 3)
         obstacle_radius = float(env.unwrapped.obstacles.obstacle_radius)
         quad_radius = float(env.unwrapped.quad_arm)
-        if obstacle_centers.size == 0:
-            boundary_dist = float("inf")
-            clearance = float("inf")
-            cbf_clearance = float("inf")
-        else:
-            center_dists_xy = np.linalg.norm(obstacle_centers[:, :2] - solo_pos[None, :2], axis=1)
-            boundary_dist = float(np.min(center_dists_xy - obstacle_radius))
-            clearance = float(np.min(center_dists_xy - (obstacle_radius + quad_radius)))
-            cbf_clearance = float(np.min(center_dists_xy - (obstacle_radius + quad_radius + obstacle_radius_margin)))
+        boundary_dist, clearance, cbf_clearance = _compute_obstacle_distance_metrics(
+            pos=solo_pos,
+            obstacle_positions=obstacle_centers,
+            obstacle_radius=obstacle_radius,
+            quad_radius=quad_radius,
+            obstacle_radius_margin=obstacle_radius_margin,
+        )
+        env.unwrapped.render_bubble_radius = quad_radius + float(obstacle_radius_margin)
+        env.unwrapped.render_bubble_rgba = _obstacle_bubble_rgba(
+            cbf_clearance,
+            had_prior_violation=has_seen_bubble_violation,
+        )
+        if cbf_clearance <= 0.0:
+            has_seen_bubble_violation = True
 
         rew_obst_raw = infos[0]["rewards"].get("rewraw_quadcol_obstacle", 0.0)
         collision_obstacle = float(rew_obst_raw) < 0.0
 
+        if record_video:
+            _append_video_frame(env, video_frames)
+
         run_logs["position"].append(solo_pos.copy())
         run_logs["velocity"].append(solo_vel.copy())
+        run_logs["rotation"].append(np.asarray(env.unwrapped.envs[0].dynamics.rot, dtype=np.float64).copy())
+        run_logs["omega"].append(np.asarray(env.unwrapped.envs[0].dynamics.omega, dtype=np.float64).copy())
         run_logs["goal_dist"].append(goal_dist)
         run_logs["collision_obstacle"].append(collision_obstacle)
         run_logs["boundary_dist"].append(boundary_dist)
@@ -544,6 +982,7 @@ def _run_obstacle_trajectory(
         run_logs["model_mismatch_state"].append(mismatch_state)
         run_logs["nominal_acceleration"].append(np.asarray(nominal_acc, dtype=np.float32))
         run_logs["filtered_acceleration"].append(np.asarray(filtered_acc, dtype=np.float32))
+        run_logs["bubble_violation"].append(bool(cbf_clearance <= 0.0))
 
         done = bool(np.all(dones))
         step_num += 1
@@ -558,6 +997,8 @@ def _run_obstacle_trajectory(
     return {
         "position": position,
         "velocity": velocity,
+        "rotation": np.asarray(run_logs["rotation"], dtype=np.float32),
+        "omega": np.asarray(run_logs["omega"], dtype=np.float32),
         "goal_dist": np.asarray(run_logs["goal_dist"], dtype=np.float32),
         "collision_obstacle": np.asarray(run_logs["collision_obstacle"], dtype=np.bool_),
         "boundary_dist": np.asarray(run_logs["boundary_dist"], dtype=np.float32),
@@ -566,11 +1007,13 @@ def _run_obstacle_trajectory(
         "model_mismatch_state": np.asarray(run_logs["model_mismatch_state"], dtype=np.float32),
         "nominal_acceleration": np.asarray(run_logs["nominal_acceleration"], dtype=np.float32),
         "filtered_acceleration": np.asarray(run_logs["filtered_acceleration"], dtype=np.float32),
+        "bubble_violation": np.asarray(run_logs["bubble_violation"], dtype=np.bool_),
         "initial_position": np.asarray(initial_state["initial_position"], dtype=np.float64),
         "initial_goal": np.asarray(initial_state["initial_goal"], dtype=np.float64),
         "initial_velocity": np.asarray(initial_state["initial_velocity"], dtype=np.float64),
         "initial_omega": np.asarray(initial_state["initial_omega"], dtype=np.float64),
         "initial_rotation": np.asarray(initial_state["initial_rotation"], dtype=np.float64),
+        "initial_cbf_clearance": float(initial_cbf_clearance),
         "trajectory_length": int(step_num),
     }
 
@@ -587,6 +1030,12 @@ def main() -> None:
         raise ValueError("--spawn_ball_radius must be non-negative.")
     if args.spawn_ball_max_tries <= 0:
         raise ValueError("--spawn_ball_max_tries must be positive.")
+    if args.video_fps <= 0:
+        raise ValueError("--video_fps must be positive.")
+    if args.video_trajectory_idx < -1:
+        raise ValueError("--video_trajectory_idx must be >= -1.")
+    if args.video_zoom_scale <= 0.0:
+        raise ValueError("--video_zoom_scale must be positive.")
 
     saved_args = _load_json(args.conf_rand_obs_args)
     obstacle_radius_margin = float(saved_args["obstacle_radius_margin"])
@@ -603,8 +1052,47 @@ def main() -> None:
     set_global_seed(args.seed)
 
     cfg_solo = load_cfg(saved_args["solo_train_dir"], saved_args["solo_experiment"])
-    eval_cfg = _build_eval_cfg(saved_args)
-    env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=None)
+    obstacle_rgb = _parse_video_color_arg(args.video_obstacle_color, "--video_obstacle_color")
+    background_rgb = _parse_video_color_arg(args.video_background_color, "--video_background_color")
+    multi_traj_video = args.num_trajectories > 1
+    individual_video_name = args.video_name
+    composite_video_name = args.video_composite_name
+    auto_promoted_composite = False
+    if multi_traj_video and individual_video_name is not None and composite_video_name is None:
+        composite_video_name = individual_video_name
+        individual_video_name = None
+        auto_promoted_composite = True
+
+    record_video = individual_video_name is not None
+    video_target = _resolve_video_output(individual_video_name, args.output_path)
+    composite_video_target = _resolve_video_output(composite_video_name, args.output_path)
+    record_all_trajectories = record_video and args.video_trajectory_idx == -1
+    if record_video:
+        if record_all_trajectories:
+            print("[collect_rand_obs] Recording individual videos for all collected trajectories.")
+        else:
+            if args.video_trajectory_idx >= args.num_trajectories:
+                raise ValueError("--video_trajectory_idx must be smaller than --num_trajectories, or -1 for all.")
+            print(f"[collect_rand_obs] Recording individual video only for trajectory {args.video_trajectory_idx}.")
+    if composite_video_target is not None and multi_traj_video:
+        if auto_promoted_composite and args.video_trajectory_idx == 0:
+            print("[collect_rand_obs] Recording a composite replay video covering all collected trajectories.")
+        elif args.video_trajectory_idx == -1:
+            print("[collect_rand_obs] Recording a composite replay video covering all collected trajectories.")
+        else:
+            print(
+                f"[collect_rand_obs] Recording a composite replay video only for trajectory {args.video_trajectory_idx}."
+            )
+
+    eval_cfg = _build_eval_cfg(saved_args, enable_render=record_video, view_mode=args.video_view_mode)
+    env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode="rgb_array" if record_video else None)
+    if record_video:
+        env.unwrapped.render_floor_visible = False
+        env.unwrapped.render_walls_visible = False
+        env.unwrapped.render_dynamic_zoom = bool(args.dynamic_zoom)
+        env.unwrapped.render_zoom_scale = float(args.video_zoom_scale)
+        env.unwrapped.render_obstacle_rgba = tuple(float(x) for x in obstacle_rgb) + (1.0,)
+        env.unwrapped.render_bgcolor = tuple(float(x) for x in background_rgb)
 
     if disable_boundary_collision:
         _configure_far_boundary_geometry(env.unwrapped)
@@ -630,8 +1118,13 @@ def main() -> None:
     )
 
     trajectories = []
+    video_frame_sets: List[tuple[int, List[np.ndarray]]] = []
     progress_bar = tqdm(range(args.num_trajectories))
-    for _ in progress_bar:
+    for traj_idx in progress_bar:
+        should_record_this_trajectory = record_video and (
+            record_all_trajectories or traj_idx == args.video_trajectory_idx
+        )
+        traj_video_frames: List[np.ndarray] | None = [] if should_record_this_trajectory else None
         traj = _run_obstacle_trajectory(
             env=env,
             solo_actor=solo_actor,
@@ -647,13 +1140,19 @@ def main() -> None:
             action_repeat=int(args.action_repeat),
             spawn_ball_radius=float(args.spawn_ball_radius),
             spawn_ball_max_tries=int(args.spawn_ball_max_tries),
+            record_video=should_record_this_trajectory,
+            video_frames=traj_video_frames,
         )
         trajectories.append(traj)
+        if traj_video_frames is not None:
+            video_frame_sets.append((traj_idx, traj_video_frames))
         progress_bar.set_postfix_str(f"last_len={traj['trajectory_length']}")
 
     max_len = max(traj["trajectory_length"] for traj in trajectories)
     positions = np.stack([_pad_with_fill(traj["position"], max_len) for traj in trajectories], axis=0)
     velocities = np.stack([_pad_with_fill(traj["velocity"], max_len) for traj in trajectories], axis=0)
+    rotations = np.stack([_pad_with_fill(traj["rotation"], max_len) for traj in trajectories], axis=0)
+    omegas = np.stack([_pad_with_fill(traj["omega"], max_len) for traj in trajectories], axis=0)
     goal_dist = np.stack([_pad_with_fill(traj["goal_dist"], max_len) for traj in trajectories], axis=0)
     collision_obstacle = np.stack([_pad_with_fill(traj["collision_obstacle"], max_len) for traj in trajectories], axis=0)
     boundary_dist = np.stack([_pad_with_fill(traj["boundary_dist"], max_len) for traj in trajectories], axis=0)
@@ -662,12 +1161,14 @@ def main() -> None:
     model_mismatch_state = np.stack([_pad_with_fill(traj["model_mismatch_state"], max_len) for traj in trajectories], axis=0)
     nominal_accelerations = np.stack([_pad_with_fill(traj["nominal_acceleration"], max_len) for traj in trajectories], axis=0)
     filtered_accelerations = np.stack([_pad_with_fill(traj["filtered_acceleration"], max_len) for traj in trajectories], axis=0)
+    bubble_violation = np.stack([_pad_with_fill(traj["bubble_violation"], max_len) for traj in trajectories], axis=0)
     trajectory_lengths = np.asarray([traj["trajectory_length"] for traj in trajectories], dtype=np.int32)
     initial_positions = np.stack([traj["initial_position"] for traj in trajectories], axis=0)
     initial_goals = np.stack([traj["initial_goal"] for traj in trajectories], axis=0)
     initial_velocities = np.stack([traj["initial_velocity"] for traj in trajectories], axis=0)
     initial_omegas = np.stack([traj["initial_omega"] for traj in trajectories], axis=0)
     initial_rotations = np.stack([traj["initial_rotation"] for traj in trajectories], axis=0)
+    initial_cbf_clearance = np.asarray([traj["initial_cbf_clearance"] for traj in trajectories], dtype=np.float32)
 
     output_path = os.path.abspath(args.output_path)
     output_dir = os.path.dirname(output_path)
@@ -681,6 +1182,8 @@ def main() -> None:
         output_path,
         positions=positions,
         velocities=velocities,
+        rotations=rotations,
+        omegas=omegas,
         goal_dist=goal_dist,
         collision_obstacle=collision_obstacle,
         boundary_dist=boundary_dist,
@@ -689,12 +1192,14 @@ def main() -> None:
         model_mismatch_state=model_mismatch_state,
         nominal_accelerations=nominal_accelerations,
         filtered_accelerations=filtered_accelerations,
+        bubble_violation=bubble_violation,
         trajectory_lengths=trajectory_lengths,
         initial_positions=initial_positions,
         initial_goals=initial_goals,
         initial_velocities=initial_velocities,
         initial_omegas=initial_omegas,
         initial_rotations=initial_rotations,
+        initial_cbf_clearance=initial_cbf_clearance,
         start_point=np.asarray(geometry["start_point"], dtype=np.float64),
         goal_point=np.asarray(geometry["goal_point"], dtype=np.float64),
         obstacle_positions=np.asarray(geometry["obstacle_positions"], dtype=np.float64),
@@ -727,6 +1232,49 @@ def main() -> None:
     print(f"[collect_rand_obs] Obstacle count: {np.asarray(geometry['obstacle_positions']).shape[0]}")
     print(f"[collect_rand_obs] point_towards_goal={bool(args.point_towards_goal)}")
     print(f"[collect_rand_obs] action_repeat={int(args.action_repeat)}")
+    if video_target is not None:
+        for traj_idx, video_frames in video_frame_sets:
+            if len(video_frames) == 0:
+                continue
+            final_video_path = _trajectory_video_path(
+                video_target,
+                traj_idx,
+                len(video_frame_sets),
+                record_all_trajectories=record_all_trajectories,
+            )
+            _save_video_frames(final_video_path, video_frames, args.video_fps)
+            print(f"[collect_rand_obs] Saved trajectory video to {final_video_path}")
+    if composite_video_target is not None:
+        if auto_promoted_composite and args.video_trajectory_idx == 0:
+            composite_indices = list(range(len(trajectories)))
+        elif args.video_trajectory_idx == -1:
+            composite_indices = list(range(len(trajectories)))
+        else:
+            if args.video_trajectory_idx >= len(trajectories):
+                raise ValueError("--video_trajectory_idx must be smaller than the number of collected trajectories.")
+            composite_indices = [args.video_trajectory_idx]
+        composite_runs = [trajectories[idx] for idx in composite_indices]
+        composite_video_path = _trajectory_video_path(
+            composite_video_target,
+            traj_idx=0,
+            num_trajectories=1,
+            record_all_trajectories=False,
+        )
+        _record_composite_obstacle_video(
+            saved_args=saved_args,
+            geometry=geometry,
+            trajectories=composite_runs,
+            obstacle_radius_margin=obstacle_radius_margin,
+            disable_boundary_collision=disable_boundary_collision,
+            video_path=composite_video_path,
+            video_fps=args.video_fps,
+            video_view_mode=args.video_view_mode,
+            dynamic_zoom=bool(args.dynamic_zoom),
+            zoom_scale=float(args.video_zoom_scale),
+            obstacle_rgb=obstacle_rgb,
+            background_rgb=background_rgb,
+        )
+        print(f"[collect_rand_obs] Saved composite trajectory video to {composite_video_path}")
 
 
 if __name__ == "__main__":
