@@ -6,6 +6,7 @@ Collect fixed-radius conformal rollouts and render a composite replay video.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shutil
@@ -20,11 +21,11 @@ from sample_factory.huggingface.huggingface_utils import generate_replay_video
 from sample_factory.model.model_utils import get_rnn_size
 from sample_factory.utils.attr_dict import AttrDict
 
+from gym_art.quadrotor_multi.quad_utils import QUAD_COLOR
 from swarm_rl.env_snapshot import clone_env_from_snapshot, safe_capture_env_snapshot
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
-from project_utils.cbf_utils import make_cbf_filter
 from project_utils.conformal_utils import fall_down, run_multi_agents
 from project_utils.restart_utils import deterministic_reset
 from project_utils.utils import (
@@ -38,11 +39,8 @@ from project_utils.utils import (
 
 DEVICE = torch.device("cpu")
 
-GREEN_RGBA = np.array([0.0, 1.0, 0.0, 0.22], dtype=np.float64)
-RED_RGBA = np.array([1.0, 0.0, 0.0, 0.22], dtype=np.float64)
-ORANGE_RGBA = np.array([1.0, 0.55, 0.0, 0.22], dtype=np.float64)
-BLUE_RGBA = np.array([0.0, 0.45, 1.0, 0.24], dtype=np.float64)
-TRANSPARENT_RGBA = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+EGO_QUAD_RGB = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+SPHERE_ALPHA = 0.24
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,8 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_path", default="train_dir/collect_video.npz")
     parser.add_argument("--video_name", default="collect_video.mp4")
     parser.add_argument("--video_fps", type=int, default=30)
-    parser.add_argument("--video_view_mode", default="topdown")
+    parser.add_argument("--video_view_mode", default="topdownfollow")
+    parser.add_argument("--video_topdownfollow_zoom", type=float, default=5.0)
+    parser.add_argument("--ecbf", action="store_true", help="Use project_utils.full_cbf_utils instead of project_utils.cbf_utils.")
     return parser.parse_args()
+
+
+def load_cbf_module(use_ecbf: bool):
+    module_name = "project_utils.full_cbf_utils" if use_ecbf else "project_utils.cbf_utils"
+    return importlib.import_module(module_name)
 
 
 def _normalize_output_path(path: str) -> str:
@@ -84,6 +89,17 @@ def _append_video_frame(env, video_frames: List[np.ndarray]) -> None:
             "collect_video composite rendering requires the normal simulator renderer, but env.render() returned None."
         )
     video_frames.append(np.asarray(frame, dtype=np.uint8).copy())
+
+
+def _configure_replay_scene(env, ego_global_idx: int, topdownfollow_zoom: float, agent_colors: np.ndarray) -> None:
+    env_unwrapped = env.unwrapped
+    if len(env_unwrapped.scenes) == 0:
+        env_unwrapped.init_scene_multi()
+    for scene in env_unwrapped.scenes:
+        scene.camera_drone_index = int(ego_global_idx)
+        scene.agent_colors = np.asarray(agent_colors, dtype=np.float64).copy()
+        if scene.viewpoint == "topdownfollow":
+            scene.chase_cam.view_dist = float(topdownfollow_zoom)
 
 
 def _save_video_frames(video_path: str, video_frames: List[np.ndarray], fps: int) -> None:
@@ -373,25 +389,37 @@ def _prediction_step_for_frame(frame_idx: int, episode_length: int) -> int:
     return min(frame_idx - 1, episode_length - 1)
 
 
-def _bubble_color(current_h: float, had_prior_violation: bool, left_prediction_ball: bool) -> np.ndarray:
-    if left_prediction_ball:
-        return BLUE_RGBA.copy()
-    if current_h <= 0.0:
-        return RED_RGBA.copy()
-    if had_prior_violation:
-        return ORANGE_RGBA.copy()
-    return GREEN_RGBA.copy()
+def _build_replay_agent_colors(num_trajectories: int, num_multi_agents: int) -> np.ndarray:
+    local_agents = int(num_multi_agents) + 1
+    total_agents = int(num_trajectories) * local_agents
+    non_ego_palette = [
+        np.asarray(color, dtype=np.float64)
+        for color in QUAD_COLOR
+        if not np.allclose(np.asarray(color, dtype=np.float64), EGO_QUAD_RGB)
+    ]
+    if len(non_ego_palette) == 0:
+        raise ValueError("QUAD_COLOR must contain at least one non-red color for non-ego quads.")
+
+    agent_colors = np.zeros((total_agents, 3), dtype=np.float64)
+    for traj_idx in range(int(num_trajectories)):
+        for local_idx in range(local_agents):
+            global_idx = traj_idx * local_agents + local_idx
+            if local_idx == int(num_multi_agents):
+                agent_colors[global_idx] = EGO_QUAD_RGB
+            else:
+                agent_colors[global_idx] = non_ego_palette[local_idx % len(non_ego_palette)]
+    return agent_colors
 
 
 def _set_composite_replay_frame(
     env_unwrapped,
     trajectories: Sequence[Dict[str, np.ndarray]],
     pred_trajectories: np.ndarray,
+    agent_colors: np.ndarray,
     frame_idx: int,
     radius: float,
     num_multi_agents: int,
     num_closest: int,
-    had_h_violation: np.ndarray,
 ) -> None:
     total_agents = len(trajectories) * (num_multi_agents + 1)
     if len(env_unwrapped.envs) != total_agents:
@@ -410,13 +438,9 @@ def _set_composite_replay_frame(
         actual_teammate_pos = positions[:num_multi_agents]
         predicted_positions = pred_trajectories[:, pred_step, :3]
 
-        current_h = np.sum((predicted_positions - actual_ego_pos[None, :]) ** 2, axis=1) - float(radius) ** 2
-        prior_h = had_h_violation[traj_idx].copy()
-        left_prediction_ball = np.linalg.norm(actual_teammate_pos - predicted_positions, axis=1) > float(radius)
         actual_distances = np.linalg.norm(actual_teammate_pos - actual_ego_pos[None, :], axis=1)
         nearest_count = min(max(int(num_closest), 0), num_multi_agents)
         nearest = np.argsort(actual_distances)[:nearest_count]
-        had_h_violation[traj_idx] = np.logical_or(had_h_violation[traj_idx], current_h <= 0.0)
 
         for local_idx in range(local_agents):
             global_idx = traj_idx * local_agents + local_idx
@@ -444,11 +468,8 @@ def _set_composite_replay_frame(
         for teammate_idx in nearest:
             global_idx = traj_idx * local_agents + teammate_idx
             bubble_positions[global_idx] = predicted_positions[teammate_idx]
-            bubble_rgba[global_idx] = _bubble_color(
-                float(current_h[teammate_idx]),
-                bool(prior_h[teammate_idx]),
-                bool(left_prediction_ball[teammate_idx]),
-            )
+            bubble_rgba[global_idx, :3] = agent_colors[global_idx]
+            bubble_rgba[global_idx, 3] = SPHERE_ALPHA
 
     env_unwrapped.render_bubble_radius = float(radius)
     env_unwrapped.render_bubble_positions = bubble_positions
@@ -472,6 +493,7 @@ def _record_composite_video(
     video_path: str,
     video_fps: int,
     video_view_mode: str,
+    video_topdownfollow_zoom: float,
 ) -> None:
     if len(trajectories) == 0:
         raise ValueError("Need at least one trajectory to render a composite video.")
@@ -480,22 +502,24 @@ def _record_composite_video(
     replay_cfg = _build_eval_cfg(cfg_multi, num_agents=total_agents, enable_render=True, view_mode=video_view_mode)
     replay_env = make_quadrotor_env("quadrotor_multi", cfg=replay_cfg, render_mode="rgb_array")
     replay_env.unwrapped.render_bubble_radius = float(radius)
+    agent_colors = _build_replay_agent_colors(len(trajectories), num_multi_agents)
 
     try:
         _reset_env(replay_env)
+        first_ego_global_idx = int(num_multi_agents)
+        _configure_replay_scene(replay_env, first_ego_global_idx, video_topdownfollow_zoom, agent_colors)
         max_len = max(int(traj["trajectory_length"]) for traj in trajectories)
         video_frames: List[np.ndarray] = []
-        had_h_violation = np.zeros((len(trajectories), num_multi_agents), dtype=bool)
         for frame_idx in range(max_len + 1):
             _set_composite_replay_frame(
                 replay_env.unwrapped,
                 trajectories,
                 pred_trajectories,
+                agent_colors,
                 frame_idx,
                 radius=radius,
                 num_multi_agents=num_multi_agents,
                 num_closest=num_closest,
-                had_h_violation=had_h_violation,
             )
             _append_video_frame(replay_env, video_frames)
         _save_video_frames(video_path, video_frames, video_fps)
@@ -505,12 +529,15 @@ def _record_composite_video(
 
 def main() -> None:
     args = parse_args()
+    cbf_module = load_cbf_module(args.ecbf)
     if args.r <= 0.0:
         raise ValueError("--r must be positive.")
     if args.num_trajectories <= 0:
         raise ValueError("--num_trajectories must be positive.")
     if args.num_closest < 0:
         raise ValueError("--num_closest must be non-negative.")
+    if args.video_topdownfollow_zoom <= 0.0:
+        raise ValueError("--video_topdownfollow_zoom must be positive.")
 
     output_path = _normalize_output_path(args.output_path)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -572,7 +599,7 @@ def main() -> None:
 
         snapshot = safe_capture_env_snapshot(env)
         radii = np.full(args.num_multi_agents, float(args.r), dtype=np.float64)
-        solo_action_fn = make_cbf_filter(radii)
+        solo_action_fn = cbf_module.make_cbf_filter(radii)
 
         trajectories = []
         for traj_idx in range(args.num_trajectories):
@@ -646,6 +673,7 @@ def main() -> None:
         video_path=video_path,
         video_fps=args.video_fps,
         video_view_mode=args.video_view_mode,
+        video_topdownfollow_zoom=args.video_topdownfollow_zoom,
     )
 
 

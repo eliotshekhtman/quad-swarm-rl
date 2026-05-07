@@ -88,7 +88,7 @@ class SideCamera(object):
         return eye, center, up
 
 
-def quadrotor_3dmodel(model, quad_id=0):
+def quadrotor_3dmodel(model, quad_id=0, quad_color=None):
     import gym_art.quadrotor_multi.rendering3d as r3d
 
     # params["body"] = {"l": 0.03, "w": 0.03, "h": 0.004, "m": 0.005}
@@ -104,6 +104,8 @@ def quadrotor_3dmodel(model, quad_id=0):
     ## PROPELLERS
     # "X" propeller configuration, start fwd left, go clockwise
     # IDs: https://wiki.bitcraze.io/projects:crazyflie2:userguide:assembly
+    agent_color = np.array(quad_color if quad_color is not None else QUAD_COLOR[quad_id % len(QUAD_COLOR)])
+    agent_color_tuple = tuple(float(x) for x in agent_color)
     link_colors = {
         "body": (0.67843137, 1., 0.18431373),
         "payload": (0., 0., 1.),
@@ -120,7 +122,7 @@ def quadrotor_3dmodel(model, quad_id=0):
         # print("LINK: ", link.name, "R:", rot, end=" ")
         if link.name[:4] == "prop":
             prop_r = link.r
-            color = np.array(QUAD_COLOR[quad_id % len(QUAD_COLOR)])
+            color = agent_color
         if link.type == "box":
             # print("Type: Box")
             link_transf = r3d.transform_and_color(
@@ -142,13 +144,13 @@ def quadrotor_3dmodel(model, quad_id=0):
         links.append(link_transf)
 
     ## ARROWS
-    arrow = r3d.Color((0.2, 0.3, 0.9), r3d.arrow(0.05 * prop_r, 1.5 * prop_r, 16))
+    arrow = r3d.Color(agent_color_tuple, r3d.arrow(0.05 * prop_r, 1.5 * prop_r, 16))
     links.append(arrow)
 
     return r3d.Transform(np.eye(4), links)
 
 
-def quadrotor_simple_3dmodel(diam):
+def quadrotor_simple_3dmodel(diam, quad_color=None):
     import gym_art.quadrotor_multi.rendering3d as r3d
 
     r = diam / 2
@@ -158,7 +160,9 @@ def quadrotor_simple_3dmodel(diam):
     # "X" propeller configuration, start fwd left, go clockwise
     rr = r * np.sqrt(2) / 2
     deltas = ((rr, rr, 0), (rr, -rr, 0), (-rr, -rr, 0), (-rr, rr, 0))
-    colors = ((1, 0, 0), (1, 0, 0), (0, 1, 0), (0, 1, 0))
+    agent_color = np.array(quad_color if quad_color is not None else (0.2, 0.3, 0.9))
+    agent_color_tuple = tuple(float(x) for x in agent_color)
+    colors = [agent_color] * 4 if quad_color is not None else ((1, 0, 0), (1, 0, 0), (0, 1, 0), (0, 1, 0))
 
     def disc(translation, color):
         color = 0.5 * np.array(list(color)) + 0.2
@@ -174,7 +178,7 @@ def quadrotor_simple_3dmodel(diam):
         np.matmul(r3d.translate((0, 0, -arm_thicc)), r3d.rotz(np.pi / 4)), arm_color,
         [r3d.box(diam / 10, diam, arm_thicc), r3d.box(diam, diam / 10, arm_thicc)])
 
-    arrow = r3d.Color((0.2, 0.3, 0.9), r3d.arrow(0.12 * prop_r, 2.5 * prop_r, 16))
+    arrow = r3d.Color(agent_color_tuple, r3d.arrow(0.12 * prop_r, 2.5 * prop_r, 16))
 
     bodies = props + [arms, arrow]
     return r3d.Transform(np.eye(4), bodies)

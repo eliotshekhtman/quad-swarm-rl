@@ -17,6 +17,18 @@ plt.rcParams.update({
     "font.family": "serif",
 })
 
+
+def _apply_font_sizes(other_fontsize: float, title_fontsize: float, legend_fontsize: float) -> None:
+    plt.rcParams.update({
+        "font.size": other_fontsize,
+        "axes.labelsize": other_fontsize,
+        "xtick.labelsize": other_fontsize,
+        "ytick.labelsize": other_fontsize,
+        "axes.titlesize": title_fontsize,
+        "legend.fontsize": legend_fontsize,
+    })
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot conformal experiment results from saved metrics.")
     parser.add_argument(
@@ -39,6 +51,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Alpha for performance error bars; defaults to the value stored in the metrics file.",
     )
+    parser.add_argument("--title_fontsize", type=float, default=12.0, help="Font size for plot titles.")
+    parser.add_argument("--legend_fontsize", type=float, default=10.0, help="Font size for legend text.")
+    parser.add_argument("--other_fontsize", type=float, default=10.0, help="Font size for axis labels and tick labels.")
     return parser.parse_args()
 
 # Helper to draw translucent conformal tubes (spheres) around predicted positions
@@ -57,8 +72,16 @@ def draw_circle(ax, center, radius, color, label=None):
     x = np.full_like(theta, center[0])  # keep x fixed
     ax.plot(x, y, z, color=color, alpha=0.1)
 
+
+def _apply_bold_3d_text(ax, title: str) -> None:
+    ax.set_title(title)
+    ax.set_xlabel(r"$x$ (m)")
+    ax.set_ylabel(r"$y$ (m)")
+    ax.set_zlabel(r"$z$ (m)")
+
 def main() -> None:
     args = parse_args()
+    _apply_font_sizes(args.other_fontsize, args.title_fontsize, args.legend_fontsize)
     data_path = os.path.abspath(args.plot_data)
     exp_name = Path(data_path).stem
     output_dir = args.output_dir or os.path.join("./", "plots", exp_name)
@@ -95,7 +118,7 @@ def main() -> None:
     ax.axhline(noninteractive_radius, linestyle="--", color="gray", label=r"Non-interactive $1 - \bar \alpha$ quantile")
     ax.plot(episodes, shifted_radius_arr, label=r"$r_j$", marker='s')
     ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker='o')
-    ax.set_title(r"Radius Across Episodes")
+    ax.set_title(r"\bf{(a)} Radius across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_lim)
     ax.set_xticks(x_ticks)
@@ -130,7 +153,7 @@ def main() -> None:
         )
     else:
         ax.plot(episodes, cumulative_reward_arr, label=r"Cumulative progress towards goal", marker='s')
-    ax.set_title(r"Performance Across Episodes")
+    ax.set_title(r"\bf{(b)} Cumulative reward across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_lim)
     ax.set_xticks(x_ticks)
@@ -147,7 +170,7 @@ def main() -> None:
     target_alpha = alpha if alpha is not None else 0.1
     target_line = (1 - target_alpha)
     ax.axhline(target_line, linestyle="--", color="gray", label=r"Target $(1 - \alpha)$")
-    ax.set_title(r"Empirical Tube Coverage")
+    ax.set_title(r"\bf{(c)} Empirical tube coverage across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_lim)
     ax.set_xticks(x_ticks)
@@ -162,7 +185,7 @@ def main() -> None:
     fig, ax = plt.subplots()
     ax.plot(episodes, safety_arr, label=r"Empirical safety", marker='s')
     ax.axhline(target_line, linestyle="--", color="gray", label=r"Target $(1 - \alpha)$")
-    ax.set_title(r"Empirical Safety Coverage")
+    ax.set_title(r"\bf{(d)} Empirical safety coverage across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_lim)
     ax.set_xticks(x_ticks)
@@ -179,14 +202,21 @@ def main() -> None:
         trajs = agent_locs_per_episode[episode_idx]
         num_agents, num_steps, _ = trajs.shape
         solo_idx = num_agents - 1
+        episode_display = episode_idx + 1
 
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
 
+        env_labeled = False
         for agent_id in range(num_agents):
             traj = trajs[agent_id]
-            color = "tab:red" if agent_id == solo_idx else None
-            label = f"Ego (radius {radius_arr[episode_idx]:.3g})" if agent_id == solo_idx else f"Agent {agent_id}"
+            if agent_id == solo_idx:
+                color = "tab:red"
+                label = "Ego agent"
+            else:
+                color = "tab:blue"
+                label = "Environment agent" if not env_labeled else None
+                env_labeled = True
             ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], label=label, color=color)
         # Overlay predicted trajectories for the multi agents (dotted lines)
         pred_all = predicted_traj_per_episode[episode_idx]  # shape: num_multi_agents x steps x 6
@@ -200,18 +230,18 @@ def main() -> None:
                 pred_traj[:, 2],
                 linestyle=":",
                 color="tab:blue",
-                label="Predicted (multi)" if agent_id == 0 else None,
+                label="Predicted trajectory" if agent_id == 0 else None,
             )
-        ax.set_title(rf"3D Trajectories (Episode {episode_idx + 1})")
-        ax.set_xlabel(r"$x$ (m)")
-        ax.set_ylabel(r"$y$ (m)")
-        ax.set_zlabel(r"$z$ (m)")
+        _apply_bold_3d_text(
+            ax,
+            rf"3D trajectories: $j={episode_display}$, $r_j = {radius_arr[episode_idx]:.3g}$ (m)",
+        )
         if episode_idx == 0:
             ax.legend()
-        traj_plot_path = os.path.join(output_dir, f"trajectories_episode_{episode_idx + 1}.pdf")
+        traj_plot_path = os.path.join(output_dir, f"trajectories_episode_{episode_display}.pdf")
         fig.savefig(traj_plot_path, bbox_inches="tight", format='pdf')
         plt.close(fig)
-        plot_paths[f"trajectories_{episode_idx + 1}"] = traj_plot_path
+        plot_paths[f"trajectories_{episode_display}"] = traj_plot_path
         
     # Plot F: Make a trajectory plot for one agent with a tube
     agent_idx = args.tube_agent
@@ -220,6 +250,7 @@ def main() -> None:
         trajs = agent_locs_per_episode[episode_idx]
         num_agents, num_steps, _ = trajs.shape
         solo_idx = num_agents - 1
+        episode_display = episode_idx + 1
 
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
@@ -253,20 +284,20 @@ def main() -> None:
         ax.scatter([agent_start[0]], [agent_start[1]], [agent_start[2]], color="tab:blue", marker="o", s=30)
         # Build legend without Poly3DCollection handles from spheres
         handles, labels = ax.get_legend_handles_labels()
-        ax.set_title(rf"Conformal Tube: Episode \#{episode_idx + 1}, Radius {radius_arr[episode_idx]:.3g} (m)")
-        ax.set_xlabel(r"$x$ (m)")
-        ax.set_ylabel(r"$y$ (m)")
-        ax.set_zlabel(r"$z$ (m)")
+        _apply_bold_3d_text(
+            ax,
+            rf"Agent {agent_idx} tube: $j={episode_display}$, $r_j = {radius_arr[episode_idx]:.3g}$ (m)",
+        )
         if not axes_lim is None:
             ax.set_xlim(*axes_lim['x'])
             ax.set_ylim(*axes_lim['y'])
             ax.set_zlim(*axes_lim['z'])
         if episode_idx == 0:
             ax.legend(handles, labels)
-        traj_plot_path = os.path.join(output_dir, f"tube_{episode_idx + 1}.pdf")
+        traj_plot_path = os.path.join(output_dir, f"tube_{episode_display}.pdf")
         fig.savefig(traj_plot_path, bbox_inches="tight", format='pdf')
         plt.close(fig)
-        plot_paths[f"tube_{episode_idx + 1}"] = traj_plot_path
+        plot_paths[f"tube_{episode_display}"] = traj_plot_path
         if axes_lim is None:
             axes_lim = {}
             axes_lim['x'] = ax.get_xlim()

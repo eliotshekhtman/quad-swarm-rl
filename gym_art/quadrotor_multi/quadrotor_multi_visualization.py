@@ -87,7 +87,7 @@ class CornerCamera(object):
 
 class TopDownFollowCamera(object):
     def __init__(self, view_dist=4):
-        self.view_dist = view_dist
+        self.view_dist = float(view_dist)
 
     def reset(self, goal, pos, vel):
         self.goal = goal
@@ -103,7 +103,7 @@ class TopDownFollowCamera(object):
     # return eye, center, up suitable for gluLookAt
     def look_at(self):
         up = npa(0, 1, 0)
-        eye = self.pos_smooth + np.array([0, 0, 5])
+        eye = self.pos_smooth + np.array([0, 0, self.view_dist])
         center = self.pos_smooth
         return eye, center, up
 
@@ -117,7 +117,7 @@ class Quadrotor3DSceneMulti:
             viewpoint='chase', obs_hw=None, room_dims=(10, 10, 10), num_agents=8, obstacles=None,
             render_speed=1.0, formation_size=-1.0, vis_vel_arrows=True, vis_acc_arrows=True, viz_traces=100, viz_trace_nth_step=1,
             num_obstacles=0, scene_index=0, bubble_radius=0.0, bubble_rgba=(0.0, 1.0, 0.0, 0.18),
-            bubble_positions=None
+            bubble_positions=None, agent_colors=None
     ):
         self.pygl_window = __import__('pyglet.window', fromlist=['key'])
         self.keys = None  # keypress handler, initialized later
@@ -195,7 +195,15 @@ class Quadrotor3DSceneMulti:
         self.bubble_radius = float(bubble_radius)
         self.bubble_rgba = np.asarray(bubble_rgba, dtype=np.float64).copy()
         self.bubble_positions = None if bubble_positions is None else np.asarray(bubble_positions, dtype=np.float64).copy()
+        self.agent_colors = None if agent_colors is None else np.asarray(agent_colors, dtype=np.float64).copy()
         self.topdown_default_radius = 15.0
+
+    def _agent_color(self, agent_id):
+        if self.agent_colors is not None:
+            colors = np.asarray(self.agent_colors, dtype=np.float64)
+            if colors.ndim == 2 and colors.shape[1] == 3 and agent_id < colors.shape[0]:
+                return tuple(float(x) for x in colors[agent_id])
+        return QUAD_COLOR[agent_id % len(QUAD_COLOR)]
 
     def _bubble_rgba_for_agent(self, agent_id):
         rgba = np.asarray(self.bubble_rgba, dtype=np.float64)
@@ -253,10 +261,11 @@ class Quadrotor3DSceneMulti:
         path_sphere = r3d.sphere(0.15 * self.diameter, 16)
 
         for i, model in enumerate(self.models):
+            color = self._agent_color(i)
             if model is not None:
-                quad_transform = quadrotor_3dmodel(model, quad_id=i)
+                quad_transform = quadrotor_3dmodel(model, quad_id=i, quad_color=color)
             else:
-                quad_transform = quadrotor_simple_3dmodel(self.diameter)
+                quad_transform = quadrotor_simple_3dmodel(self.diameter, quad_color=color)
             self.quad_transforms.append(quad_transform)
 
             self.shadow_transforms.append(
@@ -284,7 +293,7 @@ class Quadrotor3DSceneMulti:
                 )
 
             if self.viz_traces:
-                color = QUAD_COLOR[i % len(QUAD_COLOR)] + (1.0,)
+                color = self._agent_color(i) + (1.0,)
                 for j in range(self.viz_traces):
                     self.path_transforms[i].append(r3d.transform_and_color(np.eye(4), color, path_sphere))
 
@@ -292,7 +301,8 @@ class Quadrotor3DSceneMulti:
         floor = r3d.ProceduralTexture(2, (0.85, 0.95),
                                       r3d.rect((100, 100), (0, 100), (0, 100)))
         self.update_goal_diameter()
-        self.chase_cam.view_dist = self.diameter * 15
+        if self.viewpoint in ('chase', 'side'):
+            self.chase_cam.view_dist = self.diameter * 15
 
         self.create_goals()
 
@@ -359,7 +369,7 @@ class Quadrotor3DSceneMulti:
 
         goal_sphere = r3d.sphere(0.1 / 2, 18)
         for i in range(len(self.models)):
-            color = QUAD_COLOR[i % len(QUAD_COLOR)]
+            color = self._agent_color(i)
             goal_transform = r3d.transform_and_color(np.eye(4), color, goal_sphere)
             self.goal_transforms.append(goal_transform)
 
@@ -442,7 +452,7 @@ class Quadrotor3DSceneMulti:
                         self.path_store[i].pop(0)
 
                     self.path_store[i].append(translation)
-                    color_rgba = QUAD_COLOR[i % len(QUAD_COLOR)] + (1.0,)
+                    color_rgba = self._agent_color(i) + (1.0,)
                     path_storage_length = len(self.path_store[i])
                     for k in range(path_storage_length):
                         scale = k / path_storage_length + 0.01
@@ -478,8 +488,9 @@ class Quadrotor3DSceneMulti:
 
                     cone_mat = r3d.trans_and_rot(dyn.pos, vector_dir @ dyn.rot) @ cone_trans
 
-                    self.vec_cyl_transforms[i].set_transform_and_color(cyl_mat, QUAD_COLOR[i % len(QUAD_COLOR)] + (1.0,))
-                    self.vec_cone_transforms[i].set_transform_and_color(cone_mat, QUAD_COLOR[i % len(QUAD_COLOR)] + (1.0,))
+                    color_rgba = self._agent_color(i) + (1.0,)
+                    self.vec_cyl_transforms[i].set_transform_and_color(cyl_mat, color_rgba)
+                    self.vec_cone_transforms[i].set_transform_and_color(cone_mat, color_rgba)
 
                 if self.vis_acc_arrows:
                     if len(self.vector_array[i]) > 10:
@@ -505,8 +516,9 @@ class Quadrotor3DSceneMulti:
 
                     cone_mat = r3d.trans_and_rot(dyn.pos, vector_dir @ dyn.rot) @ cone_trans
 
-                    self.vec_cyl_transforms[i].set_transform_and_color(cyl_mat, QUAD_COLOR[i % len(QUAD_COLOR)] + (1.0,))
-                    self.vec_cone_transforms[i].set_transform_and_color(cone_mat, QUAD_COLOR[i % len(QUAD_COLOR)] + (1.0,))
+                    color_rgba = self._agent_color(i) + (1.0,)
+                    self.vec_cyl_transforms[i].set_transform_and_color(cyl_mat, color_rgba)
+                    self.vec_cone_transforms[i].set_transform_and_color(cone_mat, color_rgba)
 
                 matrix = r3d.translate(dyn.pos)
                 if collisions['drone'][i] > 0.0 or collisions['ground'][i] > 0.0 or collisions['obstacle'][i] > 0.0:

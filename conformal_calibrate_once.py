@@ -11,6 +11,7 @@ Adjust new radius, but use a kappa that we set.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,11 +34,6 @@ from swarm_rl.env_snapshot import *
 
 from project_utils.conformal_utils import *
 from project_utils.utils import *
-from project_utils.cbf_utils import (
-    make_cbf_filter, 
-    CBF_K0, 
-    CBF_K1,
-)
 from project_utils.restart_utils import (
     deterministic_reset,
     extract_positions_velocities,
@@ -81,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_threads", type=int, default=1, help="Max worker threads for parallel rollouts (default: CPU count).")
     parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--ecbf", action="store_true", help="Use project_utils.full_cbf_utils instead of project_utils.cbf_utils.")
     return parser.parse_args()
 
 
@@ -90,8 +87,14 @@ def ensure_experiment_dir(base_dir: str, name: str) -> str:
     return experiment_dir
 
 
+def load_cbf_module(use_ecbf: bool):
+    module_name = "project_utils.full_cbf_utils" if use_ecbf else "project_utils.cbf_utils"
+    return importlib.import_module(module_name)
+
+
 def main() -> None:
     args = parse_args()
+    cbf_module = load_cbf_module(args.ecbf)
 
     torch.set_grad_enabled(False)
     register_swarm_components()
@@ -208,7 +211,7 @@ def main() -> None:
     # Init r0 to some large value that ought to be safe
     radius = MAX_RADIUS
     radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-    filter = make_cbf_filter(radii)
+    filter = cbf_module.make_cbf_filter(radii)
 
     ##### COLLECTING q0 #####
     # Find qj using old pi_j
@@ -319,7 +322,7 @@ def main() -> None:
     print('r0', radius, 'q0', q0, 'r1', new_radius)
     radius = new_radius
     radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-    filter = make_cbf_filter(radii) # pi_{j+1}
+    filter = cbf_module.make_cbf_filter(radii) # pi_{j+1}
     temp_env.close()
 
     ### COLLECTING q1 FOR POSTERITY ###
@@ -430,7 +433,7 @@ def main() -> None:
         delta_r = np.abs(new_radius - radius) # How different is it this time
         radius = new_radius
     radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-    filter = make_cbf_filter(radii) # pi_{j+1}
+    filter = cbf_module.make_cbf_filter(radii) # pi_{j+1}
     
     # Find qj using old pi_j
     # Make sure the environment is reset for rollout collection
