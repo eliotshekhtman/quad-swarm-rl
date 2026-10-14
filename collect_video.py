@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Collect fixed-radius conformal rollouts and render a composite replay video.
+Collect a fixed-radius conformal rollout and render a replay video.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
 from project_utils.conformal_utils import fall_down, run_multi_agents
-from project_utils.restart_utils import deterministic_reset
+from project_utils.restart_utils import deterministic_reset, reseed_quads, set_global_seed
 from project_utils.utils import (
     OBS_KEY,
     get_swarm_state,
@@ -52,8 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions_dir", default="train_dir")
     parser.add_argument("--init_predictions", default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--rollout_seed", type=int, default=None)
     parser.add_argument("--episode_length", type=int, default=1500)
-    parser.add_argument("--num_trajectories", type=int, default=1)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--r", type=float, required=True)
@@ -63,6 +63,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--video_view_mode", default="topdownfollow")
     parser.add_argument("--video_topdownfollow_zoom", type=float, default=5.0)
+    parser.add_argument(
+        "--video_global_elev",
+        type=float,
+        default=None,
+        help="Matplotlib-style elevation angle in degrees for --video_view_mode global.",
+    )
+    parser.add_argument(
+        "--video_global_azim",
+        type=float,
+        default=None,
+        help="Matplotlib-style azimuth angle in degrees for --video_view_mode global.",
+    )
+    parser.add_argument(
+        "--video_global_radius",
+        type=float,
+        default=None,
+        help="Camera distance for --video_view_mode global.",
+    )
+    parser.add_argument("--skip_video", action="store_true")
     parser.add_argument("--ecbf", action="store_true", help="Use project_utils.full_cbf_utils instead of project_utils.cbf_utils.")
     return parser.parse_args()
 
@@ -86,12 +105,25 @@ def _append_video_frame(env, video_frames: List[np.ndarray]) -> None:
     frame = env.render()
     if frame is None:
         raise RuntimeError(
-            "collect_video composite rendering requires the normal simulator renderer, but env.render() returned None."
+            "collect_video replay rendering requires the normal simulator renderer, but env.render() returned None."
         )
     video_frames.append(np.asarray(frame, dtype=np.uint8).copy())
 
 
-def _configure_replay_scene(env, ego_global_idx: int, topdownfollow_zoom: float, agent_colors: np.ndarray) -> None:
+def _apply_rollout_seed(env, rollout_seed: int) -> None:
+    set_global_seed(int(rollout_seed))
+    reseed_quads(env.unwrapped, int(rollout_seed))
+
+
+def _configure_replay_scene(
+    env,
+    ego_global_idx: int,
+    topdownfollow_zoom: float,
+    agent_colors: np.ndarray,
+    global_elev: float | None = None,
+    global_azim: float | None = None,
+    global_radius: float | None = None,
+) -> None:
     env_unwrapped = env.unwrapped
     if len(env_unwrapped.scenes) == 0:
         env_unwrapped.init_scene_multi()
@@ -100,6 +132,13 @@ def _configure_replay_scene(env, ego_global_idx: int, topdownfollow_zoom: float,
         scene.agent_colors = np.asarray(agent_colors, dtype=np.float64).copy()
         if scene.viewpoint == "topdownfollow":
             scene.chase_cam.view_dist = float(topdownfollow_zoom)
+        elif scene.viewpoint == "global":
+            if global_elev is not None:
+                scene.chase_cam.theta = np.deg2rad(90.0 - float(global_elev))
+            if global_azim is not None:
+                scene.chase_cam.phi = np.deg2rad(float(global_azim))
+            if global_radius is not None:
+                scene.chase_cam.radius = float(global_radius)
 
 
 def _save_video_frames(video_path: str, video_frames: List[np.ndarray], fps: int) -> None:
@@ -195,6 +234,7 @@ def _load_or_generate_pred_trajectories(
         return [pred_trajectories[i] for i in range(pred_trajectories.shape[0])]
 
     obs = deterministic_reset(env, args.seed, stored_states)[0]
+    _apply_rollout_seed(env, args.rollout_seed)
     snapshot = safe_capture_env_snapshot(env)
     temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
     dummy_pred = np.zeros((num_multi_agents, args.episode_length, 6), dtype=np.float32)
@@ -236,10 +276,9 @@ def _extract_agent_state(quad) -> Dict[str, np.ndarray]:
     }
 
 
-def _collect_single_trajectory(
+def _collect_trajectory(
     snapshot,
     obs: np.ndarray,
-    trajectory_idx: int,
     num_multi_agents: int,
     multi_actor,
     multi_rnn_states: torch.Tensor,
@@ -268,7 +307,6 @@ def _collect_single_trajectory(
 
     done = False
     step_num = 0
-    force_deterministic = deterministic or trajectory_idx == 0
 
     try:
         while (not done) and step_num < max_steps:
@@ -278,8 +316,7 @@ def _collect_single_trajectory(
                 policy_output = multi_actor(normalized_obs, run_multi_rnn_states)
             actions_multi = policy_output["actions"]
             run_multi_rnn_states = policy_output["new_rnn_states"]
-            if force_deterministic:
-                actions_multi = argmax_actions(multi_actor.action_distribution())
+            actions_multi = argmax_actions(multi_actor.action_distribution())
             if actions_multi.dim() == 1:
                 actions_multi = actions_multi.unsqueeze(-1)
             actions_multi = actions_multi.detach().cpu().numpy()
@@ -290,7 +327,9 @@ def _collect_single_trajectory(
                 normalized_solo = prepare_and_normalize_obs(solo_actor, obs_solo_dict)
                 policy_solo = solo_actor(normalized_solo, run_solo_rnn_states)
             run_solo_rnn_states = policy_solo["new_rnn_states"]
-            action_solo = argmax_actions(solo_actor.action_distribution())
+            action_solo = policy_solo["actions"]
+            if deterministic:
+                action_solo = argmax_actions(solo_actor.action_distribution())
             if action_solo.dim() == 1:
                 action_solo = action_solo.unsqueeze(0)
             action_solo = action_solo.detach().cpu().numpy()[0]
@@ -389,9 +428,8 @@ def _prediction_step_for_frame(frame_idx: int, episode_length: int) -> int:
     return min(frame_idx - 1, episode_length - 1)
 
 
-def _build_replay_agent_colors(num_trajectories: int, num_multi_agents: int) -> np.ndarray:
+def _build_replay_agent_colors(num_multi_agents: int) -> np.ndarray:
     local_agents = int(num_multi_agents) + 1
-    total_agents = int(num_trajectories) * local_agents
     non_ego_palette = [
         np.asarray(color, dtype=np.float64)
         for color in QUAD_COLOR
@@ -400,20 +438,18 @@ def _build_replay_agent_colors(num_trajectories: int, num_multi_agents: int) -> 
     if len(non_ego_palette) == 0:
         raise ValueError("QUAD_COLOR must contain at least one non-red color for non-ego quads.")
 
-    agent_colors = np.zeros((total_agents, 3), dtype=np.float64)
-    for traj_idx in range(int(num_trajectories)):
-        for local_idx in range(local_agents):
-            global_idx = traj_idx * local_agents + local_idx
-            if local_idx == int(num_multi_agents):
-                agent_colors[global_idx] = EGO_QUAD_RGB
-            else:
-                agent_colors[global_idx] = non_ego_palette[local_idx % len(non_ego_palette)]
+    agent_colors = np.zeros((local_agents, 3), dtype=np.float64)
+    for agent_idx in range(local_agents):
+        if agent_idx == int(num_multi_agents):
+            agent_colors[agent_idx] = EGO_QUAD_RGB
+        else:
+            agent_colors[agent_idx] = non_ego_palette[agent_idx % len(non_ego_palette)]
     return agent_colors
 
 
-def _set_composite_replay_frame(
+def _set_replay_frame(
     env_unwrapped,
-    trajectories: Sequence[Dict[str, np.ndarray]],
+    trajectory: Dict[str, np.ndarray],
     pred_trajectories: np.ndarray,
     agent_colors: np.ndarray,
     frame_idx: int,
@@ -421,71 +457,66 @@ def _set_composite_replay_frame(
     num_multi_agents: int,
     num_closest: int,
 ) -> None:
-    total_agents = len(trajectories) * (num_multi_agents + 1)
-    if len(env_unwrapped.envs) != total_agents:
-        raise ValueError("Replay env agent count does not match composite trajectory count.")
+    num_agents = int(num_multi_agents) + 1
+    if len(env_unwrapped.envs) != num_agents:
+        raise ValueError("Replay env agent count does not match trajectory agent count.")
 
-    bubble_positions = np.zeros((total_agents, 3), dtype=np.float64)
-    bubble_rgba = np.zeros((total_agents, 4), dtype=np.float64)
+    bubble_positions = np.zeros((num_agents, 3), dtype=np.float64)
+    bubble_rgba = np.zeros((num_agents, 4), dtype=np.float64)
     goals_out = []
 
     pred_step = _prediction_step_for_frame(frame_idx, pred_trajectories.shape[1])
-    local_agents = num_multi_agents + 1
+    positions, velocities, rotations, omegas, goals = _state_for_frame(trajectory, frame_idx)
+    actual_ego_pos = positions[num_multi_agents]
+    actual_teammate_pos = positions[:num_multi_agents]
+    predicted_positions = pred_trajectories[:, pred_step, :3]
 
-    for traj_idx, traj in enumerate(trajectories):
-        positions, velocities, rotations, omegas, goals = _state_for_frame(traj, frame_idx)
-        actual_ego_pos = positions[num_multi_agents]
-        actual_teammate_pos = positions[:num_multi_agents]
-        predicted_positions = pred_trajectories[:, pred_step, :3]
+    actual_distances = np.linalg.norm(actual_teammate_pos - actual_ego_pos[None, :], axis=1)
+    nearest_count = min(max(int(num_closest), 0), num_multi_agents)
+    nearest = np.argsort(actual_distances)[:nearest_count]
 
-        actual_distances = np.linalg.norm(actual_teammate_pos - actual_ego_pos[None, :], axis=1)
-        nearest_count = min(max(int(num_closest), 0), num_multi_agents)
-        nearest = np.argsort(actual_distances)[:nearest_count]
+    for agent_idx in range(num_agents):
+        quad = env_unwrapped.envs[agent_idx]
+        quad.goal = np.asarray(goals[agent_idx], dtype=np.float64).copy()
+        quad.spawn_point = np.asarray(trajectory["initial_positions"][agent_idx], dtype=np.float64).copy()
+        quad.dynamics.set_state(
+            np.asarray(positions[agent_idx], dtype=np.float64),
+            np.asarray(velocities[agent_idx], dtype=np.float64),
+            np.asarray(rotations[agent_idx], dtype=np.float64),
+            np.asarray(omegas[agent_idx], dtype=np.float64),
+        )
+        quad.dynamics.reset()
+        quad.dynamics.on_floor = False
+        quad.dynamics.crashed_floor = False
+        quad.dynamics.crashed_wall = False
+        quad.dynamics.crashed_ceiling = False
+        quad.tick = int(frame_idx)
+        quad.actions = [np.zeros(4, dtype=np.float64), np.zeros(4, dtype=np.float64)]
 
-        for local_idx in range(local_agents):
-            global_idx = traj_idx * local_agents + local_idx
-            quad = env_unwrapped.envs[global_idx]
-            quad.goal = np.asarray(goals[local_idx], dtype=np.float64).copy()
-            quad.spawn_point = np.asarray(traj["initial_positions"][local_idx], dtype=np.float64).copy()
-            quad.dynamics.set_state(
-                np.asarray(positions[local_idx], dtype=np.float64),
-                np.asarray(velocities[local_idx], dtype=np.float64),
-                np.asarray(rotations[local_idx], dtype=np.float64),
-                np.asarray(omegas[local_idx], dtype=np.float64),
-            )
-            quad.dynamics.reset()
-            quad.dynamics.on_floor = False
-            quad.dynamics.crashed_floor = False
-            quad.dynamics.crashed_wall = False
-            quad.dynamics.crashed_ceiling = False
-            quad.tick = int(frame_idx)
-            quad.actions = [np.zeros(4, dtype=np.float64), np.zeros(4, dtype=np.float64)]
+        env_unwrapped.pos[agent_idx, :] = quad.dynamics.pos
+        env_unwrapped.vel[agent_idx, :] = quad.dynamics.vel
+        goals_out.append(np.asarray(quad.goal, dtype=np.float64).copy())
 
-            env_unwrapped.pos[global_idx, :] = quad.dynamics.pos
-            env_unwrapped.vel[global_idx, :] = quad.dynamics.vel
-            goals_out.append(np.asarray(quad.goal, dtype=np.float64).copy())
-
-        for teammate_idx in nearest:
-            global_idx = traj_idx * local_agents + teammate_idx
-            bubble_positions[global_idx] = predicted_positions[teammate_idx]
-            bubble_rgba[global_idx, :3] = agent_colors[global_idx]
-            bubble_rgba[global_idx, 3] = SPHERE_ALPHA
+    for teammate_idx in nearest:
+        bubble_positions[teammate_idx] = predicted_positions[teammate_idx]
+        bubble_rgba[teammate_idx, :3] = agent_colors[teammate_idx]
+        bubble_rgba[teammate_idx, 3] = SPHERE_ALPHA
 
     env_unwrapped.render_bubble_radius = float(radius)
     env_unwrapped.render_bubble_positions = bubble_positions
     env_unwrapped.render_bubble_rgba = bubble_rgba
     env_unwrapped.all_collisions = {
-        "drone": np.zeros(total_agents, dtype=np.float64),
-        "ground": np.zeros(total_agents, dtype=np.float64),
-        "obstacle": np.zeros(total_agents, dtype=np.float64),
+        "drone": np.zeros(num_agents, dtype=np.float64),
+        "ground": np.zeros(num_agents, dtype=np.float64),
+        "obstacle": np.zeros(num_agents, dtype=np.float64),
     }
     if hasattr(env_unwrapped.scenario, "goals"):
         env_unwrapped.scenario.goals = np.asarray(goals_out, dtype=np.float64)
 
 
-def _record_composite_video(
+def _record_replay_video(
     cfg_multi,
-    trajectories: Sequence[Dict[str, np.ndarray]],
+    trajectory: Dict[str, np.ndarray],
     pred_trajectories: np.ndarray,
     radius: float,
     num_multi_agents: int,
@@ -494,26 +525,34 @@ def _record_composite_video(
     video_fps: int,
     video_view_mode: str,
     video_topdownfollow_zoom: float,
+    video_global_elev: float | None,
+    video_global_azim: float | None,
+    video_global_radius: float | None,
 ) -> None:
-    if len(trajectories) == 0:
-        raise ValueError("Need at least one trajectory to render a composite video.")
-
-    total_agents = len(trajectories) * (num_multi_agents + 1)
-    replay_cfg = _build_eval_cfg(cfg_multi, num_agents=total_agents, enable_render=True, view_mode=video_view_mode)
+    num_agents = int(num_multi_agents) + 1
+    replay_cfg = _build_eval_cfg(cfg_multi, num_agents=num_agents, enable_render=True, view_mode=video_view_mode)
     replay_env = make_quadrotor_env("quadrotor_multi", cfg=replay_cfg, render_mode="rgb_array")
     replay_env.unwrapped.render_bubble_radius = float(radius)
-    agent_colors = _build_replay_agent_colors(len(trajectories), num_multi_agents)
+    agent_colors = _build_replay_agent_colors(num_multi_agents)
 
     try:
         _reset_env(replay_env)
-        first_ego_global_idx = int(num_multi_agents)
-        _configure_replay_scene(replay_env, first_ego_global_idx, video_topdownfollow_zoom, agent_colors)
-        max_len = max(int(traj["trajectory_length"]) for traj in trajectories)
+        ego_idx = int(num_multi_agents)
+        _configure_replay_scene(
+            replay_env,
+            ego_idx,
+            video_topdownfollow_zoom,
+            agent_colors,
+            global_elev=video_global_elev,
+            global_azim=video_global_azim,
+            global_radius=video_global_radius,
+        )
+        max_len = int(trajectory["trajectory_length"])
         video_frames: List[np.ndarray] = []
         for frame_idx in range(max_len + 1):
-            _set_composite_replay_frame(
+            _set_replay_frame(
                 replay_env.unwrapped,
-                trajectories,
+                trajectory,
                 pred_trajectories,
                 agent_colors,
                 frame_idx,
@@ -530,19 +569,23 @@ def _record_composite_video(
 def main() -> None:
     args = parse_args()
     cbf_module = load_cbf_module(args.ecbf)
+    if args.rollout_seed is None:
+        args.rollout_seed = int(args.seed)
     if args.r <= 0.0:
         raise ValueError("--r must be positive.")
-    if args.num_trajectories <= 0:
-        raise ValueError("--num_trajectories must be positive.")
     if args.num_closest < 0:
         raise ValueError("--num_closest must be non-negative.")
     if args.video_topdownfollow_zoom <= 0.0:
         raise ValueError("--video_topdownfollow_zoom must be positive.")
+    if args.video_global_radius is not None and args.video_global_radius <= 0.0:
+        raise ValueError("--video_global_radius must be positive.")
 
     output_path = _normalize_output_path(args.output_path)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    video_path = _resolve_video_output(output_path, args.video_name)
-    os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
+    video_path = None
+    if not args.skip_video:
+        video_path = _resolve_video_output(output_path, args.video_name)
+        os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
 
     torch.set_grad_enabled(False)
     register_swarm_components()
@@ -597,62 +640,47 @@ def main() -> None:
             if not np.allclose(initial_signature[key], seeded_signature[key]):
                 raise RuntimeError(f"Deterministic seeded reset mismatch for {key}.")
 
+        _apply_rollout_seed(env, args.rollout_seed)
         snapshot = safe_capture_env_snapshot(env)
         radii = np.full(args.num_multi_agents, float(args.r), dtype=np.float64)
         solo_action_fn = cbf_module.make_cbf_filter(radii)
 
-        trajectories = []
-        for traj_idx in range(args.num_trajectories):
-            trajectories.append(
-                _collect_single_trajectory(
-                    snapshot,
-                    obs,
-                    trajectory_idx=traj_idx,
-                    num_multi_agents=args.num_multi_agents,
-                    multi_actor=multi_actor,
-                    multi_rnn_states=multi_rnn_states,
-                    solo_actor=solo_actor,
-                    solo_rnn_states=solo_rnn_states,
-                    solo_obs_dim=solo_obs_dim,
-                    pred_trajectories=pred_trajectories_list,
-                    solo_action_fn=solo_action_fn,
-                    max_steps=args.episode_length,
-                    deterministic=args.deterministic,
-                )
-            )
+        trajectory = _collect_trajectory(
+            snapshot,
+            obs,
+            num_multi_agents=args.num_multi_agents,
+            multi_actor=multi_actor,
+            multi_rnn_states=multi_rnn_states,
+            solo_actor=solo_actor,
+            solo_rnn_states=solo_rnn_states,
+            solo_obs_dim=solo_obs_dim,
+            pred_trajectories=pred_trajectories_list,
+            solo_action_fn=solo_action_fn,
+            max_steps=args.episode_length,
+            deterministic=args.deterministic,
+        )
     finally:
         env.close()
 
-    trajectory_lengths = np.asarray([traj["trajectory_length"] for traj in trajectories], dtype=np.int32)
-    positions = np.stack([traj["positions"] for traj in trajectories], axis=0)
-    velocities = np.stack([traj["velocities"] for traj in trajectories], axis=0)
-    rotations = np.stack([traj["rotations"] for traj in trajectories], axis=0)
-    omegas = np.stack([traj["omegas"] for traj in trajectories], axis=0)
-    goals = np.stack([traj["goals"] for traj in trajectories], axis=0)
-    initial_positions = np.stack([traj["initial_positions"] for traj in trajectories], axis=0)
-    initial_velocities = np.stack([traj["initial_velocities"] for traj in trajectories], axis=0)
-    initial_rotations = np.stack([traj["initial_rotations"] for traj in trajectories], axis=0)
-    initial_omegas = np.stack([traj["initial_omegas"] for traj in trajectories], axis=0)
-    initial_goals = np.stack([traj["initial_goals"] for traj in trajectories], axis=0)
-
     np.savez_compressed(
         output_path,
-        positions=positions,
-        velocities=velocities,
-        rotations=rotations,
-        omegas=omegas,
-        goals=goals,
-        initial_positions=initial_positions,
-        initial_velocities=initial_velocities,
-        initial_rotations=initial_rotations,
-        initial_omegas=initial_omegas,
-        initial_goals=initial_goals,
-        trajectory_lengths=trajectory_lengths,
+        positions=trajectory["positions"],
+        velocities=trajectory["velocities"],
+        rotations=trajectory["rotations"],
+        omegas=trajectory["omegas"],
+        goals=trajectory["goals"],
+        initial_positions=trajectory["initial_positions"],
+        initial_velocities=trajectory["initial_velocities"],
+        initial_rotations=trajectory["initial_rotations"],
+        initial_omegas=trajectory["initial_omegas"],
+        initial_goals=trajectory["initial_goals"],
+        trajectory_length=np.int32(trajectory["trajectory_length"]),
         pred_trajectories=pred_trajectories,
         r=np.float64(args.r),
         num_closest=np.int32(args.num_closest),
         num_multi_agents=np.int32(args.num_multi_agents),
         seed=np.int32(args.seed),
+        rollout_seed=np.int32(args.rollout_seed),
         scenario_positions=seeded_signature["positions"],
         scenario_goals=seeded_signature["goals"],
         scenario_goal_pairs=seeded_signature["goal_pairs"],
@@ -663,18 +691,22 @@ def main() -> None:
     with open(args_path, "w", encoding="utf-8") as handle:
         json.dump(vars(args), handle, indent=2, sort_keys=True)
 
-    _record_composite_video(
-        cfg_multi=cfg_multi,
-        trajectories=trajectories,
-        pred_trajectories=pred_trajectories,
-        radius=float(args.r),
-        num_multi_agents=args.num_multi_agents,
-        num_closest=args.num_closest,
-        video_path=video_path,
-        video_fps=args.video_fps,
-        video_view_mode=args.video_view_mode,
-        video_topdownfollow_zoom=args.video_topdownfollow_zoom,
-    )
+    if not args.skip_video:
+        _record_replay_video(
+            cfg_multi=cfg_multi,
+            trajectory=trajectory,
+            pred_trajectories=pred_trajectories,
+            radius=float(args.r),
+            num_multi_agents=args.num_multi_agents,
+            num_closest=args.num_closest,
+            video_path=video_path,
+            video_fps=args.video_fps,
+            video_view_mode=args.video_view_mode,
+            video_topdownfollow_zoom=args.video_topdownfollow_zoom,
+            video_global_elev=args.video_global_elev,
+            video_global_azim=args.video_global_azim,
+            video_global_radius=args.video_global_radius,
+        )
 
 
 if __name__ == "__main__":

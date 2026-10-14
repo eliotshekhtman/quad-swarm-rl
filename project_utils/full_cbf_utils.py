@@ -10,7 +10,7 @@ import numpy as np
 from project_utils.utils import SwarmState
 
 CBF_K4 = 0.5
-CBF_K1 = 1
+CBF_K1 = 4
 CBF_K0 = 1
 CBF_SLACK_WEIGHT = 1.0e4
 CBF_RELINEARIZATION_PASSES = 2
