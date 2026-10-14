@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,28 +38,6 @@ def capture_initial_states(env) -> List[QuadState]:
             )
         )
     return states
-
-
-def quad_state_to_serialisable(state: QuadState) -> Dict[str, list]:
-    """Convert a QuadState into JSON-friendly lists."""
-    return {
-        "position": state.position.tolist(),
-        "velocity": state.velocity.tolist(),
-        "rotation": state.rotation.tolist(),
-        "omega": state.omega.tolist(),
-        "goal": state.goal.tolist(),
-    }
-
-
-def quad_state_from_dict(data: Dict[str, Sequence[float]]) -> QuadState:
-    """Rehydrate a QuadState from ``initial_states.json``."""
-    return QuadState(
-        position=np.asarray(data["position"], dtype=np.float64),
-        velocity=np.asarray(data["velocity"], dtype=np.float64),
-        rotation=np.asarray(data["rotation"], dtype=np.float64),
-        omega=np.asarray(data["omega"], dtype=np.float64),
-        goal=np.asarray(data["goal"], dtype=np.float64),
-    )
 
 
 def apply_initial_states(env, states: List[QuadState]) -> List[np.ndarray]:
@@ -133,8 +111,6 @@ __all__ = [
     "capture_initial_states",
     "deterministic_reset",
     "extract_positions_velocities",
-    "quad_state_from_dict",
-    "quad_state_to_serialisable",
     "reseed_quads",
     "set_global_seed",
 ]

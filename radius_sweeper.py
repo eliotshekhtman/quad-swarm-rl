@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
 import os
 from types import SimpleNamespace
 
@@ -29,6 +28,7 @@ from collect_video import (
     _state_for_frame,
 )
 from project_utils.restart_utils import deterministic_reset
+from project_utils.full_cbf_utils import make_cbf_filter
 from project_utils.utils import latest_checkpoint, load_actor, load_cfg
 
 
@@ -48,15 +48,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--radius_start", type=float, default=8.0)
     parser.add_argument("--radius_stop", type=float, default=0.5)
     parser.add_argument("--num_radii", type=int, default=10)
-    parser.add_argument("--ecbf", action="store_true", help="Use project_utils.full_cbf_utils instead of project_utils.cbf_utils.")
     parser.add_argument("--output_path", default="train_dir/radius_sweep_runs.csv")
     parser.add_argument("--summary_path", default=None)
     return parser.parse_args()
-
-
-def load_cbf_module(use_ecbf: bool):
-    module_name = "project_utils.full_cbf_utils" if use_ecbf else "project_utils.cbf_utils"
-    return importlib.import_module(module_name)
 
 
 def _prediction_args(args: argparse.Namespace, rollout_seed: int) -> SimpleNamespace:
@@ -175,7 +169,6 @@ def main() -> None:
     finally:
         solo_env.close()
 
-    cbf_module = load_cbf_module(args.ecbf)
     rollout_seeds = [int(args.rollout_seed_start + idx) for idx in range(args.num_runs)]
     radii = np.linspace(float(args.radius_start), float(args.radius_stop), int(args.num_radii), dtype=np.float64)
 
@@ -197,7 +190,7 @@ def main() -> None:
 
         for radius in radii:
             run_distances = []
-            solo_action_fn = cbf_module.make_cbf_filter(
+            solo_action_fn = make_cbf_filter(
                 np.full(args.num_multi_agents, float(radius), dtype=np.float64)
             )
 

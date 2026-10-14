@@ -1,86 +1,95 @@
 #!/usr/bin/env python3
-"""
-Open-loop conformal
-
-Supercharged predictor: true collected trajectories from a run without interaction.
-    Because of intense variation, predictions re-collected from last run's interaction.
-Collect trajectories for qj using last episode's ego agent policy/radius.
-Adjust new radius, but use a kappa that we set.
-"""
+"""Run robust, naive, or calibrate-once conformal CBF experiments."""
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from tqdm import tqdm
 
-from sample_factory.algo.utils.action_distributions import argmax_actions
-from sample_factory.algo.utils.rl_utils import prepare_and_normalize_obs
 from sample_factory.model.model_utils import get_rnn_size
-from sample_factory.utils.attr_dict import AttrDict
-from sample_factory.huggingface.huggingface_utils import generate_replay_video
 
-from swarm_rl.train import parse_swarm_cfg, register_swarm_components
+from swarm_rl.env_snapshot import clone_env_from_snapshot, safe_capture_env_snapshot
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
-from swarm_rl.env_snapshot import *
+from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
-from project_utils.conformal_utils import *
-from project_utils.utils import *
-from project_utils.restart_utils import (
-    deterministic_reset,
-    extract_positions_velocities,
+from project_utils.conformal_utils import (
+    calibrate_once_final_radius,
+    conformal_radii,
+    fall_down,
+    get_alpha_bar,
+    next_radius,
+    run_multi_agents,
+    summarize_rollouts,
 )
+from project_utils.full_cbf_utils import make_cbf_filter
+from project_utils.restart_utils import deterministic_reset
+from project_utils.utils import latest_checkpoint, load_actor, load_cfg
+
 
 DEVICE = torch.device("cpu")
-DELTA_T = 0.015
-MIN_RADIUS = 0
-MAX_RADIUS = 8
+MAX_RADIUS = 8.0
+KAPPA = 0.6
+COLLISION_HITBOX_RADIUS = 2.5
+UPDATE_PROCEDURES = ("robust", "naive", "calibrate-once")
 
 
-
-# record distance to goal position / reward / max reward/mindist over episodes?
-# what happens if you don't update, if you do aggressive adversarial CP: want to highlight that all the steps are important
-# ablations ^^ 
-# full explanation of what each step does currently, what's my plan for next teps, what's their feedback
-
-# ---------------------------------------------------------------------------
-# Main script
-# ---------------------------------------------------------------------------
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Deterministic patrol_dual_goal data collection.")
-    parser.add_argument("--multi_train_dir", default='train_dir', help="Directory containing the trained multi-agent policy.")
-    parser.add_argument("--multi_experiment", required=True, help="Experiment name for the multi-agent policy.")
-    parser.add_argument("--solo_train_dir", default='train_dir', help="Directory containing the trained single-agent policy.")
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run a conformal prediction experiment with the full ECBF."
+    )
+    parser.add_argument("--multi_train_dir", default="train_dir")
+    parser.add_argument("--multi_experiment", required=True)
+    parser.add_argument("--solo_train_dir", default="train_dir")
     parser.add_argument("--solo_experiment", required=True)
-    parser.add_argument("--train_dir", default='train_dir', help="Base directory to store the new conformal experiment.")
-    parser.add_argument("--experiment_name", required=True, help="Subdirectory under train_dir for outputs.")
-    parser.add_argument("--seed", type=int, default=42, help="Seed applied before every reset to reproduce goals.")
-    parser.add_argument("--alpha", type=float, default=0.1, help="Desired probability of conformal error")
-    parser.add_argument("--delta", type=float, default=0.1, help="Desired probability of a bad draw")
-    parser.add_argument("--video_name", default="conformal_replay.mp4")
-    parser.add_argument("--video_fps", type=int, default=30)
+    parser.add_argument("--train_dir", default="train_dir")
+    parser.add_argument("--experiment_name", required=True)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--alpha", type=float, default=0.1)
+    parser.add_argument("--delta", type=float, default=0.1)
     parser.add_argument("--episode_length", type=int, default=1500)
     parser.add_argument("--num_trajectories", type=int, default=200)
     parser.add_argument("--num_eval_trajs", type=int, default=100)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
-    parser.add_argument("--predictions_dir", default='train_dir', help="Directory containing the initial predicted trajectories.")
-    parser.add_argument("--init_predictions", default=None, help="Experiment name for initial predicted trajectories if provided.")
-    parser.add_argument("--update_predictions", action="store_true", help="Whether or not to update predictions every episode.")
-    parser.add_argument("--keep_conformal_radius", action="store_true", help="Don't update the conformal radius")
-    parser.add_argument("--num_threads", type=int, default=1, help="Max worker threads for parallel rollouts (default: CPU count).")
+    parser.add_argument("--predictions_dir", default="train_dir")
+    parser.add_argument("--init_predictions", default=None)
+    parser.add_argument(
+        "--update_predictions",
+        action="store_true",
+        help="Replace predictions with the first evaluation run after episode 0.",
+    )
     parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--ecbf", action="store_true", help="Use project_utils.full_cbf_utils instead of project_utils.cbf_utils.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--update_procedure",
+        "--update-procedure",
+        choices=UPDATE_PROCEDURES,
+        default="robust",
+        help="Radius update rule. Defaults to the legacy conformal.py behavior.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.episode_length < 2:
+        parser.error("--episode_length must be at least 2")
+    if args.num_trajectories <= 0:
+        parser.error("--num_trajectories must be positive")
+    if args.num_eval_trajs <= 0:
+        parser.error("--num_eval_trajs must be positive")
+    if args.num_episodes < 0:
+        parser.error("--num_episodes must be non-negative")
+    if not 0.0 < args.alpha < 1.0:
+        parser.error("--alpha must lie in (0, 1)")
+    if not 0.0 < args.delta < 1.0:
+        parser.error("--delta must lie in (0, 1)")
+    if args.update_procedure != "calibrate-once" and args.num_episodes == 0:
+        parser.error("--num_episodes must be positive for iterative updates")
+    if args.update_procedure == "calibrate-once" and args.update_predictions:
+        parser.error("--update_predictions is not supported by calibrate-once")
+
+    return args
 
 
 def ensure_experiment_dir(base_dir: str, name: str) -> str:
@@ -89,39 +98,146 @@ def ensure_experiment_dir(base_dir: str, name: str) -> str:
     return experiment_dir
 
 
-def load_cbf_module(use_ecbf: bool):
-    module_name = "project_utils.full_cbf_utils" if use_ecbf else "project_utils.cbf_utils"
-    return importlib.import_module(module_name)
+def _empty_metrics() -> dict:
+    return {
+        "qj_per_episode": [],
+        "radius_per_episode": [],
+        "tube_coverage_per_episode": [],
+        "crashes_per_episode": [],
+        "bad_crashes_per_episode": [],
+        "safety_per_episode": [],
+        "cumulative_reward_per_episode": [],
+        "cumulative_reward_runs_per_episode": [],
+        "agent_locs_per_episode": [],
+        "predicted_traj_per_episode": [],
+    }
+
+
+def _record_episode(
+    metrics: dict,
+    qj: float,
+    radius: float,
+    summary: dict,
+    pred_trajectories,
+) -> None:
+    metrics["qj_per_episode"].append(qj)
+    metrics["radius_per_episode"].append(radius)
+    metrics["tube_coverage_per_episode"].append(summary["tube_coverage"])
+    metrics["crashes_per_episode"].append(summary["crashes"])
+    metrics["bad_crashes_per_episode"].append(summary["bad_crashes"])
+    metrics["safety_per_episode"].append(summary["safety"])
+    metrics["cumulative_reward_per_episode"].append(
+        summary["cumulative_reward"]
+    )
+    metrics["cumulative_reward_runs_per_episode"].append(
+        summary["cumulative_reward_per_run"]
+    )
+    metrics["agent_locs_per_episode"].append(summary["agent_locs"])
+    metrics["predicted_traj_per_episode"].append(
+        np.asarray(pred_trajectories, dtype=np.float32).copy()
+    )
+
+
+def _save_metrics(
+    experiment_dir: str,
+    args: argparse.Namespace,
+    episode_ids,
+    metrics: dict,
+    alpha_bar: float,
+) -> str:
+    metrics_path = os.path.join(experiment_dir, "conformal_metrics.npz")
+    np.savez(
+        metrics_path,
+        episodes=np.asarray(episode_ids, dtype=np.int64),
+        qj_per_episode=np.asarray(
+            metrics["qj_per_episode"],
+            dtype=np.float32,
+        ),
+        radius_per_episode=np.asarray(
+            metrics["radius_per_episode"],
+            dtype=np.float32,
+        ),
+        tube_coverage_per_episode=np.asarray(
+            metrics["tube_coverage_per_episode"],
+            dtype=np.float32,
+        ),
+        crashes_per_episode=np.asarray(
+            metrics["crashes_per_episode"],
+            dtype=np.float32,
+        ),
+        bad_crashes_per_episode=np.asarray(
+            metrics["bad_crashes_per_episode"],
+            dtype=np.float32,
+        ),
+        safety_per_episode=np.asarray(
+            metrics["safety_per_episode"],
+            dtype=np.float32,
+        ),
+        cumulative_reward_per_episode=np.asarray(
+            metrics["cumulative_reward_per_episode"],
+            dtype=np.float32,
+        ),
+        cumulative_reward_per_run=np.asarray(
+            metrics["cumulative_reward_runs_per_episode"],
+            dtype=np.float32,
+        ),
+        agent_locs_per_episode=np.asarray(
+            metrics["agent_locs_per_episode"],
+            dtype=np.float32,
+        ),
+        predicted_traj_per_episode=np.asarray(
+            metrics["predicted_traj_per_episode"],
+            dtype=np.float32,
+        ),
+        alpha=args.alpha,
+        delta=args.delta,
+        bar_alpha=alpha_bar,
+        update_procedure=np.asarray(args.update_procedure),
+    )
+    return metrics_path
+
+
+def _validate_predictions(
+    pred_trajectories,
+    num_multi_agents: int,
+    episode_length: int,
+):
+    predictions = np.asarray(pred_trajectories)
+    if predictions.ndim != 3 or predictions.shape[0] != num_multi_agents:
+        raise ValueError(
+            "Predictions must have shape (num_multi_agents, steps, features)."
+        )
+    if predictions.shape[1] < episode_length:
+        raise ValueError(
+            "Predicted trajectories are shorter than --episode_length."
+        )
+    if predictions.shape[2] < 6:
+        raise ValueError(
+            "Predicted trajectories must contain position and velocity."
+        )
+    return [predictions[i] for i in range(num_multi_agents)]
 
 
 def main() -> None:
     args = parse_args()
-    cbf_module = load_cbf_module(args.ecbf)
 
     torch.set_grad_enabled(False)
     register_swarm_components()
-    max_threads = args.num_threads if args.num_threads and args.num_threads > 0 else (os.cpu_count() or 1)
 
-    if os.path.isabs(args.video_name):
-        video_dir = os.path.dirname(args.video_name) or "."
-        video_file = os.path.basename(args.video_name)
-    else:
-        video_dir = os.path.join(args.multi_train_dir, args.multi_experiment)
-        video_file = args.video_name
-    os.makedirs(video_dir, exist_ok=True)
-    video_frames: List[np.ndarray] = []
-
-    experiment_dir = ensure_experiment_dir(args.train_dir, args.experiment_name)
+    experiment_dir = ensure_experiment_dir(
+        args.train_dir,
+        args.experiment_name,
+    )
     args_path = os.path.join(experiment_dir, "conformal_args.json")
-    with open(args_path, "w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2, sort_keys=True)
+    with open(args_path, "w", encoding="utf-8") as handle:
+        json.dump(vars(args), handle, indent=2, sort_keys=True)
 
-    # Load multi config early since it has some useful info
     cfg_multi = load_cfg(args.multi_train_dir, args.multi_experiment)
     if args.num_multi_agents < 0:
-        args.num_multi_agents = cfg_multi.quads_num_agents
+        args.num_multi_agents = int(cfg_multi.quads_num_agents)
+    if args.num_multi_agents <= 0:
+        raise ValueError("--num_multi_agents must be positive.")
 
-    quads_collision_hitbox_radius = 2.5
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
@@ -131,7 +247,7 @@ def main() -> None:
         f"--quads_neighbor_visible_num={cfg_multi.quads_neighbor_visible_num}",
         f"--quads_neighbor_obs_type={cfg_multi.quads_neighbor_obs_type}",
         "--quads_collision_reward=8.0",
-        f"--quads_collision_hitbox_radius={quads_collision_hitbox_radius}",
+        f"--quads_collision_hitbox_radius={COLLISION_HITBOX_RADIUS}",
         "--quads_collision_falloff_radius=5.0",
         "--quads_collision_smooth_max_penalty=12.0",
         "--quads_use_numba=False",
@@ -140,239 +256,269 @@ def main() -> None:
         "--quads_view_mode=topdown",
     ]
     eval_cfg = parse_swarm_cfg(eval_cli, evaluation=True)
-    render_mode = "rgb_array"
+    env = make_quadrotor_env(
+        "quadrotor_multi",
+        cfg=eval_cfg,
+        render_mode="rgb_array",
+    )
 
-    # Load in multi-agents
-    env = make_quadrotor_env("quadrotor_multi", cfg=eval_cfg, render_mode=render_mode)
-    multi_ckpt = latest_checkpoint(args.multi_train_dir, args.multi_experiment, policy_index=0)
-    multi_actor = load_actor(cfg_multi, env.observation_space, env.action_space, multi_ckpt, DEVICE)
-    multi_rnn_size = get_rnn_size(cfg_multi)
-    multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
+    try:
+        multi_ckpt = latest_checkpoint(
+            args.multi_train_dir,
+            args.multi_experiment,
+            policy_index=0,
+        )
+        multi_actor = load_actor(
+            cfg_multi,
+            env.observation_space,
+            env.action_space,
+            multi_ckpt,
+            DEVICE,
+        )
+        multi_rnn_size = get_rnn_size(cfg_multi)
 
-    # Add in ego agent
-    cfg_solo = load_cfg(args.solo_train_dir, args.solo_experiment)
-    solo_env = make_quadrotor_env("quadrotor_multi", cfg=cfg_solo, render_mode=None)
-    solo_ckpt = latest_checkpoint(args.solo_train_dir, args.solo_experiment, policy_index=0)
-    solo_actor = load_actor(cfg_solo, solo_env.observation_space, solo_env.action_space, solo_ckpt, DEVICE)
-    solo_obs_dim = solo_env.observation_space.shape[0]
-    solo_env.close()
+        cfg_solo = load_cfg(args.solo_train_dir, args.solo_experiment)
+        solo_env = make_quadrotor_env(
+            "quadrotor_multi",
+            cfg=cfg_solo,
+            render_mode=None,
+        )
+        try:
+            solo_ckpt = latest_checkpoint(
+                args.solo_train_dir,
+                args.solo_experiment,
+                policy_index=0,
+            )
+            solo_actor = load_actor(
+                cfg_solo,
+                solo_env.observation_space,
+                solo_env.action_space,
+                solo_ckpt,
+                DEVICE,
+            )
+            solo_obs_dim = int(solo_env.observation_space.shape[0])
+            solo_rnn_size = get_rnn_size(cfg_solo)
+        finally:
+            solo_env.close()
 
-    multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
-    solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
+        _obs, stored_states = deterministic_reset(env, args.seed, None)
 
-    # Save initial state so we can return to it later
-    obs, stored_states = deterministic_reset(env, args.seed, None)
-
-    if args.init_predictions is None:
-        # Collect predicted trajectory
-        print('Predicting trajectories')
-        obs, stored_states = deterministic_reset(env, args.seed, stored_states)
-        snapshot = safe_capture_env_snapshot(env)
-        temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
-        dummy_pred_traj = np.zeros((args.num_multi_agents, args.episode_length, 6))
-        logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
-                        multi_actor, multi_rnn_states, 
-                        solo_actor, solo_rnn_states, solo_obs_dim, 
-                        pred_trajectories=dummy_pred_traj,
-                        solo_action_fn=fall_down,
-                        deterministic=True, max_steps=args.episode_length,
-                        num_threads=max_threads)
-        temp_env.close()
-        pred_trajectories = []
-        for agent_id in range(args.num_multi_agents):
-            positions = logs[agent_id][0]["position"] # episode_length x 3
-            velocities = logs[agent_id][0]["velocity"]
-            pred_trajectories.append(np.concatenate([positions, velocities], axis=1))
-    else:
-        pred_path = os.path.join(args.predictions_dir, args.init_predictions, "pred_trajectories.npz")
-        pred_data = np.load(pred_path)
-        pred_trajectories = pred_data["pred_trajectories"].astype(np.float32)
-        # Keep the format conformal.py expects: list of (episode_length x 6) arrays
-        pred_trajectories = [pred_trajectories[i] for i in range(pred_trajectories.shape[0])]
-
-
-    # Collect arm length for default radius and dt for time btn steps
-    arm_len = env.quad_arm
-    DELTA_T = env.control_dt
-    MIN_RADIUS = arm_len * quads_collision_hitbox_radius # Internally used for detecting crashes
-    KAPPA = 0.6 # Tune to desired
-    alpha = get_alpha_bar(args.alpha, args.delta, args.num_trajectories)
-
-    # Init r0 to some large value that ought to be safe
-    radius = MAX_RADIUS
-    radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-    filter = cbf_module.make_cbf_filter(radii)
-
-    # Running list: every entry is how many env agents left their tubes that episode
-    tube_coverage_per_episode = []
-    safety_per_episode = []
-    crashes_per_episode = [] # All crashes: including when CBF fails
-    bad_crashes_per_episode = [] # Crash outside of a tube
-    qj_per_episode = []
-    radius_per_episode = []
-    cumulative_reward_runs_per_episode = []
-    cumulative_reward_per_episode = []
-    agent_locs_per_episode = [] # Save positions during one run per episode for plotting
-    predicted_traj_per_episode = [] # Store predicted trajectories used each episode (agents x steps x 6)
-
-    # While the radius hasn't converged
-    for episode in range(args.num_episodes):
-        print('EPISODE', episode)
-
-        ##### SETTING THE RADIUS FOR THIS EPISODE #####
-        if not args.keep_conformal_radius or episode == 0:
-            # Find qj using old pi_j
-            # Make sure the environment is reset for rollout collection
-            multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
-            solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
-            obs, stored_states = deterministic_reset(env, args.seed, stored_states)
+        def collect_rollouts(
+            pred_trajectories,
+            solo_action_fn,
+            num_runs: int,
+            deterministic: bool,
+        ):
+            multi_rnn_states = torch.zeros(
+                (args.num_multi_agents, multi_rnn_size),
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            solo_rnn_states = torch.zeros(
+                (1, solo_rnn_size),
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            obs, _ = deterministic_reset(env, args.seed, stored_states)
             snapshot = safe_capture_env_snapshot(env)
             temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
-            # Collect actual rollouts to compare against (with current radius)
-            logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
-                        multi_actor, multi_rnn_states, 
-                        solo_actor, solo_rnn_states, solo_obs_dim, 
-                        pred_trajectories, filter,
-                        max_steps=args.episode_length, 
-                        num_runs=args.num_trajectories, 
-                        deterministic=args.deterministic,
-                        num_threads=max_threads)
-            # Set radius depending on how bad our prediction was
-            qj = conformal_radii(logs, args.num_multi_agents, pred_trajectories, alpha, args.episode_length)
-            qj = np.max(qj)
-            if args.keep_conformal_radius: # Must mean that it's episode 0
-                new_radius = qj
-                delta_r = np.abs(new_radius - radius)
-            else:
-                new_radius = explicit_radius_update(radius, qj, KAPPA, MIN_RADIUS, MAX_RADIUS)
-        if args.keep_conformal_radius and episode > 0: # Old method had rho_j = Ls kappa |rj - rj-1|
-            new_radius = qj + KAPPA * delta_r 
-            delta_r = np.abs(new_radius - radius) # How different is it this time
-        print('radius', radius, 'qj', qj, 'new radius', new_radius)
-        radius = new_radius
-        radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-        filter = cbf_module.make_cbf_filter(radii) # pi_{j+1}
-        temp_env.close()
+            try:
+                return run_multi_agents(
+                    temp_env,
+                    obs,
+                    args.num_multi_agents,
+                    multi_actor,
+                    multi_rnn_states,
+                    solo_actor,
+                    solo_rnn_states,
+                    solo_obs_dim,
+                    pred_trajectories,
+                    solo_action_fn,
+                    max_steps=args.episode_length,
+                    num_runs=num_runs,
+                    deterministic=deterministic,
+                )
+            finally:
+                temp_env.close()
 
-        ##### COLLECTING THE DATA FOR THIS EPISODE #####
-        # Do a full reset before collecting rollouts
-        multi_rnn_states = torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE)
-        solo_rnn_states = torch.zeros((1, get_rnn_size(cfg_solo)), dtype=torch.float32, device=DEVICE)
-        obs, stored_states = deterministic_reset(env, args.seed, stored_states)
-        snapshot = safe_capture_env_snapshot(env)
-        temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
-        # Collect actual rollouts to compare against (with current radius)
-        logs = run_multi_agents(temp_env, obs, args.num_multi_agents, 
-                    multi_actor, multi_rnn_states, 
-                    solo_actor, solo_rnn_states, solo_obs_dim, 
-                    pred_trajectories, filter,
-                    max_steps=args.episode_length, 
-                    num_runs=args.num_eval_trajs, 
-                    deterministic=args.deterministic,
-                    num_threads=max_threads)
-        temp_env.close()
+        if args.init_predictions is None:
+            print("Predicting trajectories")
+            dummy_predictions = np.zeros(
+                (args.num_multi_agents, args.episode_length, 6),
+                dtype=np.float64,
+            )
+            prediction_logs = collect_rollouts(
+                dummy_predictions,
+                fall_down,
+                num_runs=1,
+                deterministic=True,
+            )
+            pred_trajectories = []
+            for agent_id in range(args.num_multi_agents):
+                pred_trajectories.append(
+                    np.concatenate(
+                        [
+                            prediction_logs[agent_id][0]["position"],
+                            prediction_logs[agent_id][0]["velocity"],
+                        ],
+                        axis=1,
+                    )
+                )
+        else:
+            pred_path = os.path.join(
+                args.predictions_dir,
+                args.init_predictions,
+                "pred_trajectories.npz",
+            )
+            with np.load(pred_path) as pred_data:
+                pred_trajectories = pred_data["pred_trajectories"].astype(
+                    np.float32
+                )
 
-        ##### DIGEST DATA FOR THIS EPISODE #####
-        cumulative_reward_per_run = []
-        tube_coverage_per_run = []
-        num_crashes_per_run = []
-        num_bad_crashes_per_run = []
-        solo_agent_id = args.num_multi_agents
-        for run_id in range(args.num_eval_trajs):
-            num_nonswap_steps = 0
-            cumulative_reward = 0
-            in_tube = [True] * args.num_multi_agents
-            num_crashes = 0
-            num_bad_crashes = 0
-            # Skip first step so we can do comparisons with the earlier step
-            # Also no chance of crashes or leaving tube in the first step
-            for step in range(1, args.episode_length):
-                # If, at this step, the goal didn't change wrt last step
-                if not logs[solo_agent_id][run_id]['goal_swap'][step]:
-                    num_nonswap_steps += 1
-                    # Should have a smaller distance this step than last step if same goal
-                    delta_distance = logs[solo_agent_id][run_id]['goal_dist'][step - 1] - logs[solo_agent_id][run_id]['goal_dist'][step]
-                    # if run_id == 0:
-                    #     print(logs[solo_agent_id][run_id]['goal_dist'][step - 1], logs[solo_agent_id][run_id]['goal_dist'][step])
-                    if delta_distance > 0:
-                        cumulative_reward += delta_distance
-                solo_loc = logs[solo_agent_id][run_id]['position'][step]
-                for agent_id in range(args.num_multi_agents):
-                    agent_loc = logs[agent_id][run_id]['position'][step]
-                    pred_loc = pred_trajectories[agent_id][step][:3]
-                    # If outside of tube, set in_tube to False: can't become True
-                    if np.linalg.norm(agent_loc - pred_loc) > radius:
-                        in_tube[agent_id] = False
-                    # Record a crash if below the minimum radius
-                    if np.linalg.norm(solo_loc - agent_loc) <= MIN_RADIUS:
-                        num_crashes += 1
-                        # If crashed and that agent wasn't in their tube, presumably avoidable
-                        if not in_tube[agent_id]:
-                            num_bad_crashes += 1
-            # Don't want to be penalized for the number of times the goal swaps since that's good
-            cumulative_reward_per_run.append(cumulative_reward / num_nonswap_steps * (args.episode_length - 1))
-            # Make agnostic to the number of multi agents
-            tube_coverage_per_run.append(sum(in_tube) / args.num_multi_agents)
-            num_crashes_per_run.append(num_crashes)
-            num_bad_crashes_per_run.append(num_bad_crashes)
-        # Take average over evaluation runs
-        cumulative_reward_per_episode.append(sum(cumulative_reward_per_run) / args.num_eval_trajs)
-        tube_coverage_per_episode.append(sum(tube_coverage_per_run) / args.num_eval_trajs)
-        crashes_per_episode.append(sum(num_crashes_per_run) / args.num_eval_trajs)
-        bad_crashes_per_episode.append(sum(num_bad_crashes_per_run) / args.num_eval_trajs)
-        safety = 1 - sum([crashes > 0 for crashes in num_bad_crashes_per_run]) / args.num_eval_trajs
-        safety_per_episode.append(safety)
-        cumulative_reward_runs_per_episode.append(np.asarray(cumulative_reward_per_run, dtype=np.float32))
-        # Radius updates don't change across eval runs so just append normally
-        qj_per_episode.append(qj)
-        radius_per_episode.append(radius)
-        # Cache predicted trajectories used this episode
-        predicted_traj_per_episode.append(np.asarray(pred_trajectories, dtype=np.float32))
+        pred_trajectories = _validate_predictions(
+            pred_trajectories,
+            args.num_multi_agents,
+            args.episode_length,
+        )
 
-        ##### SET UP PRED_TRAJECTORIES FOR NEXT EPISODE #####
-        agent_locs = []
-        for agent_id in range(args.num_multi_agents + 1):
-            for step in range(args.episode_length):
-                if args.update_predictions and agent_id < solo_agent_id and episode == 0: # Only update first episode
-                    pred_trajectories[agent_id][step][:3] = logs[agent_id][0]['position'][step]
-                    pred_trajectories[agent_id][step][3:] = logs[agent_id][0]['velocity'][step]
-            agent_locs.append(logs[agent_id][0]['position'])
-        agent_locs_per_episode.append(agent_locs) # episodes x agents x steps x 3
-        print(f'Cum rew: {cumulative_reward_per_episode[-1]} Tube cov: {tube_coverage_per_episode[-1]} Crashes: {crashes_per_episode[-1]} Bad crashes: {bad_crashes_per_episode[-1]}')
+        min_radius = env.quad_arm * COLLISION_HITBOX_RADIUS
+        alpha_bar = get_alpha_bar(
+            args.alpha,
+            args.delta,
+            args.num_trajectories,
+        )
+        if not 0.0 <= alpha_bar < 1.0:
+            raise ValueError(
+                "The adjusted alpha is outside [0, 1); increase "
+                "--num_trajectories or adjust --alpha/--delta."
+            )
 
-    # Persist per-episode metrics for offline plotting
-    metrics_path = os.path.join(experiment_dir, "conformal_metrics.npz")
-    np.savez(
-        metrics_path,
-        episodes=np.arange(args.num_episodes),
-        qj_per_episode=np.asarray(qj_per_episode, dtype=np.float32),
-        radius_per_episode=np.asarray(radius_per_episode, dtype=np.float32),
-        tube_coverage_per_episode=np.asarray(tube_coverage_per_episode, dtype=np.float32),
-        crashes_per_episode=np.asarray(crashes_per_episode, dtype=np.float32),
-        bad_crashes_per_episode=np.asarray(bad_crashes_per_episode, dtype=np.float32),
-        safety_per_episode=np.asarray(safety_per_episode, dtype=np.float32),
-        cumulative_reward_per_episode=np.asarray(cumulative_reward_per_episode, dtype=np.float32),
-        cumulative_reward_per_run=np.asarray(cumulative_reward_runs_per_episode, dtype=np.float32),
-        agent_locs_per_episode=np.asarray(agent_locs_per_episode, dtype=np.float32),
-        predicted_traj_per_episode=np.asarray(predicted_traj_per_episode, dtype=np.float32),
-        alpha=args.alpha,
-        delta=args.delta,
-        bar_alpha=alpha,
-    )
-    print(f"[conformal] Saved per-episode metrics to {metrics_path}")
-    env.close()
+        def collect_for_radius(radius: float, num_runs: int):
+            radii = np.full(
+                args.num_multi_agents,
+                radius,
+                dtype=np.float64,
+            )
+            return collect_rollouts(
+                pred_trajectories,
+                make_cbf_filter(radii),
+                num_runs=num_runs,
+                deterministic=args.deterministic,
+            )
 
-    if len(video_frames) > 0:
-        video_cfg = AttrDict(video_name=video_file)
-        generate_replay_video(video_dir, video_frames, args.video_fps, video_cfg)
-        final_path = os.path.abspath(os.path.join(video_dir, video_file))
-        print(f"[conformal] Video saved to {final_path}")
-    
-    print('Number of total crashes:', sum(crashes_per_episode))
-    print('Number of total crashes outside of conformal tubes:', sum(bad_crashes_per_episode))
+        def calibrate(radius: float) -> float:
+            logs = collect_for_radius(radius, args.num_trajectories)
+            radii = conformal_radii(
+                logs,
+                args.num_multi_agents,
+                pred_trajectories,
+                alpha_bar,
+                args.episode_length,
+            )
+            return float(np.max(radii))
 
-    
+        metrics = _empty_metrics()
 
+        def evaluate_and_record(radius: float, qj: float):
+            logs = collect_for_radius(radius, args.num_eval_trajs)
+            summary = summarize_rollouts(
+                logs,
+                pred_trajectories,
+                radius,
+                min_radius,
+                args.num_multi_agents,
+                args.episode_length,
+                args.num_eval_trajs,
+            )
+            _record_episode(
+                metrics,
+                qj,
+                radius,
+                summary,
+                pred_trajectories,
+            )
+            print(
+                f"Cum rew: {summary['cumulative_reward']} "
+                f"Tube cov: {summary['tube_coverage']} "
+                f"Crashes: {summary['crashes']} "
+                f"Bad crashes: {summary['bad_crashes']}"
+            )
+            return logs
+
+        if args.update_procedure in ("robust", "naive"):
+            radius = MAX_RADIUS
+            episode_ids = np.arange(args.num_episodes)
+            for episode in episode_ids:
+                print("EPISODE", episode)
+                qj = calibrate(radius)
+                new_radius = next_radius(
+                    args.update_procedure,
+                    radius,
+                    qj,
+                    KAPPA,
+                    min_radius,
+                    MAX_RADIUS,
+                )
+                print(
+                    "radius",
+                    radius,
+                    "qj",
+                    qj,
+                    "new radius",
+                    new_radius,
+                )
+                radius = new_radius
+                logs = evaluate_and_record(radius, qj)
+
+                if args.update_predictions and episode == 0:
+                    for agent_id in range(args.num_multi_agents):
+                        pred_trajectories[agent_id][
+                            : args.episode_length,
+                            :3,
+                        ] = logs[agent_id][0]["position"]
+                        pred_trajectories[agent_id][
+                            : args.episode_length,
+                            3:6,
+                        ] = logs[agent_id][0]["velocity"]
+        else:
+            q0 = calibrate(MAX_RADIUS)
+            evaluate_and_record(MAX_RADIUS, q0)
+
+            radius = q0
+            print("r0", MAX_RADIUS, "q0", q0, "r1", radius)
+            q1 = calibrate(radius)
+            print("r1", radius, "q1", q1)
+            evaluate_and_record(radius, q1)
+
+            radius = calibrate_once_final_radius(
+                MAX_RADIUS,
+                q0,
+                KAPPA,
+                args.num_episodes,
+            )
+            q_final = calibrate(radius)
+            print("radius", radius, "qj", q_final)
+            evaluate_and_record(radius, q_final)
+            episode_ids = np.array([0, 1, args.num_episodes + 1])
+
+        metrics_path = _save_metrics(
+            experiment_dir,
+            args,
+            episode_ids,
+            metrics,
+            alpha_bar,
+        )
+        print(f"[conformal] Saved per-episode metrics to {metrics_path}")
+        print(
+            "Number of total crashes:",
+            sum(metrics["crashes_per_episode"]),
+        )
+        print(
+            "Number of total crashes outside of conformal tubes:",
+            sum(metrics["bad_crashes_per_episode"]),
+        )
+    finally:
+        env.close()
 
 
 if __name__ == "__main__":

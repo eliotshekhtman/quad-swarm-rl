@@ -4,11 +4,11 @@ Combine conformal and non-interaction runs into unified across-episode plots.
 
 Generates four plots (radius, performance, empirical tube coverage, empirical
 safety coverage) with multiple lines:
-  - Robust conformal run (conformal.py)
-  - Naive conformal run  (conformal.py)
-  - Calibrate-once run   (conformal_no_interaction.py), mapped so its second
-    recorded episode is treated as episode 1 and repeated for all later
-    episodes
+  - Robust conformal run (conformal.py --update-procedure robust)
+  - Naive conformal run  (conformal.py --update-procedure naive)
+  - Calibrate-once run   (conformal.py --update-procedure calibrate-once),
+    mapped so its second recorded episode is treated as episode 1 and repeated
+    for all later episodes
   - Non-interactive run (single-episode .npz); provides constant lines on all
     four plots.
 
@@ -37,7 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot combined conformal/non-interaction metrics.")
     parser.add_argument("--robust", required=True, help="Path to Robust conformal .npz (conformal.py run).")
     parser.add_argument("--naive", required=True, help="Path to Naive conformal .npz (conformal.py run).")
-    parser.add_argument("--calibrate_once", required=True, help="Path to calibrate-once .npz (conformal_no_interaction.py run).")
+    parser.add_argument(
+        "--calibrate_once",
+        required=True,
+        help="Path to calibrate-once .npz (conformal.py run).",
+    )
     parser.add_argument("--non_interactive", required=True, help="Path to single-episode non-interactive .npz.")
     parser.add_argument("--output_dir", help="Directory to save plots (default: ./plots/combined_<robust_stem>).")
     parser.add_argument("--alpha", type=float, help="Alpha for performance error bars; defaults to Robust run's alpha.")

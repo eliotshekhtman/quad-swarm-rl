@@ -46,6 +46,24 @@ This should pull and install all the necessary dependencies including PyTorch.
 
 ## Running experiments
 
+### Conformal CBF evaluation
+
+`conformal.py` is the single driver for the three supported radius-update
+procedures. Select one with `--update-procedure`:
+
+```
+python conformal.py [model and output arguments] --update-procedure robust
+python conformal.py [model and output arguments] --update-procedure naive
+python conformal.py [model and output arguments] --update-procedure calibrate-once
+```
+
+`robust` implements the adaptive robust update, `naive` sets the next radius
+directly from the current conformal quantile, and `calibrate-once` performs the
+initial calibration followed by the fixed legacy recurrence. All modes use the
+fourth-order exponential control barrier function and execute rollouts
+sequentially. Run `python conformal.py --help` for the required model and output
+arguments.
+
 ### Train
 
 This will run the baseline experiment.

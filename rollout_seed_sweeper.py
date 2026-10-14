@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
 import os
 from types import SimpleNamespace
 
@@ -30,6 +29,7 @@ from collect_video import (
     _state_for_frame,
 )
 from project_utils.restart_utils import deterministic_reset
+from project_utils.full_cbf_utils import make_cbf_filter
 from project_utils.utils import latest_checkpoint, load_actor, load_cfg
 
 
@@ -47,16 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode_length", type=int, default=1500)
     parser.add_argument("--num_multi_agents", type=int, default=-1)
     parser.add_argument("--r", type=float, required=True)
-    parser.add_argument("--ecbf", action="store_true", help="Use project_utils.full_cbf_utils instead of project_utils.cbf_utils.")
     parser.add_argument("--tolerance", type=float, default=1.0e-6)
     parser.add_argument("--output_path", default="train_dir/rollout_seed_sweep.csv")
     parser.add_argument("--continue_after_found", action="store_true")
     return parser.parse_args()
-
-
-def load_cbf_module(use_ecbf: bool):
-    module_name = "project_utils.full_cbf_utils" if use_ecbf else "project_utils.cbf_utils"
-    return importlib.import_module(module_name)
 
 
 def _min_ego_prediction_margin(trajectory, pred_trajectories: np.ndarray, radius: float, num_multi_agents: int):
@@ -130,9 +124,8 @@ def main() -> None:
     finally:
         solo_env.close()
 
-    cbf_module = load_cbf_module(args.ecbf)
     radii = np.full(args.num_multi_agents, float(args.r), dtype=np.float64)
-    solo_action_fn = cbf_module.make_cbf_filter(radii)
+    solo_action_fn = make_cbf_filter(radii)
 
     rows = []
     found_seed = None

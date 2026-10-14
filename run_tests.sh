@@ -1,6 +1,6 @@
 #!/bin/bash
 
-python -m unittest
+python -m unittest discover -s tests -v
 STATUS_ALL_TESTS=$?
 
 echo "Status: $STATUS_ALL_TESTS"

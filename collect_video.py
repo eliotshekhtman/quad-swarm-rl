@@ -6,7 +6,6 @@ Collect a fixed-radius conformal rollout and render a replay video.
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import shutil
@@ -27,6 +26,7 @@ from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
 from project_utils.conformal_utils import fall_down, run_multi_agents
+from project_utils.full_cbf_utils import make_cbf_filter
 from project_utils.restart_utils import deterministic_reset, reseed_quads, set_global_seed
 from project_utils.utils import (
     OBS_KEY,
@@ -82,13 +82,7 @@ def parse_args() -> argparse.Namespace:
         help="Camera distance for --video_view_mode global.",
     )
     parser.add_argument("--skip_video", action="store_true")
-    parser.add_argument("--ecbf", action="store_true", help="Use project_utils.full_cbf_utils instead of project_utils.cbf_utils.")
     return parser.parse_args()
-
-
-def load_cbf_module(use_ecbf: bool):
-    module_name = "project_utils.full_cbf_utils" if use_ecbf else "project_utils.cbf_utils"
-    return importlib.import_module(module_name)
 
 
 def _normalize_output_path(path: str) -> str:
@@ -252,7 +246,6 @@ def _load_or_generate_pred_trajectories(
             solo_action_fn=fall_down,
             deterministic=True,
             max_steps=args.episode_length,
-            num_threads=1,
         )
     finally:
         temp_env.close()
@@ -568,7 +561,6 @@ def _record_replay_video(
 
 def main() -> None:
     args = parse_args()
-    cbf_module = load_cbf_module(args.ecbf)
     if args.rollout_seed is None:
         args.rollout_seed = int(args.seed)
     if args.r <= 0.0:
@@ -643,7 +635,7 @@ def main() -> None:
         _apply_rollout_seed(env, args.rollout_seed)
         snapshot = safe_capture_env_snapshot(env)
         radii = np.full(args.num_multi_agents, float(args.r), dtype=np.float64)
-        solo_action_fn = cbf_module.make_cbf_filter(radii)
+        solo_action_fn = make_cbf_filter(radii)
 
         trajectory = _collect_trajectory(
             snapshot,
