@@ -99,6 +99,17 @@ def main() -> None:
         safety_arr = data["safety_per_episode"]
         alpha = float(data["alpha"])
         bar_alpha = float(data["bar_alpha"])
+        update_procedure = str(data["update_procedure"])
+        tube_radius_arr = (
+            data["tube_radius_per_episode"]
+            if "tube_radius_per_episode" in data
+            else radius_arr
+        )
+        anytime_current_radius = (
+            data["anytime_current_radius_per_episode"]
+            if "anytime_current_radius_per_episode" in data
+            else None
+        )
         agent_locs_per_episode = data.get("agent_locs_per_episode", None)
         predicted_traj_per_episode = data["predicted_traj_per_episode"]
     print(radius_arr)
@@ -113,11 +124,15 @@ def main() -> None:
 
     # Plot A: Radius across episodes (rj and qj)
     fig, ax = plt.subplots()
-    shifted_radius_arr = np.insert(radius_arr, 0, 8)[:-1] # r0 is MAX_RADIUS
     noninteractive_radius = 0.33648095
     ax.axhline(noninteractive_radius, linestyle="--", color="gray", label=r"Non-interactive $1 - \bar \alpha$ quantile")
-    ax.plot(episodes, shifted_radius_arr, label=r"$r_j$", marker='s')
-    ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker='o')
+    if update_procedure == "anytime" and anytime_current_radius is not None:
+        ax.plot(episodes, anytime_current_radius, label=r"$r_j$", marker='s')
+        ax.plot(episodes, radius_arr, label=r"$r_{j+1}$", marker='o')
+    else:
+        shifted_radius_arr = np.insert(radius_arr, 0, 8)[:-1]
+        ax.plot(episodes, shifted_radius_arr, label=r"$r_j$", marker='s')
+        ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker='o')
     ax.set_title(r"\bf{(a)} Radius across episodes")
     ax.set_xlabel(r"Episode ($j$)")
     ax.set_xlim(*x_lim)
@@ -221,7 +236,7 @@ def main() -> None:
         # Overlay predicted trajectories for the multi agents (dotted lines)
         pred_all = predicted_traj_per_episode[episode_idx]  # shape: num_multi_agents x steps x 6
         num_pred_agents = pred_all.shape[0]
-        tube_radius = radius_arr[episode_idx]
+        tube_radius = tube_radius_arr[episode_idx]
         for agent_id in range(min(num_agents - 1, num_pred_agents)):
             pred_traj = pred_all[agent_id]
             ax.plot(
@@ -264,7 +279,7 @@ def main() -> None:
         # Overlay predicted trajectories for the multi agents (dotted lines) and full tubes
         pred_all = predicted_traj_per_episode[episode_idx]  # shape: num_multi_agents x steps x 6
         num_pred_agents = pred_all.shape[0]
-        tube_radius = radius_arr[episode_idx]
+        tube_radius = tube_radius_arr[episode_idx]
         pred_traj = pred_all[agent_idx]
         ax.plot(
             pred_traj[:, 0],

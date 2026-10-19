@@ -8,6 +8,7 @@ from project_utils.conformal_utils import (
     explicit_radius_update,
     fall_down,
     get_alpha_bar,
+    joint_rollout_error,
     next_radius,
     summarize_rollouts,
 )
@@ -131,7 +132,7 @@ class RolloutSummaryTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(summary["cumulative_reward"], 1.5)
-        self.assertAlmostEqual(summary["tube_coverage"], 0.75)
+        self.assertAlmostEqual(summary["tube_coverage"], 0.5)
         self.assertAlmostEqual(summary["crashes"], 1.5)
         self.assertAlmostEqual(summary["bad_crashes"], 0.5)
         self.assertAlmostEqual(summary["safety"], 0.5)
@@ -140,6 +141,32 @@ class RolloutSummaryTests(unittest.TestCase):
             [2.0, 1.0],
         )
         self.assertEqual(len(summary["agent_locs"]), 3)
+
+    def test_joint_rollout_error_maximizes_over_agents_and_time(self):
+        logs = {
+            0: [
+                self._run_log(
+                    [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                    [0.0, 0.0, 0.0],
+                )
+            ],
+            1: [
+                self._run_log(
+                    [[0.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 0.0]],
+                    [0.0, 0.0, 0.0],
+                )
+            ],
+        }
+        predictions = [np.zeros((3, 6)), np.zeros((3, 6))]
+
+        error = joint_rollout_error(
+            logs,
+            predictions,
+            num_multi_agents=2,
+            episode_length=3,
+        )
+
+        self.assertEqual(error, 3.0)
 
     def test_fall_down_accepts_rollout_keyword_interface(self):
         action = fall_down(

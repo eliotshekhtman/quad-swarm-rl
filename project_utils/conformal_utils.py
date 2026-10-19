@@ -50,6 +50,28 @@ def conformal_radii(
     return radii
 
 
+def joint_rollout_error(
+    logs,
+    pred_trajectories,
+    num_multi_agents: int,
+    episode_length: int,
+    run_id: int = 0,
+) -> float:
+    """Return the maximum position error over all environment agents and time."""
+    max_error = 0.0
+    for agent_id in range(num_multi_agents):
+        actual = np.asarray(logs[agent_id][run_id]["position"])
+        predicted = np.asarray(pred_trajectories[agent_id])
+        if actual.shape[0] < episode_length or predicted.shape[0] < episode_length:
+            raise ValueError("Rollout or prediction is shorter than episode_length.")
+        errors = np.linalg.norm(
+            actual[:episode_length, :3] - predicted[:episode_length, :3],
+            axis=1,
+        )
+        max_error = max(max_error, float(np.max(errors)))
+    return max_error
+
+
 def explicit_radius_update(
     prev_radius: float,
     conf_radius: float,
@@ -125,6 +147,12 @@ def summarize_rollouts(
         num_crashes = 0
         num_bad_crashes = 0
 
+        for agent_id in range(num_multi_agents):
+            agent_loc = logs[agent_id][run_id]["position"][0]
+            pred_loc = pred_trajectories[agent_id][0][:3]
+            if np.linalg.norm(agent_loc - pred_loc) > radius:
+                in_tube[agent_id] = False
+
         for step in range(1, episode_length):
             solo_log = logs[solo_agent_id][run_id]
             if not solo_log["goal_swap"][step]:
@@ -153,7 +181,7 @@ def summarize_rollouts(
         cumulative_reward_per_run.append(
             cumulative_reward / num_nonswap_steps * (episode_length - 1)
         )
-        tube_coverage_per_run.append(sum(in_tube) / num_multi_agents)
+        tube_coverage_per_run.append(float(all(in_tube)))
         num_crashes_per_run.append(num_crashes)
         num_bad_crashes_per_run.append(num_bad_crashes)
 
@@ -194,6 +222,8 @@ def run_multi_agents(
     max_steps=1500,
     num_runs=1,
     deterministic=False,
+    first_run_deterministic=True,
+    show_progress=True,
 ):
     """Run ordered rollouts from one snapshot and return state and goal logs."""
     snapshot = safe_capture_env_snapshot(env)
@@ -237,7 +267,7 @@ def run_multi_agents(
                     )
                 actions_multi = policy_output["actions"]
                 run_multi_rnn_states = policy_output["new_rnn_states"]
-                if deterministic or run_idx == 0:
+                if deterministic or (first_run_deterministic and run_idx == 0):
                     actions_multi = argmax_actions(
                         multi_actor.action_distribution()
                     )
@@ -309,7 +339,7 @@ def run_multi_agents(
         return run_idx, run_logs, run_max_dist
 
     max_dist = 0.0
-    progress_bar = tqdm(total=num_runs)
+    progress_bar = tqdm(total=num_runs, disable=not show_progress)
     for run_idx in range(num_runs):
         run_idx, run_logs, run_max_dist = _run_single_episode(run_idx)
         for agent_id in range(num_multi_agents + 1):
@@ -328,6 +358,7 @@ __all__ = [
     "explicit_radius_update",
     "fall_down",
     "get_alpha_bar",
+    "joint_rollout_error",
     "next_radius",
     "run_multi_agents",
     "summarize_rollouts",

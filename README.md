@@ -48,21 +48,43 @@ This should pull and install all the necessary dependencies including PyTorch.
 
 ### Conformal CBF evaluation
 
-`conformal.py` is the single driver for the three supported radius-update
+`conformal.py` is the single driver for the five supported radius-update
 procedures. Select one with `--update-procedure`:
 
 ```
 python conformal.py [model and output arguments] --update-procedure robust
 python conformal.py [model and output arguments] --update-procedure naive
+python conformal.py [model and output arguments] --update-procedure non-interactive
 python conformal.py [model and output arguments] --update-procedure calibrate-once
+python conformal.py [model and output arguments] --update-procedure anytime
 ```
 
 `robust` implements the adaptive robust update, `naive` sets the next radius
-directly from the current conformal quantile, and `calibrate-once` performs the
-initial calibration followed by the fixed legacy recurrence. All modes use the
-fourth-order exponential control barrier function and execute rollouts
-sequentially. Run `python conformal.py --help` for the required model and output
-arguments.
+directly from the current conformal quantile, `non-interactive` reproduces the
+final historical `conformal_falldown.py` schedule (calibrate at the known-safe
+initial radius, update once to that quantile, and then stop), and
+`calibrate-once` performs the initial calibration followed by the fixed legacy
+recurrence. All modes use the fourth-order exponential control barrier function
+and execute rollouts sequentially. Run `python conformal.py --help` for the
+required model and output arguments.
+
+Policy inference defaults to CPU. Use `--device gpu` together with
+`CUDA_VISIBLE_DEVICES=<index>` to assign a process to one GPU; simulation and
+ECBF optimization remain CPU-bound.
+
+`anytime` implements Algorithm 1's per-rollout confidence sequence and stops
+each episode as soon as an update or radius certificate is available. One
+Bernoulli observation represents the complete joint rollout: its score is the
+physical separation radius plus the largest prediction error over all agents
+and timesteps. `--num_trajectories` is the per-episode cap in this mode.
+
+The anytime slope constants are fixed rather than estimated. The driver uses
+`KAPPA = 0.6` and computes `m_p = (1 - KAPPA) * density_lower` and
+`L_p = (1 + KAPPA) * density_upper`. Supply domain-valid uniform density bounds
+with `--anytime-score-density-lower` and
+`--anytime-score-density-upper`; both default to `1.0`. The default stopping
+check frequency is one complete rollout. Enabling `--update_predictions` is
+supported, but changes the fixed predictor assumed by the paper's guarantee.
 
 ### Train
 
