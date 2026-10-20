@@ -4,10 +4,10 @@ import numpy as np
 
 from project_utils.conformal_utils import (
     calibrate_once_final_radius,
-    conformal_radii,
     explicit_radius_update,
     fall_down,
     get_alpha_bar,
+    joint_conformal_radius,
     joint_rollout_error,
     next_radius,
     summarize_rollouts,
@@ -20,8 +20,8 @@ class ConformalQuantileTests(unittest.TestCase):
         expected = 0.8 - np.sqrt(np.log(1.0 / 0.9) / 8.0)
         self.assertAlmostEqual(actual, expected)
 
-    def test_conformal_radii_uses_trajectory_max_and_requested_quantile(self):
-        scores_by_agent = ([1.0, 4.0, 2.0, 3.0], [0.5, 2.0, 1.0, 1.5])
+    def test_joint_radius_quantiles_joint_scores_and_adds_physical_radius(self):
+        scores_by_agent = ([10.0, 0.0, 0.0, 0.0], [0.0, 10.0, 0.0, 0.0])
         logs = {}
         for agent_id, scores in enumerate(scores_by_agent):
             logs[agent_id] = []
@@ -34,15 +34,16 @@ class ConformalQuantileTests(unittest.TestCase):
                 )
 
         predictions = [np.zeros((2, 6)), np.zeros((2, 6))]
-        radii = conformal_radii(
+        radius = joint_conformal_radius(
             logs,
             num_multi_agents=2,
             pred_trajectories=predictions,
             alpha=0.25,
             episode_length=2,
+            min_radius=0.5,
         )
 
-        np.testing.assert_allclose(radii, [3.0, 1.5])
+        self.assertEqual(radius, 10.5)
 
 
 class RadiusUpdateTests(unittest.TestCase):
@@ -167,6 +168,34 @@ class RolloutSummaryTests(unittest.TestCase):
         )
 
         self.assertEqual(error, 3.0)
+
+    def test_summary_subtracts_physical_radius_for_tube_coverage(self):
+        logs = {
+            0: [
+                self._run_log(
+                    [[0.75, 0.0, 0.0]] * 3,
+                    [0.0, 0.0, 0.0],
+                )
+            ],
+            1: [
+                self._run_log(
+                    [[5.0, 0.0, 0.0]] * 3,
+                    [0.0, 0.0, 0.0],
+                )
+            ],
+        }
+
+        summary = summarize_rollouts(
+            logs,
+            [np.zeros((3, 6))],
+            radius=1.0,
+            min_radius=0.5,
+            num_multi_agents=1,
+            episode_length=3,
+            num_runs=1,
+        )
+
+        self.assertEqual(summary["tube_coverage"], 0.0)
 
     def test_fall_down_accepts_rollout_keyword_interface(self):
         action = fall_down(

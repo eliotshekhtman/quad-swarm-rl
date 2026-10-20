@@ -19,37 +19,6 @@ def get_alpha_bar(alpha: float, delta: float, num_trajectories: int) -> float:
     return alpha - np.sqrt(np.log(1.0 / delta) / (2.0 * num_trajectories))
 
 
-def conformal_radii(
-    logs,
-    num_multi_agents: int,
-    pred_trajectories,
-    alpha: float,
-    episode_length: int,
-) -> np.ndarray:
-    if not 0.0 <= alpha < 1.0:
-        raise ValueError("alpha must lie in [0, 1).")
-
-    radii = np.zeros(num_multi_agents, dtype=np.float64)
-    for agent_id in range(num_multi_agents):
-        predictions = pred_trajectories[agent_id]
-        scores = []
-        for run_log in logs[agent_id]:
-            run = np.concatenate(
-                [run_log["position"], run_log["velocity"]],
-                axis=-1,
-            ).astype(np.float32)
-            score = max(
-                np.linalg.norm(predictions[step][:3] - run[step][:3])
-                for step in range(episode_length)
-            )
-            scores.append(score)
-
-        scores.sort()
-        quantile_index = int(np.ceil(len(scores) * (1.0 - alpha)) - 1)
-        radii[agent_id] = scores[quantile_index]
-    return radii
-
-
 def joint_rollout_error(
     logs,
     pred_trajectories,
@@ -70,6 +39,37 @@ def joint_rollout_error(
         )
         max_error = max(max_error, float(np.max(errors)))
     return max_error
+
+
+def joint_conformal_radius(
+    logs,
+    num_multi_agents: int,
+    pred_trajectories,
+    alpha: float,
+    episode_length: int,
+    min_radius: float,
+) -> float:
+    """Calibrate the deployed radius from one joint score per rollout."""
+    if not 0.0 <= alpha < 1.0:
+        raise ValueError("alpha must lie in [0, 1).")
+
+    num_runs = len(logs[0])
+    if num_runs == 0:
+        raise ValueError("At least one rollout is required for calibration.")
+
+    scores = sorted(
+        min_radius
+        + joint_rollout_error(
+            logs,
+            pred_trajectories,
+            num_multi_agents,
+            episode_length,
+            run_id,
+        )
+        for run_id in range(num_runs)
+    )
+    quantile_index = int(np.ceil(num_runs * (1.0 - alpha)) - 1)
+    return float(scores[quantile_index])
 
 
 def explicit_radius_update(
@@ -134,11 +134,13 @@ def summarize_rollouts(
     episode_length: int,
     num_runs: int,
 ) -> dict:
+    """Summarize rollouts for a radius that includes physical separation."""
     cumulative_reward_per_run = []
     tube_coverage_per_run = []
     num_crashes_per_run = []
     num_bad_crashes_per_run = []
     solo_agent_id = num_multi_agents
+    tube_radius = max(radius - min_radius, 0.0)
 
     for run_id in range(num_runs):
         num_nonswap_steps = 0
@@ -150,7 +152,7 @@ def summarize_rollouts(
         for agent_id in range(num_multi_agents):
             agent_loc = logs[agent_id][run_id]["position"][0]
             pred_loc = pred_trajectories[agent_id][0][:3]
-            if np.linalg.norm(agent_loc - pred_loc) > radius:
+            if np.linalg.norm(agent_loc - pred_loc) > tube_radius:
                 in_tube[agent_id] = False
 
         for step in range(1, episode_length):
@@ -168,7 +170,7 @@ def summarize_rollouts(
             for agent_id in range(num_multi_agents):
                 agent_loc = logs[agent_id][run_id]["position"][step]
                 pred_loc = pred_trajectories[agent_id][step][:3]
-                if np.linalg.norm(agent_loc - pred_loc) > radius:
+                if np.linalg.norm(agent_loc - pred_loc) > tube_radius:
                     in_tube[agent_id] = False
                 if np.linalg.norm(solo_loc - agent_loc) <= min_radius:
                     num_crashes += 1
@@ -354,10 +356,10 @@ def run_multi_agents(
 
 __all__ = [
     "calibrate_once_final_radius",
-    "conformal_radii",
     "explicit_radius_update",
     "fall_down",
     "get_alpha_bar",
+    "joint_conformal_radius",
     "joint_rollout_error",
     "next_radius",
     "run_multi_agents",

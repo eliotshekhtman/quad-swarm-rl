@@ -25,9 +25,9 @@ from project_utils.anytime_utils import (
 )
 from project_utils.conformal_utils import (
     calibrate_once_final_radius,
-    conformal_radii,
     fall_down,
     get_alpha_bar,
+    joint_conformal_radius,
     joint_rollout_error,
     next_radius,
     run_multi_agents,
@@ -38,7 +38,7 @@ from project_utils.restart_utils import deterministic_reset
 from project_utils.utils import latest_checkpoint, load_actor, load_cfg
 
 
-MAX_RADIUS = 8.0
+DEFAULT_INITIAL_RADIUS = 2.0
 KAPPA = 0.6
 COLLISION_HITBOX_RADIUS = 2.5
 UPDATE_PROCEDURES = (
@@ -61,7 +61,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--train_dir", default="train_dir")
     parser.add_argument("--experiment_name", required=True)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--r_init", type=float, default=8)
+    parser.add_argument("--r_init", type=float, default=DEFAULT_INITIAL_RADIUS)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--delta", type=float, default=0.1)
     parser.add_argument("--episode_length", type=int, default=1500)
@@ -697,14 +697,14 @@ def main() -> None:
 
         def calibrate(radius: float) -> float:
             logs = collect_for_radius(radius, args.num_trajectories)
-            radii = conformal_radii(
+            return joint_conformal_radius(
                 logs,
                 args.num_multi_agents,
                 pred_trajectories,
                 alpha_bar,
                 args.episode_length,
+                min_radius,
             )
-            return float(np.max(radii))
 
         metrics = _empty_metrics()
 
@@ -767,7 +767,7 @@ def main() -> None:
             summary = summarize_rollouts(
                 logs,
                 pred_trajectories,
-                max(radius - min_radius, 0.0),
+                radius,
                 min_radius,
                 args.num_multi_agents,
                 args.episode_length,

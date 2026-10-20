@@ -19,6 +19,70 @@ EPSILON = 1e-3
 GRAVITY_VECTOR = np.array([0.0, 0.0, -9.81], dtype=np.float64)
 
 
+class _ParameterizedCbfQp:
+    """Reusable CVXPY graph for a fixed ordered set of active neighbors."""
+
+    def __init__(self, active_neighbor_indices: Tuple[int, ...]):
+        if not active_neighbor_indices:
+            raise ValueError("At least one active neighbor is required.")
+
+        self.active_neighbor_indices = tuple(active_neighbor_indices)
+        self.u_var = cp.Variable(4)
+        self.slack = cp.Variable()
+        self.u_ref = cp.Parameter(4)
+        self.u_min = cp.Parameter(4)
+        self.u_max = cp.Parameter(4)
+        self.phi_const = [cp.Parameter() for _ in active_neighbor_indices]
+        self.phi_grad = [cp.Parameter(4) for _ in active_neighbor_indices]
+        self.phi_exprs = [
+            phi_const + phi_grad @ self.u_var
+            for phi_const, phi_grad in zip(self.phi_const, self.phi_grad)
+        ]
+
+        constraints: List[cp.Constraint] = [
+            phi_expr >= -self.slack for phi_expr in self.phi_exprs
+        ]
+        constraints.extend(
+            [
+                self.u_var >= self.u_min,
+                self.u_var <= self.u_max,
+                self.slack >= 0,
+            ]
+        )
+        objective = (
+            cp.sum_squares(self.u_var - self.u_ref)
+            + CBF_SLACK_WEIGHT * cp.square(self.slack)
+        )
+        self.problem = cp.Problem(cp.Minimize(objective), constraints)
+
+    def set_values(
+        self,
+        *,
+        u_ref: np.ndarray,
+        u_min: np.ndarray,
+        u_max: np.ndarray,
+        coefficients: List[Tuple[float, np.ndarray]],
+    ) -> None:
+        if len(coefficients) != len(self.active_neighbor_indices):
+            raise ValueError("Coefficient count does not match active neighbors.")
+
+        self.u_ref.value = np.asarray(u_ref, dtype=np.float64).reshape(4)
+        self.u_min.value = np.asarray(u_min, dtype=np.float64).reshape(4)
+        self.u_max.value = np.asarray(u_max, dtype=np.float64).reshape(4)
+        for const_param, grad_param, (phi_const, phi_grad) in zip(
+            self.phi_const,
+            self.phi_grad,
+            coefficients,
+        ):
+            const_param.value = float(phi_const)
+            grad_param.value = np.asarray(phi_grad, dtype=np.float64).reshape(4)
+
+        # A fresh Problem has no prior iterate. Clear retained values so a cached
+        # graph has the same cold-solve and SolverError fallback semantics.
+        self.u_var.value = None
+        self.slack.value = None
+
+
 def _cross(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.cross(np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64))
 
@@ -257,6 +321,7 @@ def _solve_cbf_qp_single(
     radii: np.ndarray,
     thrust_bounds: Tuple[np.ndarray, np.ndarray],
     debug=False,
+    qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
 ) -> np.ndarray:
     """
     Build and solve one affine approximation of the ego-only multi-neighbor ECBF QP.
@@ -278,11 +343,8 @@ def _solve_cbf_qp_single(
     lambda1 = 4.0 * (alpha ** 3)
     lambda0 = float(CBF_K0) * (alpha ** 4)
 
-    constraints: List[cp.Constraint] = []
-    u_var = cp.Variable(4)
-    slack = cp.Variable()
-
-    phi_list = []
+    active_neighbor_indices = []
+    coefficients = []
     h1_list = []
     h_list = []
 
@@ -306,32 +368,37 @@ def _solve_cbf_qp_single(
             lambda2=lambda2,
             lambda3=lambda3,
         )
-        phi_expr = phi_const + phi_grad @ u_var
-        constraints.append(phi_expr >= -slack)
-        phi_list.append((teammate_idx, phi_expr))
+        active_neighbor_indices.append(teammate_idx)
+        coefficients.append((phi_const, phi_grad))
         h1_list.append((teammate_idx, debug_terms["h1"]))
         h_list.append((teammate_idx, debug_terms["h0"]))
 
-    if len(constraints) == 0:
+    if len(active_neighbor_indices) == 0:
         clipped = np.clip(u_ref, u_min, u_max)
         if debug:
-            return clipped, h_list, h1_list, phi_list
+            return clipped, h_list, h1_list, []
         return clipped
 
-    objective = cp.sum_squares(u_var - u_ref) + CBF_SLACK_WEIGHT * cp.square(slack)
-    constraints.extend(
-        [
-            u_var >= u_min,
-            u_var <= u_max,
-            slack >= 0,
-        ]
+    active_key = tuple(active_neighbor_indices)
+    if qp_cache is None:
+        qp = _ParameterizedCbfQp(active_key)
+    else:
+        qp = qp_cache.get(active_key)
+        if qp is None:
+            qp = _ParameterizedCbfQp(active_key)
+            qp_cache[active_key] = qp
+    qp.set_values(
+        u_ref=u_ref,
+        u_min=u_min,
+        u_max=u_max,
+        coefficients=coefficients,
     )
-    problem = cp.Problem(cp.Minimize(objective), constraints)
+    phi_list = list(zip(active_neighbor_indices, qp.phi_exprs))
 
     try:
-        problem.solve(solver=cp.ECOS, warm_start=True, verbose=False)
+        qp.problem.solve(solver=cp.ECOS, warm_start=False, verbose=False)
     except cp.SolverError:
-        approx = u_var.value
+        approx = qp.u_var.value
         if approx is None:
             approx = u_ref
         clipped = np.clip(np.asarray(approx, dtype=np.float64), u_min, u_max)
@@ -340,8 +407,8 @@ def _solve_cbf_qp_single(
             return clipped, h_list, h1_list, phi_list
         return clipped
 
-    if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-        print("OTHER ISSUE", problem.status)
+    if qp.problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        print("OTHER ISSUE", qp.problem.status)
         clipped = np.clip(u_ref, u_min, u_max)
         if debug:
             return clipped, h_list, h1_list, phi_list
@@ -355,7 +422,7 @@ def _solve_cbf_qp_single(
             print("h_dot:", h1_data[1])
             print("phi:", phi_data[1].value)
 
-    solution = np.array(u_var.value, dtype=np.float64)
+    solution = np.array(qp.u_var.value, dtype=np.float64)
     if debug:
         return solution, h_list, h1_list, phi_list
     return solution
@@ -370,6 +437,7 @@ def _solve_cbf_qp(
     thrust_bounds: Tuple[np.ndarray, np.ndarray],
     relinearization_passes: int = 1,
     debug=False,
+    qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
 ) -> np.ndarray:
     """
     Solve the ego-only ECBF QP, optionally re-linearising h⁽⁴⁾ around the latest iterate.
@@ -388,6 +456,7 @@ def _solve_cbf_qp(
             swarm_state=swarm_state,
             radii=radii,
             thrust_bounds=thrust_bounds,
+            qp_cache=qp_cache,
             debug=debug,
         )
         if debug:
@@ -410,6 +479,7 @@ def apply_cbf_filter(
     swarm_state: SwarmState,
     use_repeated_linearization: bool = False,
     debug=False,
+    qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
 ) -> np.ndarray:
     """
     Wrap the raw ego-policy action with a 4th-order ECBF safety filter.
@@ -436,6 +506,7 @@ def apply_cbf_filter(
             radii=radii,
             thrust_bounds=(u_min, u_max),
             relinearization_passes=(CBF_RELINEARIZATION_PASSES if use_repeated_linearization else 1),
+            qp_cache=qp_cache,
             debug=debug,
         )
 
@@ -453,6 +524,8 @@ def apply_cbf_filter(
 
 
 def make_cbf_filter(radii: np.ndarray, use_repeated_linearization: bool = False):
+    qp_cache = {}
+
     def filter(base_action: np.ndarray, env_state, swarm_state: SwarmState, debug=False):
         return apply_cbf_filter(
             base_action=base_action,
@@ -460,6 +533,7 @@ def make_cbf_filter(radii: np.ndarray, use_repeated_linearization: bool = False)
             env_state=env_state,
             swarm_state=swarm_state,
             use_repeated_linearization=use_repeated_linearization,
+            qp_cache=qp_cache,
             debug=debug,
         )
 

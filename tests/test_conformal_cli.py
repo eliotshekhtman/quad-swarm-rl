@@ -20,6 +20,7 @@ class ConformalCliTests(unittest.TestCase):
         args = parse_args(BASE_ARGS)
         self.assertEqual(args.update_procedure, "robust")
         self.assertEqual(args.device, "cpu")
+        self.assertEqual(args.r_init, 2.0)
 
     def test_gpu_device_is_accepted(self):
         args = parse_args(BASE_ARGS + ["--device", "gpu"])
