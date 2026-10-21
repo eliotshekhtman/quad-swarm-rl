@@ -60,6 +60,7 @@ def _prediction_args(args: argparse.Namespace, rollout_seed: int) -> SimpleNames
         seed=args.seed,
         rollout_seed=rollout_seed,
         episode_length=args.episode_length,
+        multi_experiment=args.multi_experiment,
     )
 
 
@@ -103,9 +104,7 @@ def _load_pred_cache(
     rollout_seeds,
     multi_actor,
     multi_rnn_size,
-    solo_actor,
-    solo_rnn_size,
-    solo_obs_dim,
+    multi_checkpoint,
 ):
     pred_cache = {}
     for rollout_seed in rollout_seeds:
@@ -117,9 +116,7 @@ def _load_pred_cache(
             args.num_multi_agents,
             multi_actor,
             torch.zeros((args.num_multi_agents, multi_rnn_size), dtype=torch.float32, device=DEVICE),
-            solo_actor,
-            torch.zeros((1, solo_rnn_size), dtype=torch.float32, device=DEVICE),
-            solo_obs_dim,
+            multi_checkpoint,
         )
         if len(pred_trajectories_list) != args.num_multi_agents:
             raise ValueError(
@@ -183,9 +180,7 @@ def main() -> None:
             rollout_seeds,
             multi_actor,
             multi_rnn_size,
-            solo_actor,
-            solo_rnn_size,
-            solo_obs_dim,
+            multi_ckpt,
         )
 
         for radius in radii:

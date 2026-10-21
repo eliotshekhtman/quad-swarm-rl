@@ -25,7 +25,6 @@ from project_utils.anytime_utils import (
 )
 from project_utils.conformal_utils import (
     calibrate_once_final_radius,
-    fall_down,
     get_alpha_bar,
     joint_conformal_radius,
     joint_rollout_error,
@@ -34,6 +33,11 @@ from project_utils.conformal_utils import (
     summarize_rollouts,
 )
 from project_utils.full_cbf_utils import make_cbf_filter
+from project_utils.prediction_utils import (
+    EVALUATION_SCENARIO,
+    collect_homogeneous_trajectories,
+    load_prediction_artifact,
+)
 from project_utils.restart_utils import deterministic_reset
 from project_utils.utils import latest_checkpoint, load_actor, load_cfg
 
@@ -497,21 +501,26 @@ def main() -> None:
         args.train_dir,
         args.experiment_name,
     )
-    args_path = os.path.join(experiment_dir, "conformal_args.json")
-    with open(args_path, "w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2, sort_keys=True)
-
     cfg_multi = load_cfg(args.multi_train_dir, args.multi_experiment)
     if args.num_multi_agents < 0:
         args.num_multi_agents = int(cfg_multi.quads_num_agents)
     if args.num_multi_agents <= 0:
         raise ValueError("--num_multi_agents must be positive.")
 
+    args_path = os.path.join(experiment_dir, "conformal_args.json")
+    with open(args_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {**vars(args), "evaluation_scenario": EVALUATION_SCENARIO},
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
+
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
         f"--device={args.device}",
-        "--quads_mode=patrol_dual_goal",
+        f"--quads_mode={EVALUATION_SCENARIO}",
         f"--quads_num_agents={args.num_multi_agents + 1}",
         f"--quads_neighbor_visible_num={cfg_multi.quads_neighbor_visible_num}",
         f"--quads_neighbor_obs_type={cfg_multi.quads_neighbor_obs_type}",
@@ -570,7 +579,7 @@ def main() -> None:
         finally:
             solo_env.close()
 
-        initial_obs, _stored_states = deterministic_reset(env, args.seed, None)
+        initial_obs, stored_states = deterministic_reset(env, args.seed, None)
         initial_snapshot = safe_capture_env_snapshot(env)
 
         def collect_rollouts(
@@ -614,38 +623,35 @@ def main() -> None:
                 temp_env.close()
 
         if args.init_predictions is None:
-            print("Predicting trajectories")
-            dummy_predictions = np.zeros(
-                (args.num_multi_agents, args.episode_length, 6),
-                dtype=np.float64,
+            print("Collecting homogeneous predicted trajectories")
+            prediction_rnn_states = torch.zeros(
+                (args.num_multi_agents + 1, multi_rnn_size),
+                dtype=torch.float32,
+                device=device,
             )
-            prediction_logs = collect_rollouts(
-                dummy_predictions,
-                fall_down,
-                num_runs=1,
-                deterministic=True,
+            all_predictions = collect_homogeneous_trajectories(
+                env,
+                initial_obs,
+                multi_actor,
+                prediction_rnn_states,
+                args.episode_length,
             )
-            pred_trajectories = []
-            for agent_id in range(args.num_multi_agents):
-                pred_trajectories.append(
-                    np.concatenate(
-                        [
-                            prediction_logs[agent_id][0]["position"],
-                            prediction_logs[agent_id][0]["velocity"],
-                        ],
-                        axis=1,
-                    )
-                )
+            pred_trajectories = all_predictions[: args.num_multi_agents]
         else:
             pred_path = os.path.join(
                 args.predictions_dir,
                 args.init_predictions,
                 "pred_trajectories.npz",
             )
-            with np.load(pred_path) as pred_data:
-                pred_trajectories = pred_data["pred_trajectories"].astype(
-                    np.float32
-                )
+            pred_trajectories = load_prediction_artifact(
+                pred_path,
+                expected_num_multi_agents=args.num_multi_agents,
+                expected_episode_length=args.episode_length,
+                expected_seed=args.seed,
+                expected_policy_experiment=args.multi_experiment,
+                expected_policy_checkpoint=multi_ckpt,
+                expected_initial_states=stored_states,
+            )
 
         pred_trajectories = _validate_predictions(
             pred_trajectories,

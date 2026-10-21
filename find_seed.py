@@ -14,6 +14,7 @@ import numpy as np
 
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
+from project_utils.prediction_utils import EVALUATION_SCENARIO
 from project_utils.utils import load_cfg
 from project_utils.restart_utils import deterministic_reset, extract_positions_velocities
 
@@ -31,12 +32,11 @@ def parse_args() -> argparse.Namespace:
 
 def build_env(num_multi_agents: int, cfg_multi) -> object:
     register_swarm_components()
-    quads_mode = getattr(cfg_multi, "quads_mode", "patrol_dual_goal")
     eval_cli = [
         "--algo=APPO",
         "--env=quadrotor_multi",
         "--device=cpu",
-        f"--quads_mode={quads_mode}",
+        f"--quads_mode={EVALUATION_SCENARIO}",
         f"--quads_num_agents={num_multi_agents + 1}",
         f"--quads_neighbor_visible_num={cfg_multi.quads_neighbor_visible_num}",
         f"--quads_neighbor_obs_type={cfg_multi.quads_neighbor_obs_type}",

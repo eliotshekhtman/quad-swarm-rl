@@ -25,8 +25,12 @@ from swarm_rl.env_snapshot import clone_env_from_snapshot, safe_capture_env_snap
 from swarm_rl.env_wrappers.quad_utils import make_quadrotor_env
 from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
-from project_utils.conformal_utils import fall_down, run_multi_agents
 from project_utils.full_cbf_utils import make_cbf_filter
+from project_utils.prediction_utils import (
+    EVALUATION_SCENARIO,
+    collect_homogeneous_trajectories,
+    load_prediction_artifact,
+)
 from project_utils.restart_utils import deterministic_reset, reseed_quads, set_global_seed
 from project_utils.utils import (
     OBS_KEY,
@@ -44,7 +48,7 @@ SPHERE_ALPHA = 0.24
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Collect fixed-radius conformal patrol videos.")
+    parser = argparse.ArgumentParser(description="Collect fixed-radius conformal rollout videos.")
     parser.add_argument("--multi_train_dir", default="train_dir")
     parser.add_argument("--multi_experiment", required=True)
     parser.add_argument("--solo_train_dir", default="train_dir")
@@ -181,7 +185,7 @@ def _build_eval_cfg(cfg_multi, num_agents: int, enable_render: bool, view_mode: 
         "--algo=APPO",
         "--env=quadrotor_multi",
         "--device=cpu",
-        "--quads_mode=patrol_dual_goal",
+        f"--quads_mode={EVALUATION_SCENARIO}",
         f"--quads_num_agents={num_agents}",
         f"--quads_neighbor_visible_num={cfg_multi.quads_neighbor_visible_num}",
         f"--quads_neighbor_obs_type={cfg_multi.quads_neighbor_obs_type}",
@@ -197,16 +201,12 @@ def _build_eval_cfg(cfg_multi, num_agents: int, enable_render: bool, view_mode: 
     return parse_swarm_cfg(eval_cli, evaluation=True)
 
 
-def _scenario_signature(stored_states, env) -> Dict[str, np.ndarray]:
+def _scenario_signature(stored_states) -> Dict[str, np.ndarray]:
     positions = np.stack([np.asarray(state.position, dtype=np.float64) for state in stored_states], axis=0)
     goals = np.stack([np.asarray(state.goal, dtype=np.float64) for state in stored_states], axis=0)
-    goal_pairs = np.asarray(env.unwrapped.scenario.goal_pairs, dtype=np.float64).copy()
-    active_goal_index = np.asarray(env.unwrapped.scenario.active_goal_index, dtype=np.int64).copy()
     return {
         "positions": positions,
         "goals": goals,
-        "goal_pairs": goal_pairs,
-        "active_goal_index": active_goal_index,
     }
 
 
@@ -217,45 +217,34 @@ def _load_or_generate_pred_trajectories(
     num_multi_agents: int,
     multi_actor,
     multi_rnn_states: torch.Tensor,
-    solo_actor,
-    solo_rnn_states: torch.Tensor,
-    solo_obs_dim: int,
+    multi_checkpoint: str,
 ) -> List[np.ndarray]:
     if args.init_predictions is not None:
         pred_path = os.path.join(args.predictions_dir, args.init_predictions, "pred_trajectories.npz")
-        pred_data = np.load(pred_path)
-        pred_trajectories = pred_data["pred_trajectories"].astype(np.float32)
+        pred_trajectories = load_prediction_artifact(
+            pred_path,
+            expected_num_multi_agents=num_multi_agents,
+            expected_episode_length=args.episode_length,
+            expected_seed=args.seed,
+            expected_policy_experiment=args.multi_experiment,
+            expected_policy_checkpoint=multi_checkpoint,
+            expected_initial_states=stored_states,
+        )
         return [pred_trajectories[i] for i in range(pred_trajectories.shape[0])]
 
     obs = deterministic_reset(env, args.seed, stored_states)[0]
     _apply_rollout_seed(env, args.rollout_seed)
-    snapshot = safe_capture_env_snapshot(env)
-    temp_env = clone_env_from_snapshot(snapshot, restore_rng=True)
-    dummy_pred = np.zeros((num_multi_agents, args.episode_length, 6), dtype=np.float32)
-    try:
-        logs = run_multi_agents(
-            temp_env,
-            obs,
-            num_multi_agents,
-            multi_actor,
-            multi_rnn_states,
-            solo_actor,
-            solo_rnn_states,
-            solo_obs_dim,
-            pred_trajectories=dummy_pred,
-            solo_action_fn=fall_down,
-            deterministic=True,
-            max_steps=args.episode_length,
-        )
-    finally:
-        temp_env.close()
-
-    pred_trajectories = []
-    for agent_id in range(num_multi_agents):
-        positions = np.asarray(logs[agent_id][0]["position"], dtype=np.float32)
-        velocities = np.asarray(logs[agent_id][0]["velocity"], dtype=np.float32)
-        pred_trajectories.append(np.concatenate([positions, velocities], axis=1))
-    return pred_trajectories
+    prediction_rnn_states = multi_rnn_states.new_zeros(
+        (num_multi_agents + 1, multi_rnn_states.shape[1])
+    )
+    all_predictions = collect_homogeneous_trajectories(
+        env,
+        obs,
+        multi_actor,
+        prediction_rnn_states,
+        args.episode_length,
+    )
+    return [all_predictions[i] for i in range(num_multi_agents)]
 
 
 def _extract_agent_state(quad) -> Dict[str, np.ndarray]:
@@ -607,7 +596,7 @@ def main() -> None:
 
     try:
         obs, stored_states = deterministic_reset(env, args.seed, None)
-        initial_signature = _scenario_signature(stored_states, env)
+        initial_signature = _scenario_signature(stored_states)
         pred_trajectories_list = _load_or_generate_pred_trajectories(
             args,
             env,
@@ -615,9 +604,7 @@ def main() -> None:
             args.num_multi_agents,
             multi_actor,
             multi_rnn_states,
-            solo_actor,
-            solo_rnn_states,
-            solo_obs_dim,
+            multi_ckpt,
         )
         if len(pred_trajectories_list) != args.num_multi_agents:
             raise ValueError(
@@ -627,7 +614,7 @@ def main() -> None:
         pred_trajectories = np.stack(pred_trajectories_list, axis=0).astype(np.float64)
 
         obs, stored_states = deterministic_reset(env, args.seed, stored_states)
-        seeded_signature = _scenario_signature(stored_states, env)
+        seeded_signature = _scenario_signature(stored_states)
         for key in initial_signature:
             if not np.allclose(initial_signature[key], seeded_signature[key]):
                 raise RuntimeError(f"Deterministic seeded reset mismatch for {key}.")
@@ -673,15 +660,19 @@ def main() -> None:
         num_multi_agents=np.int32(args.num_multi_agents),
         seed=np.int32(args.seed),
         rollout_seed=np.int32(args.rollout_seed),
+        scenario=np.asarray(EVALUATION_SCENARIO),
         scenario_positions=seeded_signature["positions"],
         scenario_goals=seeded_signature["goals"],
-        scenario_goal_pairs=seeded_signature["goal_pairs"],
-        scenario_active_goal_index=seeded_signature["active_goal_index"],
     )
 
     args_path = os.path.splitext(output_path)[0] + "_args.json"
     with open(args_path, "w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2, sort_keys=True)
+        json.dump(
+            {**vars(args), "evaluation_scenario": EVALUATION_SCENARIO},
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
 
     if not args.skip_video:
         _record_replay_video(

@@ -210,6 +210,13 @@ def fall_down(base_action, env_state, swarm_state):
     return np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.float64)
 
 
+def _agent_goals(env):
+    return [
+        np.asarray(quad.goal, dtype=np.float64).copy()
+        for quad in env.unwrapped.envs
+    ]
+
+
 def run_multi_agents(
     env,
     obs,
@@ -250,11 +257,7 @@ def run_multi_agents(
             run_solo_rnn_states = solo_rnn_states.clone()
             run_max_dist = 0.0
 
-            scenario = env_run.unwrapped.scenario
-            goals = []
-            for agent_id in range(num_multi_agents + 1):
-                active = scenario.active_goal_index[agent_id]
-                goals.append(scenario.goal_pairs[agent_id, active])
+            goals = _agent_goals(env_run)
 
             while not done and step_num < max_steps:
                 obs_multi_dict = {OBS_KEY: obs_run[:num_multi_agents]}
@@ -313,9 +316,9 @@ def run_multi_agents(
                 obs_run = np.array(obs_run, dtype=np.float32)
 
                 pos, vel = extract_positions_velocities(env_run.unwrapped)
+                current_goals = _agent_goals(env_run)
                 for agent_id in range(num_multi_agents + 1):
-                    active = scenario.active_goal_index[agent_id]
-                    target = scenario.goal_pairs[agent_id, active]
+                    target = current_goals[agent_id]
                     run_logs[agent_id]["position"].append(pos[agent_id])
                     run_logs[agent_id]["velocity"].append(vel[agent_id])
                     run_logs[agent_id]["goal_dist"].append(
@@ -324,7 +327,7 @@ def run_multi_agents(
                     goal_changed = not np.allclose(target, goals[agent_id])
                     run_logs[agent_id]["goal_swap"].append(goal_changed)
                     if goal_changed:
-                        goals[agent_id] = target
+                        goals[agent_id] = target.copy()
                     if agent_id < num_multi_agents:
                         run_max_dist = max(
                             run_max_dist,
