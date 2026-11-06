@@ -11,6 +11,8 @@ safety coverage) with multiple lines:
     for all later episodes
   - Non-interactive run (single-episode .npz); provides constant lines on all
     four plots.
+  - Parametric anytime-valid run, repeated after its stopping episode
+  - Nonparametric anytime-valid run, repeated after its stopping episode
 
 Trajectory/tube visualizations are intentionally omitted.
 """
@@ -43,6 +45,16 @@ def parse_args() -> argparse.Namespace:
         help="Path to calibrate-once .npz (conformal.py run).",
     )
     parser.add_argument("--non_interactive", required=True, help="Path to single-episode non-interactive .npz.")
+    parser.add_argument(
+        "--anytime",
+        required=True,
+        help="Path to parametric anytime-valid conformal .npz.",
+    )
+    parser.add_argument(
+        "--anytime_nonparametric",
+        required=True,
+        help="Path to nonparametric anytime-valid conformal .npz.",
+    )
     parser.add_argument("--output_dir", help="Directory to save plots (default: ./plots/combined_<robust_stem>).")
     parser.add_argument("--alpha", type=float, help="Alpha for performance error bars; defaults to Robust run's alpha.")
     return parser.parse_args()
@@ -60,6 +72,17 @@ def load_run(path: str) -> dict:
             "cumulative_reward": data["cumulative_reward_per_episode"],
             "cumulative_reward_runs": data.get("cumulative_reward_per_run", None),
             "alpha": float(data["alpha"]) if "alpha" in data else None,
+            "update_procedure": (
+                str(data["update_procedure"])
+                if "update_procedure" in data
+                else None
+            ),
+            "anytime_current_radius": data.get(
+                "anytime_current_radius_per_episode", None
+            ),
+            "anytime_next_radius": data.get(
+                "anytime_next_radius_per_episode", None
+            ),
         }
 
 
@@ -77,6 +100,70 @@ def pad_repeat(arr: np.ndarray, target_len: int) -> np.ndarray:
     return np.concatenate([arr, pad], axis=0)
 
 
+def prepare_anytime_run(
+    run: dict,
+    target_len: int,
+    expected_procedure: str,
+) -> dict:
+    """Align a stopped anytime run to the iterative-method episode grid."""
+    if run["update_procedure"] != expected_procedure:
+        raise ValueError(
+            f"Expected {expected_procedure!r} metrics, got "
+            f"{run['update_procedure']!r}."
+        )
+
+    current_radius = run["anytime_current_radius"]
+    next_radius = run["anytime_next_radius"]
+    if current_radius is None or next_radius is None:
+        raise ValueError(
+            f"{expected_procedure} metrics are missing anytime radius fields."
+        )
+
+    current_radius = np.asarray(current_radius)
+    next_radius = np.asarray(next_radius)
+    episode_count = len(run["episodes"])
+    aligned_fields = {
+        "current radius": current_radius,
+        "next radius": next_radius,
+        "deployed radius": run["radius"],
+        "cumulative reward": run["cumulative_reward"],
+        "tube coverage": run["tube"],
+        "safety coverage": run["safety"],
+    }
+    for name, values in aligned_fields.items():
+        if len(values) != episode_count:
+            raise ValueError(
+                f"{expected_procedure} {name} has {len(values)} entries; "
+                f"expected {episode_count}."
+            )
+
+    reward_runs = run["cumulative_reward_runs"]
+    if reward_runs is not None and len(reward_runs) != episode_count:
+        raise ValueError(
+            f"{expected_procedure} per-run rewards have {len(reward_runs)} "
+            f"episodes; expected {episode_count}."
+        )
+    if episode_count == 0:
+        raise ValueError(f"{expected_procedure} metrics contain no episodes.")
+    if not np.allclose(next_radius, run["radius"], rtol=1e-6, atol=1e-7):
+        raise ValueError(
+            f"{expected_procedure} next-radius and deployed-radius data disagree."
+        )
+
+    radius_path = np.concatenate([current_radius[:1], next_radius])
+    return {
+        "radius": pad_repeat(radius_path, target_len),
+        "cumulative_reward": pad_repeat(run["cumulative_reward"], target_len),
+        "cumulative_reward_runs": (
+            pad_repeat(reward_runs, target_len)
+            if reward_runs is not None
+            else None
+        ),
+        "tube": pad_repeat(run["tube"], target_len),
+        "safety": pad_repeat(run["safety"], target_len),
+    }
+
+
 def main() -> None:
     args = parse_args()
 
@@ -84,6 +171,8 @@ def main() -> None:
     naive = load_run(args.naive)
     calibrate_once = load_run(args.calibrate_once)
     non_int_single_run = load_run(args.non_interactive)
+    anytime = load_run(args.anytime)
+    anytime_nonparametric = load_run(args.anytime_nonparametric)
 
     # Base episode grid comes from the Robust conformal run.
     base_episodes = robust["episodes"]
@@ -117,11 +206,24 @@ def main() -> None:
     x_lim_radius = (0, num_episodes - 2)
     x_lim_perf = (0, num_episodes - 1)
 
+    anytime_aligned = prepare_anytime_run(
+        anytime,
+        len(x_conformal),
+        "anytime",
+    )
+    anytime_nonparametric_aligned = prepare_anytime_run(
+        anytime_nonparametric,
+        len(x_conformal),
+        "anytime-nonparametric",
+    )
+
     colors = {
         "robust": "tab:blue",
         "naive": "tab:orange",
         "cal_once": "tab:green",
         "non_int": "tab:red",
+        "anytime": "tab:purple",
+        "anytime_nonparametric": "tab:brown",
     }
 
     # Prepare radius and q_j series.
@@ -130,6 +232,8 @@ def main() -> None:
         {"label": "Naive $r_j$", "y": prepare_conformal_radius(naive["radius"]), "style": {"color": colors["naive"], "marker": "s"}},
         {"label": "Calibrate-once $r_j$", "y": cal_once_radius, "style": {"color": colors["cal_once"], "marker": "s"}},
         {"label": "Non-interactive $r_j$", "y": single_radius, "style": {"color": colors["non_int"], "marker": "s"}},
+        {"label": "Anytime $r_j$", "y": anytime_aligned["radius"], "style": {"color": colors["anytime"], "marker": "D"}},
+        {"label": "Nonparametric anytime $r_j$", "y": anytime_nonparametric_aligned["radius"], "style": {"color": colors["anytime_nonparametric"], "marker": "P"}},
     ]
     series_q = [
         {"label": "Robust $q_j$", "y": robust["qj"], "style": {"color": colors["robust"], "marker": "x"}},
@@ -169,6 +273,23 @@ def main() -> None:
             "x": x_calib,
             "style": {"color": "tab:red", "marker": "v"},
         },
+        {
+            "label": "Anytime performance",
+            "y": anytime_aligned["cumulative_reward"],
+            "runs": anytime_aligned["cumulative_reward_runs"],
+            "x": x_conformal,
+            "style": {"color": colors["anytime"], "marker": "D"},
+        },
+        {
+            "label": "Nonparametric anytime performance",
+            "y": anytime_nonparametric_aligned["cumulative_reward"],
+            "runs": anytime_nonparametric_aligned["cumulative_reward_runs"],
+            "x": x_conformal,
+            "style": {
+                "color": colors["anytime_nonparametric"],
+                "marker": "P",
+            },
+        },
     ]
 
     # Tube and safety series.
@@ -177,12 +298,16 @@ def main() -> None:
         {"label": "Naive tube", "y": naive["tube"], "x": x_conformal, "style": {"color": "tab:orange", "marker": "o"}},
         {"label": "Calibrate-once tube", "y": cal_once_tube, "x": x_calib, "style": {"color": "tab:green", "marker": "^"}},
         {"label": "Non-interactive tube", "y": single_tube, "x": x_calib, "style": {"color": "tab:red", "marker": "v"}},
+        {"label": "Anytime tube", "y": anytime_aligned["tube"], "x": x_conformal, "style": {"color": colors["anytime"], "marker": "D"}},
+        {"label": "Nonparametric anytime tube", "y": anytime_nonparametric_aligned["tube"], "x": x_conformal, "style": {"color": colors["anytime_nonparametric"], "marker": "P"}},
     ]
     safety_series = [
         {"label": "Robust safety", "y": robust["safety"], "x": x_conformal, "style": {"color": "tab:blue", "marker": "s"}},
         {"label": "Naive safety", "y": naive["safety"], "x": x_conformal, "style": {"color": "tab:orange", "marker": "o"}},
         {"label": "Calibrate-once safety", "y": cal_once_safety, "x": x_calib, "style": {"color": "tab:green", "marker": "^"}},
         {"label": "Non-interactive safety", "y": single_safety, "x": x_calib, "style": {"color": "tab:red", "marker": "v"}},
+        {"label": "Anytime safety", "y": anytime_aligned["safety"], "x": x_conformal, "style": {"color": colors["anytime"], "marker": "D"}},
+        {"label": "Nonparametric anytime safety", "y": anytime_nonparametric_aligned["safety"], "x": x_conformal, "style": {"color": colors["anytime_nonparametric"], "marker": "P"}},
     ]
 
     # Output directory.
@@ -273,6 +398,11 @@ def main() -> None:
     print(f"[plot_combined] Loaded Naive from {os.path.abspath(args.naive)}")
     print(f"[plot_combined] Loaded Calibrate-once from {os.path.abspath(args.calibrate_once)}")
     print(f"[plot_combined] Loaded Non-interactive performance from {os.path.abspath(args.non_interactive)}")
+    print(f"[plot_combined] Loaded Anytime from {os.path.abspath(args.anytime)}")
+    print(
+        "[plot_combined] Loaded Nonparametric anytime from "
+        f"{os.path.abspath(args.anytime_nonparametric)}"
+    )
     for name, path in plot_paths.items():
         print(f"[plot_combined] Saved {name} plot to {path}")
 

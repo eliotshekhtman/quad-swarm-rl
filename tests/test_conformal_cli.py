@@ -21,6 +21,18 @@ class ConformalCliTests(unittest.TestCase):
         self.assertEqual(args.update_procedure, "robust")
         self.assertEqual(args.device, "cpu")
         self.assertEqual(args.r_init, 2.0)
+        self.assertEqual(args.kappa, 0.6)
+
+    def test_kappa_is_configurable(self):
+        args = parse_args(BASE_ARGS + ["--kappa", "0.5"])
+        self.assertEqual(args.kappa, 0.5)
+
+    def test_kappa_rejects_values_outside_small_gain_domain(self):
+        for value in ("-0.1", "1", "nan", "inf"):
+            with self.subTest(value=value):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parse_args(BASE_ARGS + ["--kappa", value])
 
     def test_gpu_device_is_accepted(self):
         args = parse_args(BASE_ARGS + ["--device", "gpu"])
@@ -33,12 +45,18 @@ class ConformalCliTests(unittest.TestCase):
             "non-interactive",
             "calibrate-once",
             "anytime",
+            "anytime-nonparametric",
         ):
             with self.subTest(procedure=procedure):
+                procedure_args = ["--update-procedure", procedure]
+                if procedure.startswith("anytime"):
+                    procedure_args.append("--anytime-assume-initial-safe")
                 args = parse_args(
-                    BASE_ARGS + ["--update-procedure", procedure]
+                    BASE_ARGS + procedure_args
                 )
                 self.assertEqual(args.update_procedure, procedure)
+                if procedure.startswith("anytime"):
+                    self.assertEqual(args.anytime_delta_init, 0.0)
 
     def test_non_iterative_modes_reject_prediction_updates(self):
         for procedure in ("non-interactive", "calibrate-once"):
@@ -73,7 +91,7 @@ class ConformalCliTests(unittest.TestCase):
                 )
                 self.assertEqual(args.num_episodes, 0)
 
-    def test_anytime_rejects_inverted_density_bounds(self):
+    def test_anytime_requires_explicit_initial_safety_mode(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parse_args(
@@ -81,11 +99,73 @@ class ConformalCliTests(unittest.TestCase):
                     + [
                         "--update-procedure",
                         "anytime",
-                        "--anytime-score-density-lower",
-                        "2.0",
-                        "--anytime-score-density-upper",
-                        "1.0",
                     ]
+                )
+
+    def test_anytime_accepts_initial_calibration(self):
+        args = parse_args(
+            BASE_ARGS
+            + [
+                "--update-procedure",
+                "anytime",
+                "--anytime-init-trajectories",
+                "100",
+            ]
+        )
+        self.assertEqual(args.anytime_init_trajectories, 100)
+        self.assertEqual(args.anytime_delta_init, 0.05)
+        self.assertFalse(args.anytime_assume_initial_safe)
+
+    def test_anytime_rejects_two_initial_safety_modes(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(
+                    BASE_ARGS
+                    + [
+                        "--update-procedure",
+                        "anytime",
+                        "--anytime-init-trajectories",
+                        "100",
+                        "--anytime-assume-initial-safe",
+                    ]
+                )
+
+    def test_anytime_rejects_prediction_updates(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(
+                    BASE_ARGS
+                    + [
+                        "--update-procedure",
+                        "anytime",
+                        "--anytime-assume-initial-safe",
+                        "--update_predictions",
+                    ]
+                )
+
+    def test_anytime_rejects_combined_error_budget_at_least_one(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(
+                    BASE_ARGS
+                    + [
+                        "--update-procedure",
+                        "anytime",
+                        "--anytime-init-trajectories",
+                        "100",
+                        "--delta",
+                        "0.6",
+                        "--anytime-delta-init",
+                        "0.4",
+                    ]
+                )
+
+    def test_removed_probability_slope_argument_is_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(
+                    BASE_ARGS
+                    + ["--anytime-score-density-lower", "1.0"]
                 )
 
 

@@ -5,6 +5,7 @@ Generate conformal experiment plots from saved metrics.
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -13,7 +14,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # Enable LaTeX rendering for labels and legends if available.
 plt.rcParams.update({
-    "text.usetex": True,
+    "text.usetex": shutil.which("latex") is not None,
     "font.family": "serif",
 })
 
@@ -110,6 +111,21 @@ def main() -> None:
             if "anytime_current_radius_per_episode" in data
             else None
         )
+        anytime_current_lower_radius = (
+            data["anytime_current_lower_radius_per_episode"]
+            if "anytime_current_lower_radius_per_episode" in data
+            else None
+        )
+        anytime_quantile_lower = (
+            data["anytime_quantile_lower_per_episode"]
+            if "anytime_quantile_lower_per_episode" in data
+            else None
+        )
+        anytime_quantile_upper = (
+            data["anytime_quantile_upper_per_episode"]
+            if "anytime_quantile_upper_per_episode" in data
+            else None
+        )
         agent_locs_per_episode = data.get("agent_locs_per_episode", None)
         predicted_traj_per_episode = data["predicted_traj_per_episode"]
     print(radius_arr)
@@ -126,9 +142,34 @@ def main() -> None:
     fig, ax = plt.subplots()
     noninteractive_radius = 0.33648095
     ax.axhline(noninteractive_radius, linestyle="--", color="gray", label=r"Non-interactive $1 - \bar \alpha$ quantile")
-    if update_procedure == "anytime" and anytime_current_radius is not None:
+    if (
+        update_procedure in ("anytime", "anytime-nonparametric")
+        and anytime_current_radius is not None
+    ):
         ax.plot(episodes, anytime_current_radius, label=r"$r_j$", marker='s')
         ax.plot(episodes, radius_arr, label=r"$r_{j+1}$", marker='o')
+        if anytime_current_lower_radius is not None:
+            ax.plot(
+                episodes,
+                anytime_current_lower_radius,
+                label=r"$\ell_j$",
+                marker='^',
+            )
+        if anytime_quantile_lower is not None:
+            ax.plot(
+                episodes,
+                anytime_quantile_lower,
+                label=r"$q^{\mathrm{lo}}_{j,\tau_j}$",
+                linestyle='--',
+            )
+        if anytime_quantile_upper is not None:
+            finite = np.isfinite(anytime_quantile_upper)
+            ax.plot(
+                episodes[finite],
+                anytime_quantile_upper[finite],
+                label=r"$q^{\mathrm{up}}_{j,\tau_j}$",
+                linestyle='--',
+            )
     else:
         shifted_radius_arr = np.insert(radius_arr, 0, 8)[:-1]
         ax.plot(episodes, shifted_radius_arr, label=r"$r_j$", marker='s')

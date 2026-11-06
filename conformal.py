@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import warnings
 
 import numpy as np
 import torch
@@ -19,8 +18,13 @@ from swarm_rl.train import parse_swarm_cfg, register_swarm_components
 
 from project_utils.anytime_utils import (
     BRANCH_CERTIFICATE,
+    BRANCH_CONSERVATIVE,
+    E_PROCESS_JEFFREYS,
+    E_PROCESS_NORMAL,
+    clopper_pearson_interval,
+    contraction_factors,
     episode_error_budget,
-    probability_slopes,
+    max_active_episodes,
     run_anytime_episode,
 )
 from project_utils.conformal_utils import (
@@ -43,7 +47,7 @@ from project_utils.utils import latest_checkpoint, load_actor, load_cfg
 
 
 DEFAULT_INITIAL_RADIUS = 2.0
-KAPPA = 0.6
+DEFAULT_KAPPA = 0.6
 COLLISION_HITBOX_RADIUS = 2.5
 UPDATE_PROCEDURES = (
     "robust",
@@ -51,7 +55,9 @@ UPDATE_PROCEDURES = (
     "non-interactive",
     "calibrate-once",
     "anytime",
+    "anytime-nonparametric",
 )
+ANYTIME_PROCEDURES = ("anytime", "anytime-nonparametric")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -68,6 +74,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--r_init", type=float, default=DEFAULT_INITIAL_RADIUS)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--delta", type=float, default=0.1)
+    parser.add_argument(
+        "--kappa",
+        type=float,
+        default=DEFAULT_KAPPA,
+        help="Small-gain coefficient used by radius updates (default: 0.6).",
+    )
     parser.add_argument("--episode_length", type=int, default=1500)
     parser.add_argument(
         "--num_trajectories",
@@ -82,7 +94,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--update_predictions",
         action="store_true",
-        help="Replace predictions with the first evaluation run after episode 0.",
+        help="Replace predictions after episode 0 (robust and naive only).",
     )
     parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--deterministic", action="store_true")
@@ -99,28 +111,29 @@ def parse_args(argv=None) -> argparse.Namespace:
         default="robust",
         help="Radius update rule. Defaults to the legacy conformal.py behavior.",
     )
-    parser.add_argument(
-        "--anytime-score-density-lower",
-        type=float,
-        default=1.0,
-        help="Fixed uniform lower bound on score density for the anytime mode.",
-    )
-    parser.add_argument(
-        "--anytime-score-density-upper",
-        type=float,
-        default=1.0,
-        help="Fixed uniform upper bound on score density for the anytime mode.",
-    )
-    parser.add_argument("--anytime-relative-precision", type=float, default=3.0)
     parser.add_argument("--anytime-radius-tolerance", type=float, default=0.15)
-    parser.add_argument("--anytime-eta-min", type=float, default=0.2)
-    parser.add_argument("--anytime-damping-gamma", type=float, default=0.02)
-    parser.add_argument("--anytime-grid-size", type=int, default=601)
     parser.add_argument(
         "--anytime-check-every",
         type=int,
         default=1,
         help="Check stopping conditions every N complete joint rollouts.",
+    )
+    parser.add_argument(
+        "--anytime-init-trajectories",
+        type=int,
+        default=0,
+        help="Independent trajectories used to certify the initial radius.",
+    )
+    parser.add_argument(
+        "--anytime-delta-init",
+        type=float,
+        default=None,
+        help="Initial-radius calibration error budget (default: 0.05).",
+    )
+    parser.add_argument(
+        "--anytime-assume-initial-safe",
+        action="store_true",
+        help="Treat r_init as known safe instead of calibrating it from data.",
     )
     args = parser.parse_args(argv)
 
@@ -136,6 +149,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--alpha must lie in (0, 1)")
     if not 0.0 < args.delta < 1.0:
         parser.error("--delta must lie in (0, 1)")
+    if not np.isfinite(args.kappa) or not 0.0 <= args.kappa < 1.0:
+        parser.error("--kappa must lie in [0, 1)")
     non_iterative_procedures = {"non-interactive", "calibrate-once"}
     if (
         args.update_procedure not in non_iterative_procedures
@@ -150,41 +165,41 @@ def parse_args(argv=None) -> argparse.Namespace:
             "--update_predictions is not supported by non-iterative updates"
         )
     if (
-        not np.isfinite(args.anytime_score_density_lower)
-        or args.anytime_score_density_lower <= 0.0
-    ):
-        parser.error("--anytime-score-density-lower must be positive")
-    if (
-        not np.isfinite(args.anytime_score_density_upper)
-        or args.anytime_score_density_upper < args.anytime_score_density_lower
-    ):
-        parser.error(
-            "--anytime-score-density-upper must be at least the lower bound"
-        )
-    if (
-        not np.isfinite(args.anytime_relative_precision)
-        or args.anytime_relative_precision <= 0.0
-    ):
-        parser.error("--anytime-relative-precision must be positive")
-    if (
         not np.isfinite(args.anytime_radius_tolerance)
         or args.anytime_radius_tolerance < 0.0
     ):
         parser.error("--anytime-radius-tolerance must be non-negative")
-    if (
-        not np.isfinite(args.anytime_eta_min)
-        or not 0.0 < args.anytime_eta_min <= 1.0
-    ):
-        parser.error("--anytime-eta-min must lie in (0, 1]")
-    if (
-        not np.isfinite(args.anytime_damping_gamma)
-        or args.anytime_damping_gamma <= 0.0
-    ):
-        parser.error("--anytime-damping-gamma must be positive")
-    if args.anytime_grid_size <= 0:
-        parser.error("--anytime-grid-size must be positive")
     if args.anytime_check_every <= 0:
         parser.error("--anytime-check-every must be positive")
+    if args.anytime_init_trajectories < 0:
+        parser.error("--anytime-init-trajectories must be non-negative")
+    if args.update_procedure in ANYTIME_PROCEDURES:
+        has_calibration = args.anytime_init_trajectories > 0
+        if has_calibration == args.anytime_assume_initial_safe:
+            parser.error(
+                "anytime updates require exactly one of "
+                "--anytime-init-trajectories N or --anytime-assume-initial-safe"
+            )
+        if args.update_predictions:
+            parser.error(
+                "--update_predictions is not supported by anytime updates"
+            )
+        if has_calibration:
+            if args.anytime_delta_init is None:
+                args.anytime_delta_init = 0.05
+            if (
+                not np.isfinite(args.anytime_delta_init)
+                or not 0.0 < args.anytime_delta_init < 1.0
+            ):
+                parser.error("--anytime-delta-init must lie in (0, 1)")
+            if args.delta + args.anytime_delta_init >= 1.0:
+                parser.error("--delta + --anytime-delta-init must be below 1")
+        else:
+            if args.anytime_delta_init is not None:
+                parser.error(
+                    "--anytime-delta-init requires initial calibration"
+                )
+            args.anytime_delta_init = 0.0
 
     return args
 
@@ -208,29 +223,33 @@ def _empty_metrics() -> dict:
         "agent_locs_per_episode": [],
         "predicted_traj_per_episode": [],
         "anytime_current_radius_per_episode": [],
+        "anytime_current_lower_radius_per_episode": [],
         "anytime_next_radius_per_episode": [],
+        "anytime_next_lower_radius_per_episode": [],
+        "anytime_current_width_per_episode": [],
+        "anytime_next_width_per_episode": [],
         "anytime_tube_radius_per_episode": [],
-        "anytime_lower_probability_per_episode": [],
-        "anytime_upper_probability_per_episode": [],
-        "anytime_confidence_width_per_episode": [],
+        "anytime_quantile_lower_per_episode": [],
+        "anytime_quantile_upper_per_episode": [],
         "anytime_trajectory_count_per_episode": [],
         "anytime_exceedance_count_per_episode": [],
         "anytime_empirical_exceedance_per_episode": [],
         "anytime_branch_per_episode": [],
+        "anytime_termination_reason_per_episode": [],
         "anytime_delta_per_episode": [],
-        "anytime_eta_per_episode": [],
         "anytime_radius_certificate_per_episode": [],
-        "anytime_safe_flag_per_episode": [],
-        "anytime_next_safe_flag_per_episode": [],
-        "anytime_stopped_forecast_per_episode": [],
-        "anytime_log_hedge_conservative_per_episode": [],
-        "anytime_log_hedge_under_per_episode": [],
         "anytime_scores_per_episode": [],
         "anytime_indicators_per_episode": [],
         "anytime_sample_radii_per_episode": [],
-        "anytime_lower_history_per_episode": [],
-        "anytime_upper_history_per_episode": [],
+        "anytime_quantile_lower_history_per_episode": [],
+        "anytime_quantile_upper_history_per_episode": [],
+        "anytime_few_critical_history_per_episode": [],
+        "anytime_many_critical_history_per_episode": [],
+        "anytime_candidate_radius_history_per_episode": [],
+        "anytime_candidate_lower_radius_history_per_episode": [],
+        "anytime_candidate_width_history_per_episode": [],
         "anytime_config": None,
+        "anytime_run_termination_reason": None,
     }
 
 
@@ -266,45 +285,64 @@ def _record_anytime_episode(
     min_radius: float,
 ) -> None:
     metrics["anytime_current_radius_per_episode"].append(result.radius)
+    metrics["anytime_current_lower_radius_per_episode"].append(
+        result.lower_radius
+    )
     metrics["anytime_next_radius_per_episode"].append(result.next_radius)
+    metrics["anytime_next_lower_radius_per_episode"].append(
+        result.next_lower_radius
+    )
+    metrics["anytime_current_width_per_episode"].append(result.current_width)
+    metrics["anytime_next_width_per_episode"].append(result.next_width)
     metrics["anytime_tube_radius_per_episode"].append(
         max(result.next_radius - min_radius, 0.0)
     )
-    metrics["anytime_lower_probability_per_episode"].append(result.lower)
-    metrics["anytime_upper_probability_per_episode"].append(result.upper)
-    metrics["anytime_confidence_width_per_episode"].append(result.width)
+    metrics["anytime_quantile_lower_per_episode"].append(
+        result.quantile_lower
+    )
+    metrics["anytime_quantile_upper_per_episode"].append(
+        result.quantile_upper
+    )
     metrics["anytime_trajectory_count_per_episode"].append(result.num_samples)
     metrics["anytime_exceedance_count_per_episode"].append(result.exceedances)
     metrics["anytime_empirical_exceedance_per_episode"].append(
         result.exceedances / result.num_samples
+        if result.num_samples
+        else np.nan
     )
     metrics["anytime_branch_per_episode"].append(result.branch)
+    metrics["anytime_termination_reason_per_episode"].append(
+        result.termination_reason
+    )
     metrics["anytime_delta_per_episode"].append(episode_delta)
-    metrics["anytime_eta_per_episode"].append(result.eta)
     metrics["anytime_radius_certificate_per_episode"].append(
         result.radius_certificate
-    )
-    metrics["anytime_safe_flag_per_episode"].append(result.safe)
-    metrics["anytime_next_safe_flag_per_episode"].append(result.next_safe)
-    metrics["anytime_stopped_forecast_per_episode"].append(
-        result.stopped_forecast
-    )
-    metrics["anytime_log_hedge_conservative_per_episode"].append(
-        result.log_hedge_conservative
-    )
-    metrics["anytime_log_hedge_under_per_episode"].append(
-        result.log_hedge_under
     )
     metrics["anytime_scores_per_episode"].append(result.scores.copy())
     metrics["anytime_indicators_per_episode"].append(result.indicators.copy())
     metrics["anytime_sample_radii_per_episode"].append(
         np.full(result.num_samples, result.radius, dtype=np.float64)
     )
-    metrics["anytime_lower_history_per_episode"].append(
-        result.lower_history.copy()
+    metrics["anytime_quantile_lower_history_per_episode"].append(
+        result.quantile_lower_history.copy()
     )
-    metrics["anytime_upper_history_per_episode"].append(
-        result.upper_history.copy()
+    metrics["anytime_quantile_upper_history_per_episode"].append(
+        result.quantile_upper_history.copy()
+    )
+    metrics["anytime_few_critical_history_per_episode"].append(
+        result.few_critical_history.copy()
+    )
+    metrics["anytime_many_critical_history_per_episode"].append(
+        result.many_critical_history.copy()
+    )
+    metrics["anytime_candidate_radius_history_per_episode"].append(
+        result.candidate_radius_history.copy()
+    )
+    metrics["anytime_candidate_lower_radius_history_per_episode"].append(
+        result.candidate_lower_radius_history.copy()
+    )
+    metrics["anytime_candidate_width_history_per_episode"].append(
+        result.candidate_width_history.copy()
     )
 
 
@@ -369,29 +407,46 @@ def _save_metrics(
         "alpha": args.alpha,
         "delta": args.delta,
         "bar_alpha": alpha_bar,
+        "kappa": args.kappa,
         "update_procedure": np.asarray(args.update_procedure),
     }
 
     if metrics["anytime_trajectory_count_per_episode"]:
         config = metrics["anytime_config"]
         output.update(
+            anytime_schema_version=np.asarray(2, dtype=np.int64),
+            anytime_family=np.asarray(config["family"]),
+            anytime_run_termination_reason=np.asarray(
+                metrics["anytime_run_termination_reason"]
+            ),
             anytime_current_radius_per_episode=np.asarray(
                 metrics["anytime_current_radius_per_episode"], dtype=np.float64
+            ),
+            anytime_current_lower_radius_per_episode=np.asarray(
+                metrics["anytime_current_lower_radius_per_episode"],
+                dtype=np.float64,
             ),
             anytime_next_radius_per_episode=np.asarray(
                 metrics["anytime_next_radius_per_episode"], dtype=np.float64
             ),
+            anytime_next_lower_radius_per_episode=np.asarray(
+                metrics["anytime_next_lower_radius_per_episode"],
+                dtype=np.float64,
+            ),
+            anytime_current_width_per_episode=np.asarray(
+                metrics["anytime_current_width_per_episode"], dtype=np.float64
+            ),
+            anytime_next_width_per_episode=np.asarray(
+                metrics["anytime_next_width_per_episode"], dtype=np.float64
+            ),
             tube_radius_per_episode=np.asarray(
                 metrics["anytime_tube_radius_per_episode"], dtype=np.float64
             ),
-            anytime_lower_probability_per_episode=np.asarray(
-                metrics["anytime_lower_probability_per_episode"], dtype=np.float64
+            anytime_quantile_lower_per_episode=np.asarray(
+                metrics["anytime_quantile_lower_per_episode"], dtype=np.float64
             ),
-            anytime_upper_probability_per_episode=np.asarray(
-                metrics["anytime_upper_probability_per_episode"], dtype=np.float64
-            ),
-            anytime_confidence_width_per_episode=np.asarray(
-                metrics["anytime_confidence_width_per_episode"], dtype=np.float64
+            anytime_quantile_upper_per_episode=np.asarray(
+                metrics["anytime_quantile_upper_per_episode"], dtype=np.float64
             ),
             anytime_trajectory_count_per_episode=np.asarray(
                 metrics["anytime_trajectory_count_per_episode"], dtype=np.int64
@@ -406,31 +461,15 @@ def _save_metrics(
             anytime_branch_per_episode=np.asarray(
                 metrics["anytime_branch_per_episode"]
             ),
+            anytime_termination_reason_per_episode=np.asarray(
+                metrics["anytime_termination_reason_per_episode"]
+            ),
             anytime_delta_per_episode=np.asarray(
                 metrics["anytime_delta_per_episode"], dtype=np.float64
-            ),
-            anytime_eta_per_episode=np.asarray(
-                metrics["anytime_eta_per_episode"], dtype=np.float64
             ),
             anytime_radius_certificate_per_episode=np.asarray(
                 metrics["anytime_radius_certificate_per_episode"],
                 dtype=np.float64,
-            ),
-            anytime_safe_flag_per_episode=np.asarray(
-                metrics["anytime_safe_flag_per_episode"], dtype=bool
-            ),
-            anytime_next_safe_flag_per_episode=np.asarray(
-                metrics["anytime_next_safe_flag_per_episode"], dtype=bool
-            ),
-            anytime_stopped_forecast_per_episode=np.asarray(
-                metrics["anytime_stopped_forecast_per_episode"], dtype=np.float64
-            ),
-            anytime_log_hedge_conservative_per_episode=np.asarray(
-                metrics["anytime_log_hedge_conservative_per_episode"],
-                dtype=np.float64,
-            ),
-            anytime_log_hedge_under_per_episode=np.asarray(
-                metrics["anytime_log_hedge_under_per_episode"], dtype=np.float64
             ),
             anytime_scores=_pad_rows(
                 metrics["anytime_scores_per_episode"], np.nan, np.float64
@@ -441,18 +480,74 @@ def _save_metrics(
             anytime_sample_radii=_pad_rows(
                 metrics["anytime_sample_radii_per_episode"], np.nan, np.float64
             ),
-            anytime_lower_probability_history=_pad_rows(
-                metrics["anytime_lower_history_per_episode"], np.nan, np.float64
+            anytime_quantile_lower_history=_pad_rows(
+                metrics["anytime_quantile_lower_history_per_episode"],
+                np.nan,
+                np.float64,
             ),
-            anytime_upper_probability_history=_pad_rows(
-                metrics["anytime_upper_history_per_episode"], np.nan, np.float64
+            anytime_quantile_upper_history=_pad_rows(
+                metrics["anytime_quantile_upper_history_per_episode"],
+                np.nan,
+                np.float64,
+            ),
+            anytime_few_critical_history=_pad_rows(
+                metrics["anytime_few_critical_history_per_episode"],
+                -2,
+                np.int64,
+            ),
+            anytime_many_critical_history=_pad_rows(
+                metrics["anytime_many_critical_history_per_episode"],
+                -2,
+                np.int64,
+            ),
+            anytime_candidate_radius_history=_pad_rows(
+                metrics["anytime_candidate_radius_history_per_episode"],
+                np.nan,
+                np.float64,
+            ),
+            anytime_candidate_lower_radius_history=_pad_rows(
+                metrics[
+                    "anytime_candidate_lower_radius_history_per_episode"
+                ],
+                np.nan,
+                np.float64,
+            ),
+            anytime_candidate_width_history=_pad_rows(
+                metrics["anytime_candidate_width_history_per_episode"],
+                np.nan,
+                np.float64,
             ),
             anytime_kappa=config["kappa"],
-            anytime_density_lower=config["density_lower"],
-            anytime_density_upper=config["density_upper"],
-            anytime_lower_slope=config["lower_slope"],
-            anytime_upper_slope=config["upper_slope"],
+            anytime_gamma=config["gamma"],
+            anytime_zeta=config["zeta"],
+            anytime_radius_tolerance=config["radius_tolerance"],
+            anytime_k_epsilon=(
+                -1 if config["k_epsilon"] is None else config["k_epsilon"]
+            ),
             anytime_min_radius=config["min_radius"],
+            anytime_initial_width=config["initial_width"],
+            anytime_initial_safety_mode=np.asarray(
+                config["initial_safety_mode"]
+            ),
+            anytime_delta_init=config["delta_init"],
+            anytime_initial_trajectory_count=config[
+                "initial_trajectory_count"
+            ],
+            anytime_initial_exceedance_count=config[
+                "initial_exceedance_count"
+            ],
+            anytime_initial_probability_lower=config[
+                "initial_probability_lower"
+            ],
+            anytime_initial_probability_upper=config[
+                "initial_probability_upper"
+            ],
+            anytime_initial_scores=np.asarray(
+                config["initial_scores"], dtype=np.float64
+            ),
+            anytime_initial_indicators=np.asarray(
+                config["initial_indicators"], dtype=np.int8
+            ),
         )
 
     np.savez(metrics_path, **output)
@@ -660,7 +755,7 @@ def main() -> None:
         )
 
         min_radius = env.quad_arm * COLLISION_HITBOX_RADIUS
-        if args.update_procedure == "anytime":
+        if args.update_procedure in ANYTIME_PROCEDURES:
             alpha_bar = np.nan
         else:
             alpha_bar = get_alpha_bar(
@@ -808,7 +903,7 @@ def main() -> None:
                     args.update_procedure,
                     radius,
                     qj,
-                    KAPPA,
+                    args.kappa,
                     min_radius,
                     MAX_RADIUS,
                 )
@@ -848,50 +943,129 @@ def main() -> None:
             radius = calibrate_once_final_radius(
                 MAX_RADIUS,
                 q0,
-                KAPPA,
+                args.kappa,
                 args.num_episodes,
             )
             q_final = calibrate(radius)
             print("radius", radius, "qj", q_final)
             evaluate_and_record(radius, q_final)
             episode_ids = np.array([0, 1, args.num_episodes + 1])
-        else:
-            if args.update_predictions:
-                warnings.warn(
-                    "Updating predictions changes the radius-indexed policy family; "
-                    "the paper's fixed-predictor guarantee no longer applies.",
-                    stacklevel=2,
+        elif args.update_procedure in ANYTIME_PROCEDURES:
+            family = (
+                E_PROCESS_JEFFREYS
+                if args.update_procedure == "anytime"
+                else E_PROCESS_NORMAL
+            )
+            radius = MAX_RADIUS
+            lower_radius = min_radius
+            if radius < lower_radius:
+                raise ValueError(
+                    "--r_init must be at least the physical minimum radius "
+                    f"{lower_radius:.5f}."
                 )
 
-            lower_slope, upper_slope = probability_slopes(
-                KAPPA,
-                args.anytime_score_density_lower,
-                args.anytime_score_density_upper,
+            initial_scores = np.empty(0, dtype=np.float64)
+            initial_indicators = np.empty(0, dtype=np.int8)
+            if args.anytime_assume_initial_safe:
+                initial_safety_mode = "assumed"
+                effective_delta_init = 0.0
+                initial_probability_lower = np.nan
+                initial_probability_upper = np.nan
+                print(
+                    f"Assuming initial radius r0={radius:.5f} is known safe."
+                )
+            else:
+                initial_safety_mode = "clopper-pearson"
+                effective_delta_init = args.anytime_delta_init
+                print(
+                    "Calibrating initial-radius safety with "
+                    f"{args.anytime_init_trajectories} independent trajectories"
+                )
+                initial_logs = collect_for_radius(
+                    radius,
+                    args.anytime_init_trajectories,
+                    deterministic=args.deterministic,
+                    first_run_deterministic=False,
+                )
+                initial_scores = np.asarray(
+                    [
+                        min_radius
+                        + joint_rollout_error(
+                            initial_logs,
+                            pred_trajectories,
+                            args.num_multi_agents,
+                            args.episode_length,
+                            run_id,
+                        )
+                        for run_id in range(args.anytime_init_trajectories)
+                    ],
+                    dtype=np.float64,
+                )
+                initial_indicators = (initial_scores > radius).astype(np.int8)
+                initial_probability_lower, initial_probability_upper = (
+                    clopper_pearson_interval(
+                        int(np.sum(initial_indicators)),
+                        args.anytime_init_trajectories,
+                        effective_delta_init,
+                    )
+                )
+                print(
+                    "Initial exceedance interval: "
+                    f"[{initial_probability_lower:.5f}, "
+                    f"{initial_probability_upper:.5f}]"
+                )
+                if initial_probability_upper > args.alpha:
+                    raise RuntimeError(
+                        "Initial radius is not certified safe: Clopper-Pearson "
+                        f"upper bound {initial_probability_upper:.5f} exceeds "
+                        f"alpha={args.alpha:.5f}. Increase --r_init or collect "
+                        "more initial trajectories."
+                    )
+
+            gamma, zeta = contraction_factors(args.kappa)
+            initial_width = radius - lower_radius
+            k_epsilon = max_active_episodes(
+                initial_width,
+                args.anytime_radius_tolerance,
+                args.kappa,
             )
             metrics["anytime_config"] = {
-                "kappa": KAPPA,
-                "density_lower": args.anytime_score_density_lower,
-                "density_upper": args.anytime_score_density_upper,
-                "lower_slope": lower_slope,
-                "upper_slope": upper_slope,
+                "family": family,
+                "kappa": args.kappa,
+                "gamma": gamma,
+                "zeta": zeta,
+                "radius_tolerance": args.anytime_radius_tolerance,
+                "k_epsilon": k_epsilon,
                 "min_radius": min_radius,
+                "initial_width": initial_width,
+                "initial_safety_mode": initial_safety_mode,
+                "delta_init": effective_delta_init,
+                "initial_trajectory_count": len(initial_scores),
+                "initial_exceedance_count": int(np.sum(initial_indicators)),
+                "initial_probability_lower": initial_probability_lower,
+                "initial_probability_upper": initial_probability_upper,
+                "initial_scores": initial_scores,
+                "initial_indicators": initial_indicators,
             }
             print(
-                "Anytime fixed assumptions: "
-                f"kappa={KAPPA}, "
-                f"density=[{args.anytime_score_density_lower}, "
-                f"{args.anytime_score_density_upper}], "
-                f"m_p={lower_slope}, L_p={upper_slope}"
+                f"Anytime family={family} kappa={args.kappa} gamma={gamma:.5f} "
+                f"zeta={zeta:.5f} initial bracket="
+                f"[{lower_radius:.5f}, {radius:.5f}] k_epsilon={k_epsilon}"
             )
 
-            radius = MAX_RADIUS
-            safe = True
-            nominal_forecast = args.alpha / 2.0
+            if k_epsilon is None:
+                episode_limit = args.num_episodes
+            else:
+                episode_limit = min(args.num_episodes, max(k_epsilon, 1))
             episode_ids = []
 
-            for episode in range(args.num_episodes):
+            for episode in range(episode_limit):
                 print("EPISODE", episode)
-                episode_delta = episode_error_budget(args.delta, episode)
+                episode_delta = episode_error_budget(
+                    args.delta,
+                    episode,
+                    k_epsilon,
+                )
                 radii = np.full(
                     args.num_multi_agents,
                     radius,
@@ -929,27 +1103,23 @@ def main() -> None:
                 result = run_anytime_episode(
                     sample_joint_score,
                     radius=radius,
-                    safe=safe,
+                    lower_radius=lower_radius,
                     alpha=args.alpha,
                     delta=episode_delta,
-                    lower_slope=lower_slope,
-                    upper_slope=upper_slope,
-                    relative_precision=args.anytime_relative_precision,
+                    kappa=args.kappa,
                     radius_tolerance=args.anytime_radius_tolerance,
-                    eta_min=args.anytime_eta_min,
-                    damping_gamma=args.anytime_damping_gamma,
-                    min_radius=min_radius,
-                    max_radius=MAX_RADIUS,
                     max_samples=args.num_trajectories,
-                    nominal_forecast=nominal_forecast,
-                    grid_size=args.anytime_grid_size,
+                    family=family,
                     check_every=args.anytime_check_every,
                 )
                 print(
-                    f"branch={result.branch} n={result.num_samples} "
-                    f"K={result.exceedances} "
-                    f"p=[{result.lower:.5f}, {result.upper:.5f}] "
-                    f"radius={result.radius:.5f} -> {result.next_radius:.5f}"
+                    f"status={result.branch} reason={result.termination_reason} "
+                    f"n={result.num_samples} K={result.exceedances} "
+                    f"q=[{result.quantile_lower:.5f}, "
+                    f"{result.quantile_upper:.5f}] bracket="
+                    f"[{result.lower_radius:.5f}, {result.radius:.5f}] -> "
+                    f"[{result.next_lower_radius:.5f}, "
+                    f"{result.next_radius:.5f}]"
                 )
 
                 _record_anytime_episode(
@@ -958,22 +1128,34 @@ def main() -> None:
                     episode_delta,
                     min_radius,
                 )
-                reference_logs = evaluate_anytime_and_record(result.next_radius)
+                evaluate_anytime_and_record(result.next_radius)
                 episode_ids.append(episode)
 
-                if args.update_predictions and episode == 0:
-                    update_predictions_from_logs(reference_logs)
-
                 radius = result.next_radius
-                safe = result.next_safe
-                nominal_forecast = result.stopped_forecast
+                lower_radius = result.next_lower_radius
                 if result.branch == BRANCH_CERTIFICATE:
+                    metrics["anytime_run_termination_reason"] = "certificate"
                     print(
-                        "Certified radius error "
-                        f"{result.radius_certificate:.5f} <= "
+                        "Certified bracket width "
+                        f"{result.next_width:.5f} <= "
                         f"{args.anytime_radius_tolerance:.5f}; stopping."
                     )
                     break
+                if result.branch != BRANCH_CONSERVATIVE:
+                    metrics["anytime_run_termination_reason"] = (
+                        result.termination_reason
+                    )
+                    print(
+                        "Anytime update terminated unresolved: "
+                        f"{result.termination_reason}."
+                    )
+                    break
+            else:
+                metrics["anytime_run_termination_reason"] = (
+                    "driver-cap"
+                    if args.num_episodes <= episode_limit
+                    else "episode-budget-exhausted"
+                )
 
             episode_ids = np.asarray(episode_ids, dtype=np.int64)
 

@@ -56,7 +56,8 @@ python conformal.py [model and output arguments] --update-procedure robust
 python conformal.py [model and output arguments] --update-procedure naive
 python conformal.py [model and output arguments] --update-procedure non-interactive
 python conformal.py [model and output arguments] --update-procedure calibrate-once
-python conformal.py [model and output arguments] --update-procedure anytime
+python conformal.py [model and output arguments] --update-procedure anytime --anytime-init-trajectories 1000
+python conformal.py [model and output arguments] --update-procedure anytime-nonparametric --anytime-init-trajectories 1000
 ```
 
 `robust` implements the adaptive robust update, `naive` sets the next radius
@@ -72,19 +73,21 @@ Policy inference defaults to CPU. Use `--device gpu` together with
 `CUDA_VISIBLE_DEVICES=<index>` to assign a process to one GPU; simulation and
 ECBF optimization remain CPU-bound.
 
-`anytime` implements Algorithm 1's per-rollout confidence sequence and stops
-each episode as soon as an update or radius certificate is available. One
-Bernoulli observation represents the complete joint rollout: its score is the
+`anytime` implements the revised Algorithm 1 with the likelihood-based
+Jeffreys-mixture e-process. `anytime-nonparametric` uses the normal-mixture
+e-process with the same quantile confidence sequence, bracket update, and
+stopping rule. One score represents the complete joint rollout: it is the
 physical separation radius plus the largest prediction error over all agents
-and timesteps. `--num_trajectories` is the per-episode cap in this mode.
+and timesteps. `--num_trajectories` is the per-episode cap in these modes.
 
-The anytime slope constants are fixed rather than estimated. The driver uses
-`KAPPA = 0.6` and computes `m_p = (1 - KAPPA) * density_lower` and
-`L_p = (1 + KAPPA) * density_upper`. Supply domain-valid uniform density bounds
-with `--anytime-score-density-lower` and
-`--anytime-score-density-upper`; both default to `1.0`. The default stopping
-check frequency is one complete rollout. Enabling `--update_predictions` is
-supported, but changes the fixed predictor assumed by the paper's guarantee.
+The driver uses the fixed quantile-sensitivity constant `KAPPA = 0.6`; density
+bounds and probability-slope estimates are not part of the revised algorithm.
+An anytime run must either certify its initial radius with independent data via
+`--anytime-init-trajectories N` and `--anytime-delta-init`, or explicitly state
+the known-safe assumption with `--anytime-assume-initial-safe`. Prediction
+updates are rejected because they change the fixed radius-indexed policy family
+required by the guarantee. The default stopping-check frequency is one complete
+joint rollout and can be batched with `--anytime-check-every`.
 
 ### Train
 

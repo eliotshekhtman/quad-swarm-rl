@@ -31,6 +31,7 @@ class ConformalOutputTests(unittest.TestCase):
         args = Namespace(
             alpha=0.1,
             delta=0.2,
+            kappa=0.5,
             update_procedure="naive",
         )
 
@@ -58,10 +59,12 @@ class ConformalOutputTests(unittest.TestCase):
                     "alpha",
                     "delta",
                     "bar_alpha",
+                    "kappa",
                     "update_procedure",
                 }
                 self.assertEqual(set(data.files), expected_keys)
                 self.assertEqual(data["update_procedure"].item(), "naive")
+                self.assertEqual(data["kappa"].item(), 0.5)
                 self.assertEqual(data["cumulative_reward_per_run"].shape, (1, 1))
                 self.assertEqual(
                     data["predicted_traj_per_episode"].shape,
@@ -96,37 +99,53 @@ class ConformalOutputTests(unittest.TestCase):
         )
         result = AnytimeEpisodeResult(
             branch="conservative",
+            termination_reason="conservative",
+            family="jeffreys",
             radius=1.3,
+            lower_radius=0.2,
             next_radius=1.2,
-            safe=True,
-            next_safe=True,
+            next_lower_radius=0.3,
+            current_width=1.1,
+            next_width=0.9,
             num_samples=2,
             exceedances=0,
-            lower=0.0,
-            upper=0.05,
-            width=0.05,
-            eta=0.5,
-            radius_certificate=0.25,
-            stopped_forecast=1.0 / 6.0,
-            log_hedge_conservative=2.0,
-            log_hedge_under=-1.0,
+            quantile_lower=0.7,
+            quantile_upper=1.0,
+            radius_certificate=1.0,
             scores=np.array([0.7, 0.8]),
             indicators=np.array([0, 0], dtype=np.int8),
-            lower_history=np.array([0.0, 0.0]),
-            upper_history=np.array([0.2, 0.05]),
+            quantile_lower_history=np.array([0.0, 0.7]),
+            quantile_upper_history=np.array([np.inf, 1.0]),
+            few_critical_history=np.array([-1, 0]),
+            many_critical_history=np.array([2, 2]),
+            candidate_radius_history=np.array([1.3, 1.2]),
+            candidate_lower_radius_history=np.array([0.2, 0.3]),
+            candidate_width_history=np.array([1.1, 0.9]),
         )
         _record_anytime_episode(metrics, result, episode_delta=0.05, min_radius=0.2)
         metrics["anytime_config"] = {
+            "family": "jeffreys",
             "kappa": 0.6,
-            "density_lower": 1.0,
-            "density_upper": 1.0,
-            "lower_slope": 0.4,
-            "upper_slope": 1.6,
+            "gamma": 0.75,
+            "zeta": 0.875,
+            "radius_tolerance": 0.15,
+            "k_epsilon": 15,
             "min_radius": 0.2,
+            "initial_width": 1.8,
+            "initial_safety_mode": "clopper-pearson",
+            "delta_init": 0.05,
+            "initial_trajectory_count": 2,
+            "initial_exceedance_count": 0,
+            "initial_probability_lower": 0.0,
+            "initial_probability_upper": 0.8,
+            "initial_scores": np.array([0.7, 0.8]),
+            "initial_indicators": np.array([0, 0], dtype=np.int8),
         }
+        metrics["anytime_run_termination_reason"] = "driver-cap"
         args = Namespace(
             alpha=0.1,
             delta=0.1,
+            kappa=0.6,
             update_procedure="anytime",
         )
 
@@ -153,13 +172,23 @@ class ConformalOutputTests(unittest.TestCase):
                     data["anytime_sample_radii"], [[1.3, 1.3]]
                 )
                 np.testing.assert_allclose(
-                    data["anytime_upper_probability_history"], [[0.2, 0.05]]
+                    data["anytime_quantile_upper_history"], [[np.inf, 1.0]]
                 )
-                self.assertAlmostEqual(data["anytime_lower_slope"].item(), 0.4)
+                np.testing.assert_array_equal(
+                    data["anytime_few_critical_history"], [[-1, 0]]
+                )
                 self.assertAlmostEqual(
                     data["anytime_next_radius_per_episode"].item(), 1.2
                 )
                 self.assertAlmostEqual(data["tube_radius_per_episode"].item(), 1.0)
+                self.assertEqual(data["anytime_schema_version"].item(), 2)
+                self.assertEqual(data["anytime_family"].item(), "jeffreys")
+                self.assertEqual(
+                    data["anytime_run_termination_reason"].item(),
+                    "driver-cap",
+                )
+                self.assertNotIn("anytime_lower_probability_per_episode", data)
+                self.assertNotIn("anytime_density_lower", data)
 
 
 if __name__ == "__main__":

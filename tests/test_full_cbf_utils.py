@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import cvxpy as cp
@@ -15,6 +16,7 @@ from project_utils.full_cbf_utils import (
     _skew,
     _solve_cbf_qp,
     _thrust_to_normalized,
+    make_cbf_filter,
 )
 from project_utils.utils import SwarmState
 
@@ -308,7 +310,7 @@ class FullEcbfTests(unittest.TestCase):
         cached = _solve_cbf_qp(qp_cache={}, **common)
         np.testing.assert_array_equal(cached, uncached)
 
-    def test_solver_error_does_not_reuse_previous_solution(self):
+    def test_solver_errors_use_explicit_fallback_after_all_attempts(self):
         swarm_state = SwarmState(
             positions=np.array([[3.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
             velocities=np.zeros((2, 3)),
@@ -326,16 +328,154 @@ class FullEcbfTests(unittest.TestCase):
         _solve_cbf_qp(qp_cache=qp_cache, **common)
         qp = qp_cache[(0,)]
         qp.u_var.value = np.full(4, 9.0)
+        attempted_solvers = []
 
         def fail_solve(*args, **kwargs):
+            attempted_solvers.append(kwargs["solver"])
             self.assertIsNone(qp.u_var.value)
             self.assertFalse(kwargs["warm_start"])
             raise cp.SolverError("forced failure")
 
+        fallback = np.array([8.0, 7.0, 6.0, 5.0])
         with mock.patch.object(qp.problem, "solve", side_effect=fail_solve):
             with mock.patch("builtins.print"):
-                actual = _solve_cbf_qp(qp_cache=qp_cache, **common)
-        np.testing.assert_array_equal(actual, u_ref)
+                actual = _solve_cbf_qp(
+                    qp_cache=qp_cache,
+                    fallback_thrust=fallback,
+                    **common,
+                )
+        self.assertEqual(attempted_solvers, [cp.ECOS, cp.CLARABEL, cp.SCS])
+        np.testing.assert_array_equal(actual, fallback)
+
+    def test_solver_cascade_uses_clarabel_after_ecos_failure(self):
+        swarm_state = SwarmState(
+            positions=np.array([[3.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
+            velocities=np.zeros((2, 3)),
+            rotations=np.repeat(np.eye(3)[None, :, :], 2, axis=0),
+        )
+        common = {
+            "u_ref_thrust": np.array([2.0, 3.0, 4.0, 5.0]),
+            "dynamics": self.dynamics,
+            "swarm_state": swarm_state,
+            "radii": np.array([0.75]),
+            "thrust_bounds": (np.zeros(4), np.full(4, 10.0)),
+        }
+        qp_cache = {}
+        _solve_cbf_qp(qp_cache=qp_cache, **common)
+        qp = qp_cache[(0,)]
+        original_solve = qp.problem.solve
+        attempted_solvers = []
+
+        def solve_after_ecos_failure(*args, **kwargs):
+            attempted_solvers.append(kwargs["solver"])
+            if kwargs["solver"] == cp.ECOS:
+                raise TypeError("forced CVXPY canonicalization failure")
+            return original_solve(*args, **kwargs)
+
+        with mock.patch.object(
+            qp.problem,
+            "solve",
+            side_effect=solve_after_ecos_failure,
+        ):
+            actual = _solve_cbf_qp(qp_cache=qp_cache, **common)
+
+        self.assertEqual(attempted_solvers, [cp.ECOS, cp.CLARABEL])
+        self.assertTrue(np.all(np.isfinite(actual)))
+
+    def test_solver_cascade_retries_ecos_optimal_inaccurate(self):
+        swarm_state = SwarmState(
+            positions=np.array([[3.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
+            velocities=np.zeros((2, 3)),
+            rotations=np.repeat(np.eye(3)[None, :, :], 2, axis=0),
+        )
+        common = {
+            "u_ref_thrust": np.array([2.0, 3.0, 4.0, 5.0]),
+            "dynamics": self.dynamics,
+            "swarm_state": swarm_state,
+            "radii": np.array([0.75]),
+            "thrust_bounds": (np.zeros(4), np.full(4, 10.0)),
+        }
+        qp_cache = {}
+        _solve_cbf_qp(qp_cache=qp_cache, **common)
+        qp = qp_cache[(0,)]
+        original_solve = qp.problem.solve
+        attempted_solvers = []
+
+        def mark_ecos_inaccurate(*args, **kwargs):
+            attempted_solvers.append(kwargs["solver"])
+            result = original_solve(*args, **kwargs)
+            if kwargs["solver"] == cp.ECOS:
+                qp.problem._status = cp.OPTIMAL_INACCURATE
+            return result
+
+        with mock.patch.object(qp.problem, "solve", side_effect=mark_ecos_inaccurate):
+            actual = _solve_cbf_qp(qp_cache=qp_cache, **common)
+
+        self.assertEqual(attempted_solvers, [cp.ECOS, cp.CLARABEL])
+        self.assertTrue(np.all(np.isfinite(actual)))
+
+    def test_solver_cascade_uses_scs_after_ecos_and_clarabel_failures(self):
+        swarm_state = SwarmState(
+            positions=np.array([[3.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
+            velocities=np.zeros((2, 3)),
+            rotations=np.repeat(np.eye(3)[None, :, :], 2, axis=0),
+        )
+        common = {
+            "u_ref_thrust": np.array([2.0, 3.0, 4.0, 5.0]),
+            "dynamics": self.dynamics,
+            "swarm_state": swarm_state,
+            "radii": np.array([0.75]),
+            "thrust_bounds": (np.zeros(4), np.full(4, 10.0)),
+        }
+        qp_cache = {}
+        _solve_cbf_qp(qp_cache=qp_cache, **common)
+        qp = qp_cache[(0,)]
+        original_solve = qp.problem.solve
+        attempted_solvers = []
+
+        def solve_with_scs(*args, **kwargs):
+            attempted_solvers.append(kwargs["solver"])
+            if kwargs["solver"] in (cp.ECOS, cp.CLARABEL):
+                raise cp.SolverError("forced solver failure")
+            return original_solve(*args, **kwargs)
+
+        with mock.patch.object(qp.problem, "solve", side_effect=solve_with_scs):
+            actual = _solve_cbf_qp(qp_cache=qp_cache, **common)
+
+        self.assertEqual(attempted_solvers, [cp.ECOS, cp.CLARABEL, cp.SCS])
+        self.assertTrue(np.all(np.isfinite(actual)))
+
+    def test_filter_reuses_previous_action_and_clears_it_on_rollout_reset(self):
+        quad = SimpleNamespace(dynamics=self.dynamics, tick=0)
+        env_state = SimpleNamespace(envs=[quad])
+        swarm_state = SwarmState(
+            positions=np.array([[3.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
+            velocities=np.zeros((2, 3)),
+            rotations=np.repeat(np.eye(3)[None, :, :], 2, axis=0),
+        )
+        action_filter = make_cbf_filter(np.array([0.75]))
+        returned_thrusts = [
+            np.array([1.0, 2.0, 3.0, 4.0]),
+            np.array([1.5, 2.5, 3.5, 4.5]),
+            np.array([2.0, 3.0, 4.0, 5.0]),
+        ]
+
+        with mock.patch(
+            "project_utils.full_cbf_utils._solve_cbf_qp",
+            side_effect=returned_thrusts,
+        ) as solve:
+            action_filter(np.zeros(4), env_state, swarm_state)
+            quad.tick = 1
+            action_filter(np.zeros(4), env_state, swarm_state)
+            quad.tick = 0
+            action_filter(np.zeros(4), env_state, swarm_state)
+
+        self.assertIsNone(solve.call_args_list[0].kwargs["fallback_thrust"])
+        np.testing.assert_array_equal(
+            solve.call_args_list[1].kwargs["fallback_thrust"],
+            returned_thrusts[0],
+        )
+        self.assertIsNone(solve.call_args_list[2].kwargs["fallback_thrust"])
 
 
 if __name__ == "__main__":

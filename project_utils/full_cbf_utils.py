@@ -10,11 +10,12 @@ import numpy as np
 from project_utils.utils import SwarmState
 
 CBF_K4 = 0.5
-CBF_K1 = 4
+CBF_K1 = 2.5
 CBF_K0 = 1
 CBF_SLACK_WEIGHT = 1.0e4
 CBF_RELINEARIZATION_PASSES = 2
 EPSILON = 1e-3
+QP_FEASIBILITY_TOLERANCE = 1e-5
 
 GRAVITY_VECTOR = np.array([0.0, 0.0, -9.81], dtype=np.float64)
 
@@ -77,10 +78,88 @@ class _ParameterizedCbfQp:
             const_param.value = float(phi_const)
             grad_param.value = np.asarray(phi_grad, dtype=np.float64).reshape(4)
 
-        # A fresh Problem has no prior iterate. Clear retained values so a cached
-        # graph has the same cold-solve and SolverError fallback semantics.
+        # Clear retained values so every solver attempt starts without a stale
+        # solution from an earlier control step.
         self.u_var.value = None
         self.slack.value = None
+
+
+def _has_valid_optimal_solution(
+    qp: _ParameterizedCbfQp,
+    u_min: np.ndarray,
+    u_max: np.ndarray,
+) -> bool:
+    if qp.problem.status != cp.OPTIMAL:
+        return False
+    if qp.u_var.value is None or qp.slack.value is None:
+        return False
+
+    solution = np.asarray(qp.u_var.value, dtype=np.float64).reshape(-1)
+    slack = float(qp.slack.value)
+    if not np.all(np.isfinite(solution)) or not np.isfinite(slack):
+        return False
+
+    tolerance = QP_FEASIBILITY_TOLERANCE
+    if np.any(solution < u_min - tolerance) or np.any(solution > u_max + tolerance):
+        return False
+    if slack < -tolerance:
+        return False
+
+    for phi_expr in qp.phi_exprs:
+        if phi_expr.value is None:
+            return False
+        phi_value = float(phi_expr.value)
+        if not np.isfinite(phi_value) or phi_value + slack < -tolerance:
+            return False
+    return True
+
+
+def _solve_parameterized_qp(
+    qp: _ParameterizedCbfQp,
+    *,
+    u_min: np.ndarray,
+    u_max: np.ndarray,
+    fallback_thrust: np.ndarray,
+) -> np.ndarray:
+    solver_attempts = (
+        (cp.ECOS, {}),
+        (cp.CLARABEL, {}),
+        (cp.SCS, {"eps": 1e-6, "max_iters": 100_000}),
+    )
+    statuses = []
+
+    for solver, solver_options in solver_attempts:
+        qp.u_var.value = None
+        qp.slack.value = None
+        try:
+            qp.problem.solve(
+                solver=solver,
+                warm_start=False,
+                verbose=False,
+                **solver_options,
+            )
+        except (cp.SolverError, TypeError, ValueError) as error:
+            statuses.append(f"{solver}:{type(error).__name__}")
+            continue
+
+        statuses.append(f"{solver}:{qp.problem.status}")
+        if _has_valid_optimal_solution(qp, u_min, u_max):
+            return np.clip(
+                np.asarray(qp.u_var.value, dtype=np.float64).reshape(-1),
+                u_min,
+                u_max,
+            )
+
+    clipped = np.clip(
+        np.asarray(fallback_thrust, dtype=np.float64).reshape(-1),
+        u_min,
+        u_max,
+    )
+    print(
+        "All ECBF QP solvers failed; returning the previous action. "
+        f"Attempts: {', '.join(statuses)}"
+    )
+    return clipped
 
 
 def _cross(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -322,6 +401,7 @@ def _solve_cbf_qp_single(
     thrust_bounds: Tuple[np.ndarray, np.ndarray],
     debug=False,
     qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
+    fallback_thrust: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Build and solve one affine approximation of the ego-only multi-neighbor ECBF QP.
@@ -395,24 +475,14 @@ def _solve_cbf_qp_single(
     )
     phi_list = list(zip(active_neighbor_indices, qp.phi_exprs))
 
-    try:
-        qp.problem.solve(solver=cp.ECOS, warm_start=False, verbose=False)
-    except cp.SolverError:
-        approx = qp.u_var.value
-        if approx is None:
-            approx = u_ref
-        clipped = np.clip(np.asarray(approx, dtype=np.float64), u_min, u_max)
-        print("QP timed out; returning last iterate:", clipped)
-        if debug:
-            return clipped, h_list, h1_list, phi_list
-        return clipped
-
-    if qp.problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-        print("OTHER ISSUE", qp.problem.status)
-        clipped = np.clip(u_ref, u_min, u_max)
-        if debug:
-            return clipped, h_list, h1_list, phi_list
-        return clipped
+    if fallback_thrust is None:
+        fallback_thrust = u_ref
+    solution = _solve_parameterized_qp(
+        qp,
+        u_min=u_min,
+        u_max=u_max,
+        fallback_thrust=fallback_thrust,
+    )
 
     if debug:
         for h_data, h1_data, phi_data in zip(h_list, h1_list, phi_list):
@@ -422,7 +492,6 @@ def _solve_cbf_qp_single(
             print("h_dot:", h1_data[1])
             print("phi:", phi_data[1].value)
 
-    solution = np.array(qp.u_var.value, dtype=np.float64)
     if debug:
         return solution, h_list, h1_list, phi_list
     return solution
@@ -438,6 +507,7 @@ def _solve_cbf_qp(
     relinearization_passes: int = 1,
     debug=False,
     qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
+    fallback_thrust: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Solve the ego-only ECBF QP, optionally re-linearising h⁽⁴⁾ around the latest iterate.
@@ -457,6 +527,7 @@ def _solve_cbf_qp(
             radii=radii,
             thrust_bounds=thrust_bounds,
             qp_cache=qp_cache,
+            fallback_thrust=fallback_thrust,
             debug=debug,
         )
         if debug:
@@ -480,6 +551,7 @@ def apply_cbf_filter(
     use_repeated_linearization: bool = False,
     debug=False,
     qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
+    solver_state: dict | None = None,
 ) -> np.ndarray:
     """
     Wrap the raw ego-policy action with a 4th-order ECBF safety filter.
@@ -497,6 +569,15 @@ def apply_cbf_filter(
     u_min = np.zeros(4, dtype=np.float64)
     u_max = np.asarray(dynamics.thrust_max, dtype=np.float64)
 
+    fallback_thrust = None
+    if solver_state is not None:
+        current_tick = int(quad.tick)
+        last_tick = solver_state.get("last_tick")
+        if last_tick is not None and current_tick < last_tick:
+            solver_state.pop("previous_thrust", None)
+        fallback_thrust = solver_state.get("previous_thrust")
+        solver_state["last_tick"] = current_tick
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         outputs = _solve_cbf_qp(
@@ -507,6 +588,7 @@ def apply_cbf_filter(
             thrust_bounds=(u_min, u_max),
             relinearization_passes=(CBF_RELINEARIZATION_PASSES if use_repeated_linearization else 1),
             qp_cache=qp_cache,
+            fallback_thrust=fallback_thrust,
             debug=debug,
         )
 
@@ -514,6 +596,12 @@ def apply_cbf_filter(
         safe_thrust, h_list, h1_list, phi_list = outputs
     else:
         safe_thrust = outputs
+
+    if solver_state is not None:
+        solver_state["previous_thrust"] = np.asarray(
+            safe_thrust,
+            dtype=np.float64,
+        ).copy()
 
     safe_normalized = _thrust_to_normalized(safe_thrust, dynamics)
     safe_action = 2.0 * safe_normalized - 1.0
@@ -525,6 +613,7 @@ def apply_cbf_filter(
 
 def make_cbf_filter(radii: np.ndarray, use_repeated_linearization: bool = False):
     qp_cache = {}
+    solver_state = {}
 
     def filter(base_action: np.ndarray, env_state, swarm_state: SwarmState, debug=False):
         return apply_cbf_filter(
@@ -534,6 +623,7 @@ def make_cbf_filter(radii: np.ndarray, use_repeated_linearization: bool = False)
             swarm_state=swarm_state,
             use_repeated_linearization=use_repeated_linearization,
             qp_cache=qp_cache,
+            solver_state=solver_state,
             debug=debug,
         )
 
