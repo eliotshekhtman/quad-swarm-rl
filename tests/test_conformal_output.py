@@ -11,10 +11,84 @@ from conformal import (
     _save_metrics,
     _validate_predictions,
 )
-from project_utils.anytime_utils import AnytimeEpisodeResult
+from project_utils.anytime_utils import AnytimeEpisodeResult, initialize_mixture_prior, run_anytime_episode
 
 
 class ConformalOutputTests(unittest.TestCase):
+    def test_independent_assessments_include_initial_and_final_policies(self):
+        summary = dict(tube_coverage=.9, crashes=0, bad_crashes=0, safety=1,
+                       cumulative_reward=2, cumulative_reward_per_run=np.ones(10),
+                       agent_locs=np.zeros((2, 2, 3)))
+        for procedure in ("robust", "naive", "anytime", "anytime-nonparametric",
+                          "non-interactive", "calibrate-once", "calibrate-once-paper"):
+            with self.subTest(procedure=procedure):
+                metrics = _empty_metrics()
+                iterative = procedure in ("robust", "naive", "anytime", "anytime-nonparametric")
+                radii = [1.7, 1.6] if iterative else [2, 1.6]
+                scores = np.arange(10, dtype=float) / 10
+                for index, radius in enumerate(radii):
+                    _record_episode(metrics, 9.0, radius, summary, np.zeros((1, 2, 6)),
+                                    scores + index)
+                expected_scores = np.array([scores, scores + 1])
+                if iterative:
+                    metrics["initial_reference_scores"] = scores + 2
+                    expected_scores = np.vstack([scores + 2, expected_scores])
+                    radii = [2, *radii]
+                args = Namespace(alpha=.1, delta=.05, kappa=.2, cbf_k1=4,
+                                 cbf_solver="legacy", update_procedure=procedure, r_init=2)
+                state = np.random.get_state()
+                with tempfile.TemporaryDirectory(dir=".") as directory:
+                    path = _save_metrics(directory, args, [0, 1], metrics, .05)
+                    with np.load(path) as data:
+                        np.testing.assert_array_equal(data["assessment_radii"], radii)
+                        np.testing.assert_array_equal(data["assessment_scores"], expected_scores)
+                        np.testing.assert_array_equal(data["assessment_quantiles"], expected_scores[:, 8])
+                        np.testing.assert_array_equal(data["qj_per_episode"], [9, 9])
+                        self.assertNotEqual(data["assessment_quantiles"][-1], expected_scores[-1, 9])
+                after = np.random.get_state()
+                for before_value, after_value in zip(state, after):
+                    np.testing.assert_array_equal(before_value, after_value)
+
+    def test_assessment_scores_are_copied(self):
+        metrics = _empty_metrics()
+        scores = np.array([.3, .4])
+        summary = dict(tube_coverage=1, crashes=0, bad_crashes=0, safety=1,
+                       cumulative_reward=2, cumulative_reward_per_run=np.ones(2),
+                       agent_locs=np.zeros((2, 2, 3)))
+        _record_episode(metrics, .5, 1, summary, np.zeros((1, 2, 6)), scores)
+        scores[:] = 99
+        np.testing.assert_array_equal(metrics["evaluation_scores_per_episode"], [[.3, .4]])
+
+    def test_informed_prior_metadata_round_trip(self):
+        metrics = _empty_metrics()
+        scores = np.array([.4, .5, .6, .7])
+        prior = initialize_mixture_prior(scores, radius=2, kappa=.6)
+        result = run_anytime_episode(lambda: .5, radius=2, lower_radius=.2,
+            alpha=.1, delta=.05, kappa=.6, radius_tolerance=.15, max_samples=100,
+            family="directional", prior=prior)
+        _record_anytime_episode(metrics, result, .05, .2)
+        metrics["anytime_config"] = dict(
+            family="directional", kappa=.6, gamma=.75, zeta=.875,
+            radius_tolerance=.15, k_epsilon=15, min_radius=.2, initial_width=1.8,
+            initial_safety_mode="clopper-pearson", delta_init=.05,
+            initial_trajectory_count=4, initial_exceedance_count=0,
+            initial_probability_lower=0, initial_probability_upper=.05,
+            initial_scores=scores, initial_indicators=np.zeros(4, dtype=np.int8),
+        )
+        metrics["anytime_run_termination_reason"] = "driver-cap"
+        args = Namespace(alpha=.1, delta=.05, kappa=.6, cbf_k1=4,
+                         cbf_solver="legacy", update_procedure="anytime")
+        with tempfile.TemporaryDirectory(dir=".") as directory:
+            path = _save_metrics(directory, args, [0], metrics, np.nan)
+            with np.load(path) as data:
+                self.assertEqual(data["anytime_family"].item(), "directional")
+                for field in ("a", "b", "mean", "concentration", "source_count", "source_radius",
+                              "shift", "near_fraction", "jeffreys_weight", "directional_weight"):
+                    np.testing.assert_array_equal(data[f"anytime_prior_{field}_per_episode"],
+                                                  [getattr(prior, field)])
+                np.testing.assert_array_equal(data["anytime_initial_scores"], scores)
+                np.testing.assert_array_equal(data["anytime_scores"][0], result.scores)
+
     def test_metrics_file_preserves_legacy_schema_and_records_procedure(self):
         metrics = _empty_metrics()
         summary = {
@@ -32,6 +106,8 @@ class ConformalOutputTests(unittest.TestCase):
             alpha=0.1,
             delta=0.2,
             kappa=0.5,
+            cbf_k1=4.0,
+            cbf_solver="legacy",
             update_procedure="naive",
         )
 
@@ -60,11 +136,15 @@ class ConformalOutputTests(unittest.TestCase):
                     "delta",
                     "bar_alpha",
                     "kappa",
+                    "cbf_k1",
+                    "cbf_solver",
                     "update_procedure",
                 }
                 self.assertEqual(set(data.files), expected_keys)
                 self.assertEqual(data["update_procedure"].item(), "naive")
                 self.assertEqual(data["kappa"].item(), 0.5)
+                self.assertEqual(data["cbf_k1"].item(), 4.0)
+                self.assertEqual(data["cbf_solver"].item(), "legacy")
                 self.assertEqual(data["cumulative_reward_per_run"].shape, (1, 1))
                 self.assertEqual(
                     data["predicted_traj_per_episode"].shape,
@@ -142,10 +222,13 @@ class ConformalOutputTests(unittest.TestCase):
             "initial_indicators": np.array([0, 0], dtype=np.int8),
         }
         metrics["anytime_run_termination_reason"] = "driver-cap"
+        metrics["anytime_reference_scores"] = [[0.3, 0.7, 0.9, 1.1]]
         args = Namespace(
             alpha=0.1,
             delta=0.1,
             kappa=0.6,
+            cbf_k1=2.5,
+            cbf_solver="cascade",
             update_procedure="anytime",
         )
 
@@ -183,6 +266,12 @@ class ConformalOutputTests(unittest.TestCase):
                 self.assertAlmostEqual(data["tube_radius_per_episode"].item(), 1.0)
                 self.assertEqual(data["anytime_schema_version"].item(), 2)
                 self.assertEqual(data["anytime_family"].item(), "jeffreys")
+                np.testing.assert_array_equal(
+                    data["anytime_reference_scores"], [[0.3, 0.7, 0.9, 1.1]],
+                )
+                np.testing.assert_array_equal(
+                    data["anytime_reference_quantile_per_episode"], [1.1],
+                )
                 self.assertEqual(
                     data["anytime_run_termination_reason"].item(),
                     "driver-cap",

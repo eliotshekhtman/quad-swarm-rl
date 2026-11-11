@@ -23,6 +23,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from plot_calibration import load_initial_radius, plot_cumulative_trajectories
 
 
 # Use LaTeX if available for consistency with prior plots.
@@ -64,6 +65,7 @@ def load_run(path: str) -> dict:
     """Load a conformal metrics file into a simple dict."""
     with np.load(path) as data:
         return {
+            "initial_radius": load_initial_radius(path, data),
             "episodes": data["episodes"],
             "radius": data["radius_per_episode"],
             "qj": data["qj_per_episode"],
@@ -86,9 +88,9 @@ def load_run(path: str) -> dict:
         }
 
 
-def prepare_conformal_radius(radius: np.ndarray) -> np.ndarray:
+def prepare_conformal_radius(radius: np.ndarray, initial_radius: float = MAX_RADIUS) -> np.ndarray:
     """Insert MAX_RADIUS at episode 0 to mimic plot_conformal alignment."""
-    return np.insert(radius, 0, MAX_RADIUS)[:-1]
+    return np.insert(radius, 0, initial_radius)[:-1]
 
 
 def pad_repeat(arr: np.ndarray, target_len: int) -> np.ndarray:
@@ -228,8 +230,8 @@ def main() -> None:
 
     # Prepare radius and q_j series.
     series_radius = [
-        {"label": "Robust $r_j$", "y": prepare_conformal_radius(robust["radius"]), "style": {"color": colors["robust"], "marker": "s"}},
-        {"label": "Naive $r_j$", "y": prepare_conformal_radius(naive["radius"]), "style": {"color": colors["naive"], "marker": "s"}},
+        {"label": "Robust $r_j$", "y": prepare_conformal_radius(robust["radius"], robust["initial_radius"]), "style": {"color": colors["robust"], "marker": "s"}},
+        {"label": "Naive $r_j$", "y": prepare_conformal_radius(naive["radius"], naive["initial_radius"]), "style": {"color": colors["naive"], "marker": "s"}},
         {"label": "Calibrate-once $r_j$", "y": cal_once_radius, "style": {"color": colors["cal_once"], "marker": "s"}},
         {"label": "Non-interactive $r_j$", "y": single_radius, "style": {"color": colors["non_int"], "marker": "s"}},
         {"label": "Anytime $r_j$", "y": anytime_aligned["radius"], "style": {"color": colors["anytime"], "marker": "D"}},
@@ -392,6 +394,14 @@ def main() -> None:
     fig.savefig(safety_path, bbox_inches="tight", format="pdf")
     plt.close(fig)
     plot_paths["safety"] = safety_path
+    plot_cumulative_trajectories({
+        "Robust": args.robust,
+        "Naive": args.naive,
+        "Calibrate-once": args.calibrate_once,
+        "Non-interactive": args.non_interactive,
+        "Anytime": args.anytime,
+        "Nonparametric anytime": args.anytime_nonparametric,
+    }, output_dir)
 
     # Log saved paths for quick reference.
     print(f"[plot_combined] Loaded Robust from {os.path.abspath(args.robust)}")

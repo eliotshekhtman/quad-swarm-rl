@@ -15,6 +15,7 @@ from project_utils.full_cbf_utils import (
     _normalized_to_thrust,
     _skew,
     _solve_cbf_qp,
+    _solve_legacy_parameterized_qp,
     _thrust_to_normalized,
     make_cbf_filter,
 )
@@ -128,6 +129,74 @@ class FullEcbfTests(unittest.TestCase):
             thrust_bounds=(np.zeros(4), np.full(4, 10.0)),
         )
         np.testing.assert_allclose(actual, [0.0, 2.0, 10.0, 5.0])
+
+    def test_explicit_current_settings_preserve_default_solution(self):
+        state = SwarmState(
+            positions=np.array([[3.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
+            velocities=np.zeros((2, 3)),
+            rotations=np.repeat(np.eye(3)[None, :, :], 2, axis=0),
+        )
+        common = dict(
+            u_ref_thrust=np.array([2.0, 3.0, 4.0, 5.0]),
+            dynamics=self.dynamics, swarm_state=state, radii=np.array([0.75]),
+            thrust_bounds=(np.zeros(4), np.full(4, 10.0)),
+        )
+        np.testing.assert_array_equal(
+            _solve_cbf_qp(**common),
+            _solve_cbf_qp(**common, cbf_k1=2.5, solver_mode="cascade"),
+        )
+
+    def test_per_filter_settings_do_not_leak_or_keep_legacy_fallback_state(self):
+        quad = SimpleNamespace(dynamics=self.dynamics, tick=0)
+        env = SimpleNamespace(envs=[quad])
+        legacy = make_cbf_filter(np.array([1.0]), cbf_k1=4.0, solver_mode="legacy")
+        current = make_cbf_filter(np.array([1.0]), cbf_k1=2.5)
+        with mock.patch(
+            "project_utils.full_cbf_utils._solve_cbf_qp", return_value=np.ones(4),
+        ) as solve:
+            legacy(np.zeros(4), env, None)
+            quad.tick = 1
+            legacy(np.zeros(4), env, None)
+            current(np.zeros(4), env, None)
+        for call in solve.call_args_list[:2]:
+            self.assertEqual(call.kwargs["cbf_k1"], 4.0)
+            self.assertEqual(call.kwargs["solver_mode"], "legacy")
+            self.assertIsNone(call.kwargs["fallback_thrust"])
+        self.assertEqual(solve.call_args_list[2].kwargs["cbf_k1"], 2.5)
+        self.assertEqual(solve.call_args_list[2].kwargs["solver_mode"], "cascade")
+
+    def test_gain_override_reaches_every_barrier_coefficient(self):
+        state = SwarmState(
+            positions=np.array([[3.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
+            velocities=np.zeros((2, 3)),
+            rotations=np.repeat(np.eye(3)[None, :, :], 2, axis=0),
+        )
+        for gain in (4.0, 2.5):
+            with self.subTest(gain=gain), mock.patch(
+                "project_utils.full_cbf_utils._ecbf_coefficients",
+                wraps=_ecbf_coefficients,
+            ) as coefficients:
+                _solve_cbf_qp(
+                    u_ref_thrust=np.array([2.0, 3.0, 4.0, 5.0]),
+                    dynamics=self.dynamics,
+                    swarm_state=state,
+                    radii=np.array([0.75]),
+                    thrust_bounds=(np.zeros(4), np.full(4, 10.0)),
+                    cbf_k1=gain,
+                    solver_mode="legacy",
+                )
+                values = coefficients.call_args.kwargs
+                self.assertEqual(values["lambda4"], 0.5)
+                self.assertEqual(values["lambda3"], 4 * gain)
+                self.assertEqual(values["lambda2"], 6 * gain ** 2)
+                self.assertEqual(values["lambda1"], 4 * gain ** 3)
+                self.assertEqual(values["lambda0"], gain ** 4)
+
+    def test_filter_rejects_invalid_controller_settings(self):
+        for kwargs in ({"cbf_k1": 0}, {"cbf_k1": -1}, {"cbf_k1": np.nan},
+                       {"cbf_k1": np.inf}, {"solver_mode": "unknown"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                make_cbf_filter(np.array([1.0]), **kwargs)
 
     @staticmethod
     def _fresh_problem(u_ref, u_min, u_max, coefficients):
@@ -476,6 +545,54 @@ class FullEcbfTests(unittest.TestCase):
             returned_thrusts[0],
         )
         self.assertIsNone(solve.call_args_list[2].kwargs["fallback_thrust"])
+
+
+class LegacySolverTests(unittest.TestCase):
+    def setUp(self):
+        self.reference = np.array([2.0, 3.0, 4.0, 5.0])
+        self.qp = SimpleNamespace(
+            problem=mock.Mock(status=cp.OPTIMAL),
+            u_ref=SimpleNamespace(value=self.reference),
+            u_var=SimpleNamespace(value=None),
+        )
+        self.bounds = (np.zeros(4), np.full(4, 10.0))
+
+    def solve(self):
+        with mock.patch("builtins.print"):
+            result = _solve_legacy_parameterized_qp(self.qp, *self.bounds)
+        self.qp.problem.solve.assert_called_once_with(
+            solver=cp.ECOS, warm_start=False, verbose=False,
+        )
+        return result
+
+    def test_accepts_both_optimal_statuses_without_new_clipping_or_validation(self):
+        for status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+            with self.subTest(status=status):
+                self.qp.problem.solve.reset_mock()
+                self.qp.problem.status = status
+                self.qp.u_var.value = np.array([-1e-6, 3.0, 4.0, 10.000001])
+                np.testing.assert_array_equal(self.solve(), self.qp.u_var.value)
+
+    def test_nonoptimal_status_uses_reference_not_available_iterate(self):
+        for status in (cp.INFEASIBLE, cp.INFEASIBLE_INACCURATE, cp.UNBOUNDED):
+            with self.subTest(status=status):
+                self.qp.problem.solve.reset_mock()
+                self.qp.problem.status = status
+                self.qp.u_var.value = np.ones(4)
+                np.testing.assert_array_equal(self.solve(), self.reference)
+
+    def test_solver_error_uses_available_iterate_or_reference(self):
+        self.qp.problem.solve.side_effect = cp.SolverError("forced")
+        np.testing.assert_array_equal(self.solve(), self.reference)
+        self.qp.problem.solve.reset_mock()
+        self.qp.u_var.value = np.array([-1.0, 2.0, 12.0, 5.0])
+        np.testing.assert_array_equal(self.solve(), [0.0, 2.0, 10.0, 5.0])
+
+    def test_does_not_swallow_additional_exception_types(self):
+        for error in (TypeError, ValueError):
+            with self.subTest(error=error), self.assertRaises(error):
+                self.qp.problem.solve.side_effect = error("forced")
+                _solve_legacy_parameterized_qp(self.qp, *self.bounds)
 
 
 if __name__ == "__main__":

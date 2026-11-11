@@ -126,7 +126,7 @@ def main() -> None:
     # Plot A: Radius across episodes (rj and qj)
     fig, ax = plt.subplots()
     # shifted_radius_arr = np.insert(radius_arr, 0, 8)[:-1] # r0 is MAX_RADIUS
-    noninteractive_radius = 0.33648095
+    noninteractive_radius = float(radius_arr[-1])
     ax.axhline(noninteractive_radius, linestyle="--", color="gray", label=r"Non-interactive $1 - \bar \alpha$ quantile")
     ax.plot(episodes, radius_arr, label=r"$r_j$", marker='s')
     ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker='o')

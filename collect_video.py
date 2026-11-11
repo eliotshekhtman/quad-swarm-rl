@@ -271,6 +271,7 @@ def _collect_trajectory(
     solo_action_fn,
     max_steps: int,
     deterministic: bool,
+    step_callback=None,
 ) -> Dict[str, np.ndarray]:
     env_run = clone_env_from_snapshot(snapshot, restore_rng=True)
     obs_run = np.asarray(obs, dtype=np.float32).copy()
@@ -315,6 +316,8 @@ def _collect_trajectory(
             if action_solo.dim() == 1:
                 action_solo = action_solo.unsqueeze(0)
             action_solo = action_solo.detach().cpu().numpy()[0]
+            if step_callback is not None:
+                nominal_actions = np.vstack([actions_multi, action_solo[None, :]]).copy()
 
             swarm_state = get_swarm_state(env_run)
             for agent_id in range(num_multi_agents):
@@ -323,6 +326,8 @@ def _collect_trajectory(
             action_solo = solo_action_fn(base_action=action_solo, env_state=env_run, swarm_state=swarm_state)
 
             actions = np.vstack([actions_multi, action_solo[None, :]])
+            if step_callback is not None:
+                step_callback(env_run, step_num, obs_run, nominal_actions, actions)
             obs_run, _rewards, dones, _infos = env_run.step(actions)
             obs_run = np.asarray(obs_run, dtype=np.float32)
 
@@ -347,6 +352,8 @@ def _collect_trajectory(
 
             done = bool(np.all(dones))
             step_num += 1
+        if step_callback is not None:
+            step_callback(env_run, step_num, obs_run, None, None)
     finally:
         env_run.close()
 

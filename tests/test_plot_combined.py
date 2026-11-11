@@ -1,4 +1,5 @@
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,10 @@ class PlotCombinedTests(unittest.TestCase):
         np.testing.assert_allclose(
             prepare_conformal_radius(np.array([4.0, 3.0, 2.0])),
             [8.0, 4.0, 3.0],
+        )
+        np.testing.assert_allclose(
+            prepare_conformal_radius(np.array([1.7, 1.5, 1.4]), 2.0),
+            [2.0, 1.7, 1.5],
         )
         np.testing.assert_allclose(
             pad_repeat(np.array([1.0, 2.0]), 4),
@@ -81,6 +86,9 @@ class PlotCombinedTests(unittest.TestCase):
     def test_six_method_plot_smoke(self):
         with tempfile.TemporaryDirectory(dir=".") as directory:
             root = Path(directory)
+            (root / "conformal_args.json").write_text(json.dumps({
+                "r_init": 2.0, "num_trajectories": 1000,
+            }))
             paths = {
                 name: root / f"{name}.npz"
                 for name in (
@@ -121,6 +129,8 @@ class PlotCombinedTests(unittest.TestCase):
                 "performance_cumulative_reward.pdf",
                 "tube_coverage.pdf",
                 "empirical_safety_coverage.pdf",
+                "cumulative_calibration_trajectories.pdf",
+                "cumulative_calibration_trajectories.png",
             }
             self.assertEqual(
                 {path.name for path in output_dir.iterdir()},
@@ -155,6 +165,8 @@ class PlotCombinedTests(unittest.TestCase):
                 [[2.0], radius[:-1]]
             )
             fields["anytime_next_radius_per_episode"] = radius
+            fields["anytime_trajectory_count_per_episode"] = np.full(episode_count, 20)
+            fields["anytime_initial_trajectory_count"] = 1000
         np.savez(path, **fields)
 
 

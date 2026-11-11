@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage: %s --seed SEED --device {cpu|gpu} [--kappa KAPPA]\n' "$0"
+  printf 'Usage: %s --seed SEED --device {cpu|gpu} [--kappa KAPPA] [--run-seed RUN_SEED]\n' "$0"
 }
 
 die() {
@@ -13,6 +13,7 @@ die() {
 }
 
 SEED=""
+RUN_SEED=""
 DEVICE=""
 KAPPA="0.6"
 while [[ $# -gt 0 ]]; do
@@ -20,6 +21,13 @@ while [[ $# -gt 0 ]]; do
     --seed)
       [[ $# -ge 2 ]] || die "--seed requires a value"
       SEED="$2"
+      shift 2
+      ;;
+    --run-seed)
+      [[ $# -ge 2 ]] || die "--run-seed requires a value"
+      [[ "$2" =~ ^[0-9]{1,10}$ ]] || die "--run-seed must lie in [0, 4294967295]"
+      RUN_SEED="$((10#$2))"
+      (( RUN_SEED <= 4294967295 )) || die "--run-seed must lie in [0, 4294967295]"
       shift 2
       ;;
     --device)
@@ -48,6 +56,10 @@ done
 [[ "$KAPPA" =~ ^(0([.][0-9]+)?|[.][0-9]+)$ ]] \
   || die "--kappa must lie in [0, 1)"
 KAPPA_TAG="${KAPPA/./p}"
+RUN_SUFFIX=""
+if [[ -n "$RUN_SEED" ]]; then
+  RUN_SUFFIX="_run${RUN_SEED}"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -85,56 +97,59 @@ COMMON_ARGS=(
   --seed "$SEED"
   --device "$DEVICE"
 )
+if [[ -n "$RUN_SEED" ]]; then
+  COMMON_ARGS+=(--run-seed "$RUN_SEED")
+fi
 
 PIDS=()
 NAMES=()
 
 run_python l4dc/quad-swarm-rl/conformal.py \
   "${COMMON_ARGS[@]}" \
-  --experiment_name "gtg_s${SEED}_paperstyle_robust_r8_n1000_e20_kappa${KAPPA_TAG}" \
+  --experiment_name "gtg_s${SEED}_paperstyle_robust_r8_n1000_e20_kappa${KAPPA_TAG}${RUN_SUFFIX}" \
   --update-procedure robust \
   --r_init 8 \
   --num_trajectories 1000 \
   --num_episodes 20 \
-  > "train_dir/gtg_s${SEED}_robust_kappa${KAPPA_TAG}.log" 2>&1 &
+  > "train_dir/gtg_s${SEED}_robust_kappa${KAPPA_TAG}${RUN_SUFFIX}.log" 2>&1 &
 PIDS+=("$!")
 NAMES+=("robust")
 
 run_python l4dc/quad-swarm-rl/conformal.py \
   "${COMMON_ARGS[@]}" \
-  --experiment_name "gtg_s${SEED}_paperstyle_naive_r8_n1000_e20_kappa${KAPPA_TAG}" \
+  --experiment_name "gtg_s${SEED}_paperstyle_naive_r8_n1000_e20_kappa${KAPPA_TAG}${RUN_SUFFIX}" \
   --update-procedure naive \
   --r_init 8 \
   --num_trajectories 1000 \
   --num_episodes 20 \
-  > "train_dir/gtg_s${SEED}_naive_kappa${KAPPA_TAG}.log" 2>&1 &
+  > "train_dir/gtg_s${SEED}_naive_kappa${KAPPA_TAG}${RUN_SUFFIX}.log" 2>&1 &
 PIDS+=("$!")
 NAMES+=("naive")
 
 run_python l4dc/quad-swarm-rl/conformal.py \
   "${COMMON_ARGS[@]}" \
-  --experiment_name "gtg_s${SEED}_paperstyle_noninteractive_r8_n1000_kappa${KAPPA_TAG}" \
+  --experiment_name "gtg_s${SEED}_paperstyle_noninteractive_r8_n1000_kappa${KAPPA_TAG}${RUN_SUFFIX}" \
   --update-procedure non-interactive \
   --r_init 8 \
   --num_trajectories 1000 \
-  > "train_dir/gtg_s${SEED}_noninteractive_kappa${KAPPA_TAG}.log" 2>&1 &
+  > "train_dir/gtg_s${SEED}_noninteractive_kappa${KAPPA_TAG}${RUN_SUFFIX}.log" 2>&1 &
 PIDS+=("$!")
 NAMES+=("non-interactive")
 
 run_python l4dc/quad-swarm-rl/conformal.py \
   "${COMMON_ARGS[@]}" \
-  --experiment_name "gtg_s${SEED}_paperstyle_calonce_r8_n1000_u20_kappa${KAPPA_TAG}" \
+  --experiment_name "gtg_s${SEED}_paperstyle_calonce_r8_n1000_u20_kappa${KAPPA_TAG}${RUN_SUFFIX}" \
   --update-procedure calibrate-once \
   --r_init 8 \
   --num_trajectories 1000 \
   --num_episodes 20 \
-  > "train_dir/gtg_s${SEED}_calonce_kappa${KAPPA_TAG}.log" 2>&1 &
+  > "train_dir/gtg_s${SEED}_calonce_kappa${KAPPA_TAG}${RUN_SUFFIX}.log" 2>&1 &
 PIDS+=("$!")
 NAMES+=("calibrate-once")
 
 run_python l4dc/quad-swarm-rl/conformal.py \
   "${COMMON_ARGS[@]}" \
-  --experiment_name "gtg_s${SEED}_revised_anytime_r2_e50_kappa${KAPPA_TAG}" \
+  --experiment_name "gtg_s${SEED}_revised_anytime_r2_e50_kappa${KAPPA_TAG}${RUN_SUFFIX}" \
   --update-procedure anytime \
   --r_init 2 \
   --num_trajectories 8000 \
@@ -142,13 +157,13 @@ run_python l4dc/quad-swarm-rl/conformal.py \
   --anytime-check-every 10 \
   --anytime-init-trajectories 1000 \
   --anytime-delta-init 0.05 \
-  > "train_dir/gtg_s${SEED}_anytime_kappa${KAPPA_TAG}.log" 2>&1 &
+  > "train_dir/gtg_s${SEED}_anytime_kappa${KAPPA_TAG}${RUN_SUFFIX}.log" 2>&1 &
 PIDS+=("$!")
 NAMES+=("anytime")
 
 run_python l4dc/quad-swarm-rl/conformal.py \
   "${COMMON_ARGS[@]}" \
-  --experiment_name "gtg_s${SEED}_revised_anytime_nonparametric_r2_e50_kappa${KAPPA_TAG}" \
+  --experiment_name "gtg_s${SEED}_revised_anytime_nonparametric_r2_e50_kappa${KAPPA_TAG}${RUN_SUFFIX}" \
   --update-procedure anytime-nonparametric \
   --r_init 2 \
   --num_trajectories 8000 \
@@ -156,7 +171,7 @@ run_python l4dc/quad-swarm-rl/conformal.py \
   --anytime-check-every 10 \
   --anytime-init-trajectories 1000 \
   --anytime-delta-init 0.05 \
-  > "train_dir/gtg_s${SEED}_anytime_nonparametric_kappa${KAPPA_TAG}.log" 2>&1 &
+  > "train_dir/gtg_s${SEED}_anytime_nonparametric_kappa${KAPPA_TAG}${RUN_SUFFIX}.log" 2>&1 &
 PIDS+=("$!")
 NAMES+=("anytime-nonparametric")
 

@@ -107,6 +107,17 @@ def next_radius(
     raise ValueError(f"Unsupported iterative update procedure: {update_procedure}")
 
 
+def paper_calibrate_once_radius(
+    initial_radius: float,
+    calibrated_radius: float,
+    kappa: float,
+) -> float:
+    """Solve r = q0 + kappa * abs(r - r0), keeping the reference at r0."""
+    if calibrated_radius <= initial_radius:
+        return float((calibrated_radius + kappa * initial_radius) / (1.0 + kappa))
+    return float((calibrated_radius - kappa * initial_radius) / (1.0 - kappa))
+
+
 def calibrate_once_final_radius(
     initial_radius: float,
     calibrated_radius: float,
@@ -365,6 +376,7 @@ __all__ = [
     "joint_conformal_radius",
     "joint_rollout_error",
     "next_radius",
+    "paper_calibrate_once_radius",
     "run_multi_agents",
     "summarize_rollouts",
 ]

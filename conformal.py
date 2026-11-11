@@ -21,10 +21,13 @@ from project_utils.anytime_utils import (
     BRANCH_CONSERVATIVE,
     E_PROCESS_JEFFREYS,
     E_PROCESS_NORMAL,
+    E_PROCESS_FAMILIES,
+    INFORMED_FAMILIES,
     clopper_pearson_interval,
     contraction_factors,
     episode_error_budget,
     max_active_episodes,
+    initialize_mixture_prior,
     run_anytime_episode,
 )
 from project_utils.conformal_utils import (
@@ -33,16 +36,18 @@ from project_utils.conformal_utils import (
     joint_conformal_radius,
     joint_rollout_error,
     next_radius,
+    paper_calibrate_once_radius,
     run_multi_agents,
     summarize_rollouts,
 )
+from project_utils import full_cbf_utils
 from project_utils.full_cbf_utils import make_cbf_filter
 from project_utils.prediction_utils import (
     EVALUATION_SCENARIO,
     collect_homogeneous_trajectories,
     load_prediction_artifact,
 )
-from project_utils.restart_utils import deterministic_reset
+from project_utils.restart_utils import deterministic_reset, set_global_seed
 from project_utils.utils import latest_checkpoint, load_actor, load_cfg
 
 
@@ -54,6 +59,7 @@ UPDATE_PROCEDURES = (
     "naive",
     "non-interactive",
     "calibrate-once",
+    "calibrate-once-paper",
     "anytime",
     "anytime-nonparametric",
 )
@@ -71,6 +77,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--train_dir", default="train_dir")
     parser.add_argument("--experiment_name", required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--run-seed",
+        type=int,
+        default=None,
+        help="Optional calibration/assessment seed, applied once after scenario and prediction setup. Omit to preserve the historical random stream.",
+    )
     parser.add_argument("--r_init", type=float, default=DEFAULT_INITIAL_RADIUS)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--delta", type=float, default=0.1)
@@ -79,6 +91,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_KAPPA,
         help="Small-gain coefficient used by radius updates (default: 0.6).",
+    )
+    parser.add_argument(
+        "--cbf-k1",
+        type=float,
+        default=full_cbf_utils.CBF_K1,
+        help="ECBF gain, independent of the radius-update kappa.",
+    )
+    parser.add_argument(
+        "--cbf-solver",
+        choices=("cascade", "legacy"),
+        default="cascade",
+        help="Solver behavior: validated cascade, or historical ECOS-only replay.",
     )
     parser.add_argument("--episode_length", type=int, default=1500)
     parser.add_argument(
@@ -109,9 +133,21 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--update-procedure",
         choices=UPDATE_PROCEDURES,
         default="robust",
-        help="Radius update rule. Defaults to the legacy conformal.py behavior.",
+        help="Radius update rule. calibrate-once-paper solves the fixed-reference One-time CP equation; calibrate-once preserves the legacy recurrence.",
     )
     parser.add_argument("--anytime-radius-tolerance", type=float, default=0.15)
+    parser.add_argument(
+        "--anytime-family", choices=E_PROCESS_FAMILIES,
+        help="E-process mixture (default: jeffreys; anytime-nonparametric selects normal).",
+    )
+    parser.add_argument(
+        "--anytime-jeffreys-weight", type=float, default=None,
+        help="Jeffreys prior weight eta for hybrid/directional mixtures (default: 0.5).",
+    )
+    parser.add_argument(
+        "--anytime-directional-weight", type=float, default=None,
+        help="Lower-side mixture weight w for directional (default: 0.5).",
+    )
     parser.add_argument(
         "--anytime-check-every",
         type=int,
@@ -137,6 +173,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
 
+    if args.run_seed is not None and not 0 <= args.run_seed < 2**32:
+        parser.error("--run-seed must lie in [0, 4294967295]")
     if args.episode_length < 2:
         parser.error("--episode_length must be at least 2")
     if args.num_trajectories <= 0:
@@ -151,7 +189,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--delta must lie in (0, 1)")
     if not np.isfinite(args.kappa) or not 0.0 <= args.kappa < 1.0:
         parser.error("--kappa must lie in [0, 1)")
-    non_iterative_procedures = {"non-interactive", "calibrate-once"}
+    if not np.isfinite(args.cbf_k1) or args.cbf_k1 <= 0:
+        parser.error("--cbf-k1 must be finite and positive")
+    non_iterative_procedures = {"non-interactive", "calibrate-once", "calibrate-once-paper"}
     if (
         args.update_procedure not in non_iterative_procedures
         and args.num_episodes == 0
@@ -173,7 +213,33 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--anytime-check-every must be positive")
     if args.anytime_init_trajectories < 0:
         parser.error("--anytime-init-trajectories must be non-negative")
+    if args.update_procedure not in ANYTIME_PROCEDURES and any(value is not None for value in (
+        args.anytime_family, args.anytime_jeffreys_weight, args.anytime_directional_weight,
+    )):
+        parser.error("anytime mixture options require an anytime update procedure")
     if args.update_procedure in ANYTIME_PROCEDURES:
+        if args.update_procedure == "anytime-nonparametric":
+            if args.anytime_family not in (None, E_PROCESS_NORMAL):
+                parser.error("anytime-nonparametric requires the normal family")
+            args.anytime_family = E_PROCESS_NORMAL
+        elif args.anytime_family is None:
+            args.anytime_family = E_PROCESS_JEFFREYS
+        if args.anytime_jeffreys_weight is not None and args.anytime_family not in (
+            "jeffreys-informed", "directional",
+        ):
+            parser.error("--anytime-jeffreys-weight requires a hybrid or directional mixture")
+        if args.anytime_directional_weight is not None and args.anytime_family != "directional":
+            parser.error("--anytime-directional-weight requires the directional mixture")
+        if args.anytime_jeffreys_weight is None:
+            args.anytime_jeffreys_weight = 0.5
+        if args.anytime_directional_weight is None:
+            args.anytime_directional_weight = 0.5
+        if not 0 < args.anytime_jeffreys_weight <= 1:
+            parser.error("--anytime-jeffreys-weight must lie in (0, 1]")
+        if not 0 < args.anytime_directional_weight < 1:
+            parser.error("--anytime-directional-weight must lie in (0, 1)")
+        if args.anytime_family in INFORMED_FAMILIES and args.anytime_init_trajectories == 0:
+            parser.error("informed mixtures require --anytime-init-trajectories for the initial prior")
         has_calibration = args.anytime_init_trajectories > 0
         if has_calibration == args.anytime_assume_initial_safe:
             parser.error(
@@ -222,7 +288,10 @@ def _empty_metrics() -> dict:
         "cumulative_reward_runs_per_episode": [],
         "agent_locs_per_episode": [],
         "predicted_traj_per_episode": [],
+        "evaluation_scores_per_episode": [],
+        "initial_reference_scores": [],
         "anytime_current_radius_per_episode": [],
+        "anytime_reference_scores": [],
         "anytime_current_lower_radius_per_episode": [],
         "anytime_next_radius_per_episode": [],
         "anytime_next_lower_radius_per_episode": [],
@@ -249,6 +318,7 @@ def _empty_metrics() -> dict:
         "anytime_candidate_lower_radius_history_per_episode": [],
         "anytime_candidate_width_history_per_episode": [],
         "anytime_config": None,
+        "anytime_priors": [],
         "anytime_run_termination_reason": None,
     }
 
@@ -259,6 +329,7 @@ def _record_episode(
     radius: float,
     summary: dict,
     pred_trajectories,
+    evaluation_scores=None,
 ) -> None:
     metrics["qj_per_episode"].append(qj)
     metrics["radius_per_episode"].append(radius)
@@ -276,6 +347,10 @@ def _record_episode(
     metrics["predicted_traj_per_episode"].append(
         np.asarray(pred_trajectories, dtype=np.float32).copy()
     )
+    if evaluation_scores is not None:
+        metrics["evaluation_scores_per_episode"].append(
+            np.asarray(evaluation_scores, dtype=np.float64).copy()
+        )
 
 
 def _record_anytime_episode(
@@ -284,6 +359,7 @@ def _record_anytime_episode(
     episode_delta: float,
     min_radius: float,
 ) -> None:
+    metrics["anytime_priors"].append(result.prior)
     metrics["anytime_current_radius_per_episode"].append(result.radius)
     metrics["anytime_current_lower_radius_per_episode"].append(
         result.lower_radius
@@ -408,8 +484,28 @@ def _save_metrics(
         "delta": args.delta,
         "bar_alpha": alpha_bar,
         "kappa": args.kappa,
+        "cbf_k1": args.cbf_k1,
+        "cbf_solver": np.asarray(args.cbf_solver),
         "update_procedure": np.asarray(args.update_procedure),
     }
+
+    if metrics["evaluation_scores_per_episode"]:
+        scores = np.asarray(metrics["evaluation_scores_per_episode"], dtype=np.float64)
+        radii = np.asarray(metrics["radius_per_episode"], dtype=np.float64)
+        if scores.ndim != 2 or scores.shape[0] != len(radii) or not scores.shape[1]:
+            raise ValueError("Assessment scores must have one nonempty row per recorded policy")
+        if len(metrics["initial_reference_scores"]):
+            scores = np.vstack([metrics["initial_reference_scores"], scores])
+            radii = np.r_[args.r_init, radii]
+        if not np.all(np.isfinite(scores)):
+            raise ValueError("Assessment scores must be finite")
+        output.update(
+            assessment_radii=radii,
+            assessment_scores=scores,
+            assessment_quantiles=np.quantile(
+                scores, 1.0 - args.alpha, axis=1, method="inverted_cdf",
+            ),
+        )
 
     if metrics["anytime_trajectory_count_per_episode"]:
         config = metrics["anytime_config"]
@@ -549,6 +645,22 @@ def _save_metrics(
                 config["initial_indicators"], dtype=np.int8
             ),
         )
+        if config["family"] in INFORMED_FAMILIES:
+            priors = metrics["anytime_priors"]
+            for field in (
+                "a", "b", "mean", "concentration", "source_count", "source_radius",
+                "shift", "near_fraction", "jeffreys_weight", "directional_weight",
+            ):
+                output[f"anytime_prior_{field}_per_episode"] = np.asarray(
+                    [getattr(prior, field) for prior in priors],
+                    dtype=np.int64 if field == "source_count" else np.float64,
+                )
+        if len(metrics["anytime_reference_scores"]):
+            reference_scores = np.asarray(metrics["anytime_reference_scores"], dtype=np.float64)
+            output["anytime_reference_scores"] = reference_scores
+            output["anytime_reference_quantile_per_episode"] = np.quantile(
+                reference_scores, 1.0 - args.alpha, axis=1, method="inverted_cdf",
+            )
 
     np.savez(metrics_path, **output)
     return metrics_path
@@ -577,6 +689,7 @@ def _validate_predictions(
 
 def main() -> None:
     args = parse_args()
+    print(f"ECBF gain={args.cbf_k1} solver={args.cbf_solver}")
 
     MAX_RADIUS = args.r_init
 
@@ -754,6 +867,10 @@ def main() -> None:
             args.episode_length,
         )
 
+        # Do not reseed by default: startup has already advanced the legacy stream.
+        if args.run_seed is not None:
+            set_global_seed(args.run_seed)
+
         min_radius = env.quad_arm * COLLISION_HITBOX_RADIUS
         if args.update_procedure in ANYTIME_PROCEDURES:
             alpha_bar = np.nan
@@ -784,7 +901,9 @@ def main() -> None:
                 dtype=np.float64,
             )
             if solo_action_fn is None:
-                solo_action_fn = make_cbf_filter(radii)
+                solo_action_fn = make_cbf_filter(
+                    radii, cbf_k1=args.cbf_k1, solver_mode=args.cbf_solver,
+                )
             if deterministic is None:
                 deterministic = args.deterministic
             return collect_rollouts(
@@ -808,6 +927,7 @@ def main() -> None:
             )
 
         metrics = _empty_metrics()
+        initial_predictions = [prediction.copy() for prediction in pred_trajectories]
 
         def evaluate_and_record(radius: float, qj: float):
             logs = collect_for_radius(radius, args.num_eval_trajs)
@@ -826,6 +946,7 @@ def main() -> None:
                 radius,
                 summary,
                 pred_trajectories,
+                evaluation_scores(logs),
             )
             print(
                 f"Cum rew: {summary['cumulative_reward']} "
@@ -846,9 +967,20 @@ def main() -> None:
                     3:6,
                 ] = logs[agent_id][0]["velocity"]
 
+        def evaluation_scores(logs):
+            return np.asarray([
+                min_radius + joint_rollout_error(
+                    logs, pred_trajectories, args.num_multi_agents,
+                    args.episode_length, run_id,
+                )
+                for run_id in range(args.num_eval_trajs)
+            ], dtype=np.float64)
+
         def evaluate_anytime_and_record(radius: float):
             radii = np.full(args.num_multi_agents, radius, dtype=np.float64)
-            action_filter = make_cbf_filter(radii)
+            action_filter = make_cbf_filter(
+                radii, cbf_k1=args.cbf_k1, solver_mode=args.cbf_solver,
+            )
             # This deterministic trajectory is for plots/prediction updates only.
             reference_logs = collect_for_radius(
                 radius,
@@ -884,6 +1016,7 @@ def main() -> None:
                 radius,
                 summary,
                 pred_trajectories,
+                evaluation_scores(logs),
             )
             print(
                 f"Cum rew: {summary['cumulative_reward']} "
@@ -920,11 +1053,15 @@ def main() -> None:
 
                 if args.update_predictions and episode == 0:
                     update_predictions_from_logs(logs)
-        elif args.update_procedure == "non-interactive":
+        elif args.update_procedure in ("non-interactive", "calibrate-once-paper"):
             q0 = calibrate(MAX_RADIUS)
             evaluate_and_record(MAX_RADIUS, q0)
 
-            radius = q0
+            radius = (
+                paper_calibrate_once_radius(MAX_RADIUS, q0, args.kappa)
+                if args.update_procedure == "calibrate-once-paper"
+                else q0
+            )
             print("r0", MAX_RADIUS, "q0", q0, "r1", radius)
             q1 = calibrate(radius)
             print("r1", radius, "q1", q1)
@@ -951,11 +1088,7 @@ def main() -> None:
             evaluate_and_record(radius, q_final)
             episode_ids = np.array([0, 1, args.num_episodes + 1])
         elif args.update_procedure in ANYTIME_PROCEDURES:
-            family = (
-                E_PROCESS_JEFFREYS
-                if args.update_procedure == "anytime"
-                else E_PROCESS_NORMAL
-            )
+            family = args.anytime_family
             radius = MAX_RADIUS
             lower_radius = min_radius
             if radius < lower_radius:
@@ -1058,9 +1191,23 @@ def main() -> None:
             else:
                 episode_limit = min(args.num_episodes, max(k_epsilon, 1))
             episode_ids = []
+            previous_scores = initial_scores
+            previous_radius = None
 
             for episode in range(episode_limit):
                 print("EPISODE", episode)
+                prior = None
+                if family in INFORMED_FAMILIES:
+                    prior = initialize_mixture_prior(
+                        previous_scores, radius=radius, previous_radius=previous_radius,
+                        kappa=args.kappa, jeffreys_weight=args.anytime_jeffreys_weight,
+                        directional_weight=args.anytime_directional_weight,
+                    )
+                    print(
+                        f"  prior a={prior.a:.6g} b={prior.b:.6g} "
+                        f"source_n={prior.source_count} sigma={prior.shift:.6g} "
+                        f"mu={prior.near_fraction:.6g}"
+                    )
                 episode_delta = episode_error_budget(
                     args.delta,
                     episode,
@@ -1071,7 +1218,9 @@ def main() -> None:
                     radius,
                     dtype=np.float64,
                 )
-                action_filter = make_cbf_filter(radii)
+                action_filter = make_cbf_filter(
+                    radii, cbf_k1=args.cbf_k1, solver_mode=args.cbf_solver,
+                )
                 sample_count = 0
 
                 def sample_joint_score():
@@ -1111,6 +1260,7 @@ def main() -> None:
                     max_samples=args.num_trajectories,
                     family=family,
                     check_every=args.anytime_check_every,
+                    prior=prior,
                 )
                 print(
                     f"status={result.branch} reason={result.termination_reason} "
@@ -1131,6 +1281,8 @@ def main() -> None:
                 evaluate_anytime_and_record(result.next_radius)
                 episode_ids.append(episode)
 
+                previous_scores = result.scores
+                previous_radius = result.radius
                 radius = result.next_radius
                 lower_radius = result.next_lower_radius
                 if result.branch == BRANCH_CERTIFICATE:
@@ -1158,6 +1310,29 @@ def main() -> None:
                 )
 
             episode_ids = np.asarray(episode_ids, dtype=np.int64)
+
+        if args.update_procedure in ("robust", "naive", *ANYTIME_PROCEDURES):
+            # Assess r0 last so plotting data cannot alter any update's RNG stream.
+            # Its predictor must also be the original one if predictions were updated.
+            print("Collecting initial-policy quantile reference")
+            final_predictions = pred_trajectories
+            pred_trajectories = initial_predictions
+            try:
+                initial_reference_logs = collect_for_radius(
+                    MAX_RADIUS, args.num_eval_trajs,
+                    deterministic=args.deterministic,
+                    first_run_deterministic=False,
+                )
+                metrics["initial_reference_scores"] = evaluation_scores(initial_reference_logs)
+            finally:
+                pred_trajectories = final_predictions
+
+        if args.update_procedure in ANYTIME_PROCEDURES:
+            # Assessment after update j belongs to the bounds for episode j+1.
+            metrics["anytime_reference_scores"] = np.asarray([
+                metrics["initial_reference_scores"],
+                *metrics["evaluation_scores_per_episode"][:-1],
+            ], dtype=np.float64)
 
         metrics_path = _save_metrics(
             experiment_dir,

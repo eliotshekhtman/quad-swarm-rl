@@ -10,6 +10,7 @@ from project_utils.conformal_utils import (
     joint_conformal_radius,
     joint_rollout_error,
     next_radius,
+    paper_calibrate_once_radius,
     summarize_rollouts,
 )
 
@@ -75,6 +76,23 @@ class RadiusUpdateTests(unittest.TestCase):
     def test_unknown_update_procedure_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             next_radius("unknown", 4.0, 2.0, 0.6, 0.1, 8.0)
+
+    def test_paper_calibrate_once_solves_fixed_reference_equation(self):
+        for initial in (0.2, 2.0, 8.0):
+            for quantile in (0.0, initial / 2, initial, initial * 2):
+                for kappa in (0.0, 0.2, 0.6, 0.99):
+                    with self.subTest(initial=initial, quantile=quantile, kappa=kappa):
+                        radius = paper_calibrate_once_radius(initial, quantile, kappa)
+                        self.assertAlmostEqual(
+                            radius, quantile + kappa * abs(radius - initial),
+                        )
+
+    def test_paper_calibrate_once_matches_selected_experiment(self):
+        q0 = 1.488074361452269
+        radius = paper_calibrate_once_radius(2.0, q0, 0.2)
+        self.assertAlmostEqual(radius, 1.5733953012102242)
+        self.assertAlmostEqual(radius, explicit_radius_update(2.0, q0, 0.2, 0.1, 2.0))
+        self.assertGreater(radius, calibrate_once_final_radius(2.0, q0, 0.2, 20))
 
 
 class RolloutSummaryTests(unittest.TestCase):

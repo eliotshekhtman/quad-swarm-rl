@@ -11,6 +11,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from plot_calibration import (
+    load_initial_radius,
+    load_noninteractive_radius,
+    plot_cumulative_trajectories,
+    plot_quantile_bounds,
+)
 
 # Enable LaTeX rendering for labels and legends if available.
 plt.rcParams.update({
@@ -55,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--title_fontsize", type=float, default=12.0, help="Font size for plot titles.")
     parser.add_argument("--legend_fontsize", type=float, default=10.0, help="Font size for legend text.")
     parser.add_argument("--other_fontsize", type=float, default=10.0, help="Font size for axis labels and tick labels.")
+    parser.add_argument("--non_interactive", help="Non-interactive metrics for the reference radius line.")
     return parser.parse_args()
 
 # Helper to draw translucent conformal tubes (spheres) around predicted positions
@@ -89,6 +96,7 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     with np.load(data_path) as data:
+        initial_radius = load_initial_radius(data_path, data)
         episodes = data["episodes"]
         radius_arr = data["radius_per_episode"]
         qj_arr = data["qj_per_episode"]
@@ -140,8 +148,11 @@ def main() -> None:
 
     # Plot A: Radius across episodes (rj and qj)
     fig, ax = plt.subplots()
-    noninteractive_radius = 0.33648095
-    ax.axhline(noninteractive_radius, linestyle="--", color="gray", label=r"Non-interactive $1 - \bar \alpha$ quantile")
+    reference_path = args.non_interactive
+    if reference_path is None and update_procedure == "non-interactive":
+        reference_path = data_path
+    if reference_path is not None:
+        ax.axhline(load_noninteractive_radius(reference_path), linestyle="--", color="gray", label=r"Non-interactive $1 - \bar \alpha$ quantile")
     if (
         update_procedure in ("anytime", "anytime-nonparametric")
         and anytime_current_radius is not None
@@ -171,7 +182,7 @@ def main() -> None:
                 linestyle='--',
             )
     else:
-        shifted_radius_arr = np.insert(radius_arr, 0, 8)[:-1]
+        shifted_radius_arr = np.insert(radius_arr, 0, initial_radius)[:-1]
         ax.plot(episodes, shifted_radius_arr, label=r"$r_j$", marker='s')
         ax.plot(episodes, qj_arr, label=r"$q_j$ ($1 - \bar \alpha$ quantile)", marker='o')
     ax.set_title(r"\bf{(a)} Radius across episodes")
@@ -184,6 +195,9 @@ def main() -> None:
     fig.savefig(radius_plot_path, bbox_inches="tight", format='pdf')
     plt.close(fig)
     plot_paths["radius"] = radius_plot_path
+    plot_cumulative_trajectories({update_procedure: data_path}, output_dir)
+    if update_procedure in ("anytime", "anytime-nonparametric"):
+        plot_quantile_bounds(data_path, output_dir)
 
     # Plot B: Performance across episodes (cumulative reward)
     episodes = np.arange(1, num_episodes)

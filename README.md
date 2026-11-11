@@ -48,7 +48,7 @@ This should pull and install all the necessary dependencies including PyTorch.
 
 ### Conformal CBF evaluation
 
-`conformal.py` is the single driver for the five supported radius-update
+`conformal.py` is the single driver for the supported radius-update
 procedures. Select one with `--update-procedure`:
 
 ```
@@ -56,6 +56,7 @@ python conformal.py [model and output arguments] --update-procedure robust
 python conformal.py [model and output arguments] --update-procedure naive
 python conformal.py [model and output arguments] --update-procedure non-interactive
 python conformal.py [model and output arguments] --update-procedure calibrate-once
+python conformal.py [model and output arguments] --update-procedure calibrate-once-paper
 python conformal.py [model and output arguments] --update-procedure anytime --anytime-init-trajectories 1000
 python conformal.py [model and output arguments] --update-procedure anytime-nonparametric --anytime-init-trajectories 1000
 ```
@@ -65,13 +66,45 @@ directly from the current conformal quantile, `non-interactive` reproduces the
 final historical `conformal_falldown.py` schedule (calibrate at the known-safe
 initial radius, update once to that quantile, and then stop), and
 `calibrate-once` performs the initial calibration followed by the fixed legacy
-recurrence. All modes use the fourth-order exponential control barrier function
+recurrence. `calibrate-once-paper` instead solves `r = q0 + kappa * abs(r - r0)`
+once, as specified by One-time CP in the paper, and keeps that radius fixed.
+Its second collected batch measures the resulting quantile but does not update
+the radius; `--num_episodes` does not affect this method. The metrics can be
+passed to `plot_combined.py --calibrate_once` like the legacy baseline.
+All modes use the fourth-order exponential control barrier function
 and execute rollouts sequentially. Run `python conformal.py --help` for the
 required model and output arguments.
+
+`--seed` controls the scenario startup and prediction-artifact validation.
+Optionally add `--run-seed 100` to seed calibration and assessment randomness
+once, after scenario and prediction setup, for an independent repetition of
+the same scenario. Keep the same `--seed` and `--init_predictions` across
+repetitions. No environment reset is performed at this boundary, and the
+random stream continues across trajectories and episodes.
+
+Omitting `--run-seed` preserves the historical random stream exactly: there
+is no additional seeding call. Explicitly setting it equal to `--seed` does
+**not** reproduce the omitted-option behavior, since startup has already
+consumed random draws. Both values are saved in `conformal_args.json`.
+Use a distinct `--experiment_name` for each repetition.
+
+`run_all.sh` also accepts `--run-seed`. When supplied, it appends `_run<seed>`
+to all experiment names and log filenames, while reusing the prediction
+artifact for the scenario seed. Without this option, names and commands
+are unchanged. Equal run seeds across different algorithms do not ensure
+paired assessments, because their sample counts and RNG consumption differ.
 
 Policy inference defaults to CPU. Use `--device gpu` together with
 `CUDA_VISIBLE_DEVICES=<index>` to assign a process to one GPU; simulation and
 ECBF optimization remain CPU-bound.
+
+Controller settings are independent of the radius-update `--kappa`:
+`--cbf-k1` defaults to 2.5 and `--cbf-solver` defaults to `cascade`.
+For historical-controller replay, use `--cbf-k1 4 --cbf-solver legacy`.
+This restores ECOS-only solving, accepts inaccurate optimal solutions, and
+falls back to an available iterate or nominal thrust rather than previous thrust.
+It is a reproduction mode, not a stronger safety guarantee. Both controller
+settings are recorded in the experiment arguments and metrics.
 
 `anytime` implements the revised Algorithm 1 with the likelihood-based
 Jeffreys-mixture e-process. `anytime-nonparametric` uses the normal-mixture
@@ -80,7 +113,52 @@ stopping rule. One score represents the complete joint rollout: it is the
 physical separation radius plus the largest prediction error over all agents
 and timesteps. `--num_trajectories` is the per-episode cap in these modes.
 
-The driver uses the fixed quantile-sensitivity constant `KAPPA = 0.6`; density
+Select the other paper mixtures with `--update-procedure anytime` and
+`--anytime-family informed`, `jeffreys-informed`, or `directional`.
+`--anytime-family normal` is also an alias for the nonparametric family;
+omitting the family preserves Jeffreys. Hybrid and directional mixtures use
+`--anytime-jeffreys-weight` (eta, default 0.5). Directional additionally uses
+`--anytime-directional-weight` (w, default 0.5), the weight on the normalized
+lower-side mixture. The entire hybrid prior is split at alpha before weighting
+the two sides, as in Appendix A.2.
+
+These three new families require `--anytime-init-trajectories N`: equation (24)
+initializes the first Beta prior from the independent initial calibration and
+each subsequent prior from only the preceding episode's actual calibration
+scores. The exceedances are evaluated at the new current radius, with shift
+`kappa * abs(previous_radius - current_radius)` (zero initially). The prior is
+frozen for the entire episode, shared by all threshold tests, and previous
+scores are not reused as new evidence. No extra collection is needed for this
+initialization. The metrics include `anytime_family` and per-episode
+`anytime_prior_*_per_episode` arrays (a, b, mean, concentration, source count and
+radius, shift, nearby-score fraction, and weights) for reconstruction.
+
+All methods save `assessment_radii`, `assessment_scores`, and
+`assessment_quantiles`. Each score is physical separation plus the maximum
+prediction error over all non-ego agents and rollout timesteps. Quantiles use
+the empirical `1-alpha` order statistic (`inverted_cdf`), not the adjusted
+calibration level. The old `qj_per_episode` is unchanged. Assessment arrays
+include both initial and final policies: robust, naive, and anytime prepend
+the initial policy to their post-update assessments; non-interactive and both
+calibrate-once variants already assess the initial policy. Repeated radii are
+retained. The arrays explicitly identify the radius for every assessment row.
+
+All anytime families also save `anytime_reference_scores` and
+`anytime_reference_quantile_per_episode` for the within-episode bounds plot.
+Rows correspond to `anytime_current_radius_per_episode`, not the updated radius.
+These are independent assessment scores and their empirical `1-alpha` quantiles,
+not adjusted conformal quantiles or true population quantiles. Existing post-update
+assessments supply subsequent episodes' references. Robust, naive, and anytime
+collect one extra `num_eval_trajs` batch at the initial radius after all updates,
+using the original predictor even when baseline prediction updates are enabled.
+This leaves the algorithm's
+random sequence and decisions unchanged. These assessment samples are not
+calibration samples. Existing metrics files are not backfilled.
+The bounds plots from `plot_calibration.py` and `plot_conformal.py` automatically
+show the saved independent quantile estimate as a black dotted line and the
+deployed radius as a grey dash-dot line. Older files omit the quantile reference.
+
+The anytime driver uses fixed quantile sensitivity `--kappa` (default 0.6); density
 bounds and probability-slope estimates are not part of the revised algorithm.
 An anytime run must either certify its initial radius with independent data via
 `--anytime-init-trajectories N` and `--anytime-delta-init`, or explicitly state
@@ -88,6 +166,45 @@ the known-safe assumption with `--anytime-assume-initial-safe`. Prediction
 updates are rejected because they change the fixed radius-indexed policy family
 required by the guarantee. The default stopping-check frequency is one complete
 joint rollout and can be batched with `--anytime-check-every`.
+
+### Compact Paper Figures
+
+`plot_compact.py` accepts the same six input flags as `plot_combined.py`:
+`--robust`, `--naive`, `--calibrate_once`, `--non_interactive`, `--anytime`, and
+`--anytime_nonparametric`, each followed by a metrics `.npz` path. Use
+`--output_dir` to select the destination. It leaves `plot_combined.py` unchanged.
+Optional inputs `--anytime_informed`, `--anytime_jeffreys_informed`, and
+`--anytime_directional` add those saved mixtures. The plotter checks each file's
+family metadata, keeps the original six-input invocation valid, and expands the
+trajectory comparison to accommodate the supplied methods.
+
+The 2-by-4 `episode_progression.pdf` separates CP baselines from the supplied
+anytime mixtures. `--second-panel qj` selects radius, independent quantile,
+joint tube coverage, and cumulative calibration trajectories. The default
+`--second-panel reward` selects reward for column two and overlays independent
+quantiles as same-color dotted lines on column one's solid radii, labeled
+`r_j, q_j`. The quantile-column mode requires the new assessment fields in all
+input files; reward mode warns and omits unavailable dotted lines in old files.
+It never substitutes adjusted calibration quantiles. Error bars retain the existing per-rollout reward
+quantiles, not confidence intervals. Solid sample-budget lines count update
+calibration; dashed lines also include initial safety calibration. Assessment
+and prediction-collection rollouts are not included. Episode indexing and
+terminal-value repetition match the combined plotter; percentages are scaled
+to 0-100. Legacy calibrate-once is labeled separately from paper One-time CP.
+
+Four separate supplements are written: `ego_safety.pdf`,
+`anytime_quantile_bounds.pdf`, `final_trajectories.pdf`, and
+`anytime_tube_progression.pdf`. The bounds figure uses ordinary anytime only;
+`--bounds_episodes 0 2 4` overrides first/middle/last selection. Missing independent
+references are omitted with a warning, never replaced by calibration quantiles
+or radii. Infinite bounds are not replaced by finite values. The tube figure
+uses the first, second, and final saved post-update rollouts, not an invented
+initial-policy rollout. `--tube_agent` selects a non-ego agent (default 0), and
+`--elev` / `--azim` set a common 3D viewpoint. The ego is the last stored agent.
+Missing supplementary data skips the affected figure with a warning.
+Computer Modern fonts, paper colors/markers, and boxed axes are scoped to this
+plotter. LaTeX is used when installed; otherwise bundled Computer Modern fonts
+and mathtext render the figures without a TeX installation.
 
 ### Train
 

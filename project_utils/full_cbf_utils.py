@@ -162,6 +162,29 @@ def _solve_parameterized_qp(
     return clipped
 
 
+def _solve_legacy_parameterized_qp(
+    qp: _ParameterizedCbfQp,
+    u_min: np.ndarray,
+    u_max: np.ndarray,
+) -> np.ndarray:
+    """Reproduce the ECOS-only behavior from commit 89e0def."""
+    u_ref = qp.u_ref.value
+    try:
+        qp.problem.solve(solver=cp.ECOS, warm_start=False, verbose=False)
+    except cp.SolverError:
+        approx = qp.u_var.value
+        if approx is None:
+            approx = u_ref
+        clipped = np.clip(np.asarray(approx, dtype=np.float64), u_min, u_max)
+        print("QP timed out; returning last iterate:", clipped)
+        return clipped
+
+    if qp.problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        print("OTHER ISSUE", qp.problem.status)
+        return np.clip(u_ref, u_min, u_max)
+    return np.array(qp.u_var.value, dtype=np.float64)
+
+
 def _cross(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.cross(np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64))
 
@@ -402,6 +425,8 @@ def _solve_cbf_qp_single(
     debug=False,
     qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
     fallback_thrust: np.ndarray | None = None,
+    cbf_k1: float | None = None,
+    solver_mode: str = "cascade",
 ) -> np.ndarray:
     """
     Build and solve one affine approximation of the ego-only multi-neighbor ECBF QP.
@@ -416,7 +441,7 @@ def _solve_cbf_qp_single(
     num_multi_agents = len(radii)
     ego_terms = _ego_ecbf_terms(dynamics)
 
-    alpha = float(CBF_K1)
+    alpha = float(CBF_K1 if cbf_k1 is None else cbf_k1)
     lambda4 = float(CBF_K4)
     lambda3 = 4.0 * alpha
     lambda2 = 6.0 * (alpha ** 2)
@@ -475,14 +500,19 @@ def _solve_cbf_qp_single(
     )
     phi_list = list(zip(active_neighbor_indices, qp.phi_exprs))
 
-    if fallback_thrust is None:
-        fallback_thrust = u_ref
-    solution = _solve_parameterized_qp(
-        qp,
-        u_min=u_min,
-        u_max=u_max,
-        fallback_thrust=fallback_thrust,
-    )
+    if solver_mode == "legacy":
+        solution = _solve_legacy_parameterized_qp(qp, u_min, u_max)
+    elif solver_mode == "cascade":
+        if fallback_thrust is None:
+            fallback_thrust = u_ref
+        solution = _solve_parameterized_qp(
+            qp,
+            u_min=u_min,
+            u_max=u_max,
+            fallback_thrust=fallback_thrust,
+        )
+    else:
+        raise ValueError("solver_mode must be 'cascade' or 'legacy'.")
 
     if debug:
         for h_data, h1_data, phi_data in zip(h_list, h1_list, phi_list):
@@ -508,6 +538,8 @@ def _solve_cbf_qp(
     debug=False,
     qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
     fallback_thrust: np.ndarray | None = None,
+    cbf_k1: float | None = None,
+    solver_mode: str = "cascade",
 ) -> np.ndarray:
     """
     Solve the ego-only ECBF QP, optionally re-linearising h⁽⁴⁾ around the latest iterate.
@@ -528,6 +560,8 @@ def _solve_cbf_qp(
             thrust_bounds=thrust_bounds,
             qp_cache=qp_cache,
             fallback_thrust=fallback_thrust,
+            cbf_k1=cbf_k1,
+            solver_mode=solver_mode,
             debug=debug,
         )
         if debug:
@@ -552,6 +586,8 @@ def apply_cbf_filter(
     debug=False,
     qp_cache: dict[Tuple[int, ...], _ParameterizedCbfQp] | None = None,
     solver_state: dict | None = None,
+    cbf_k1: float | None = None,
+    solver_mode: str = "cascade",
 ) -> np.ndarray:
     """
     Wrap the raw ego-policy action with a 4th-order ECBF safety filter.
@@ -589,6 +625,8 @@ def apply_cbf_filter(
             relinearization_passes=(CBF_RELINEARIZATION_PASSES if use_repeated_linearization else 1),
             qp_cache=qp_cache,
             fallback_thrust=fallback_thrust,
+            cbf_k1=cbf_k1,
+            solver_mode=solver_mode,
             debug=debug,
         )
 
@@ -611,9 +649,19 @@ def apply_cbf_filter(
     return clipped_action
 
 
-def make_cbf_filter(radii: np.ndarray, use_repeated_linearization: bool = False):
+def make_cbf_filter(
+    radii: np.ndarray,
+    use_repeated_linearization: bool = False,
+    *,
+    cbf_k1: float | None = None,
+    solver_mode: str = "cascade",
+):
+    if cbf_k1 is not None and (not np.isfinite(cbf_k1) or cbf_k1 <= 0):
+        raise ValueError("cbf_k1 must be finite and positive.")
+    if solver_mode not in ("cascade", "legacy"):
+        raise ValueError("solver_mode must be 'cascade' or 'legacy'.")
     qp_cache = {}
-    solver_state = {}
+    solver_state = {} if solver_mode == "cascade" else None
 
     def filter(base_action: np.ndarray, env_state, swarm_state: SwarmState, debug=False):
         return apply_cbf_filter(
@@ -624,6 +672,8 @@ def make_cbf_filter(radii: np.ndarray, use_repeated_linearization: bool = False)
             use_repeated_linearization=use_repeated_linearization,
             qp_cache=qp_cache,
             solver_state=solver_state,
+            cbf_k1=cbf_k1,
+            solver_mode=solver_mode,
             debug=debug,
         )
 

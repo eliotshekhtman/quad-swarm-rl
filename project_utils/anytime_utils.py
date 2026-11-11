@@ -6,7 +6,7 @@ from functools import lru_cache
 from typing import Callable
 
 import numpy as np
-from scipy.special import betaln, betaincinv
+from scipy.special import betainc, betaincc, betaln, betaincinv
 
 
 BRANCH_CERTIFICATE = "certificate"
@@ -14,8 +14,72 @@ BRANCH_CONSERVATIVE = "conservative"
 BRANCH_UNRESOLVED = "unresolved"
 
 E_PROCESS_JEFFREYS = "jeffreys"
+E_PROCESS_INFORMED = "informed"
+E_PROCESS_JEFFREYS_INFORMED = "jeffreys-informed"
+E_PROCESS_DIRECTIONAL = "directional"
 E_PROCESS_NORMAL = "normal"
-E_PROCESS_FAMILIES = (E_PROCESS_JEFFREYS, E_PROCESS_NORMAL)
+INFORMED_FAMILIES = (
+    E_PROCESS_INFORMED, E_PROCESS_JEFFREYS_INFORMED, E_PROCESS_DIRECTIONAL,
+)
+E_PROCESS_FAMILIES = (E_PROCESS_JEFFREYS, *INFORMED_FAMILIES, E_PROCESS_NORMAL)
+
+
+@dataclass(frozen=True)
+class MixturePrior:
+    """Episode-frozen Beta prior and its equation (24) initialization record."""
+
+    a: float
+    b: float
+    jeffreys_weight: float = 0.5
+    directional_weight: float = 0.5
+    source_count: int = 0
+    source_radius: float = 0.0
+    shift: float = 0.0
+    near_fraction: float = 0.0
+
+    def __post_init__(self):
+        if not all(np.isfinite(v) and v > 0 for v in (self.a, self.b)):
+            raise ValueError("Beta prior shapes must be finite and positive.")
+        if not 0 < self.jeffreys_weight <= 1:
+            raise ValueError("Jeffreys weight must lie in (0, 1].")
+        if not 0 < self.directional_weight < 1:
+            raise ValueError("Directional weight must lie in (0, 1).")
+
+    @property
+    def mean(self):
+        return self.a / (self.a + self.b)
+
+    @property
+    def concentration(self):
+        return self.a + self.b
+
+
+def initialize_mixture_prior(
+    scores, *, radius, previous_radius=None, kappa,
+    jeffreys_weight=0.5, directional_weight=0.5,
+) -> MixturePrior:
+    """Use only the preceding episode's unpadded scores; never current evidence."""
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.ndim != 1 or not scores.size or np.any(~np.isfinite(scores)) or np.any(scores < 0):
+        raise ValueError("Prior initialization requires nonempty, finite, nonnegative scores.")
+    if not np.isfinite(radius) or radius < 0:
+        raise ValueError("radius must be finite and non-negative.")
+    contraction_factors(kappa)
+    source_radius = radius if previous_radius is None else previous_radius
+    if not np.isfinite(source_radius) or source_radius < 0:
+        raise ValueError("previous_radius must be finite and non-negative.")
+    shift = kappa * abs(source_radius - radius)
+    mean = (1 + np.count_nonzero(scores > radius)) / (len(scores) + 2)
+    near_fraction = np.mean(np.abs(scores - radius) <= shift)
+    concentration = float(len(scores)) if near_fraction == 0 else float(np.clip(
+        mean * (1 - mean) / (near_fraction / 2)**2 - 1, 1, len(scores),
+    ))
+    return MixturePrior(
+        a=concentration * mean, b=concentration * (1 - mean),
+        jeffreys_weight=jeffreys_weight, directional_weight=directional_weight,
+        source_count=len(scores), source_radius=float(source_radius),
+        shift=float(shift), near_fraction=float(near_fraction),
+    )
 
 
 def _validate_alpha(alpha: float) -> None:
@@ -55,11 +119,95 @@ def normal_log_e_value(n: int, k, alpha: float):
     return float(values) if values.ndim == 0 else values
 
 
-def log_e_value(family: str, n: int, k, alpha: float):
+def _beta_log_e_value(n, counts, alpha, a, b):
+    return (betaln(counts + a, n - counts + b) - betaln(a, b)
+            - counts * np.log(alpha) - (n - counts) * np.log1p(-alpha))
+
+
+def _small_beta_log_tail(a, b, x):
+    """Log I_x(a,b) when its small lower tail underflows in scipy.special.
+
+    Modified Lentz evaluation of the incomplete-beta continued fraction
+    (DLMF 8.17(v)); the exponential prefactor stays in log space.
+    """
+    tiny = 1e-300
+
+    def nonzero(value):
+        return np.copysign(tiny, value) if abs(value) < tiny else value
+
+    c = 1.0
+    d = 1.0 / nonzero(1.0 - (a + b) * x / (a + 1))
+    h = d
+    for m in range(1, 1001):
+        aa = m * (b - m) * x / ((a + 2*m - 1) * (a + 2*m))
+        d = 1.0 / nonzero(1.0 + aa * d)
+        c = nonzero(1.0 + aa / c)
+        h *= d * c
+        aa = -(a + m) * (a + b + m) * x / ((a + 2*m) * (a + 2*m + 1))
+        d = 1.0 / nonzero(1.0 + aa * d)
+        c = nonzero(1.0 + aa / c)
+        change = d * c
+        h *= change
+        if abs(change - 1.0) <= 8 * np.finfo(float).eps:
+            return (a * np.log(x) + b * np.log1p(-x) - betaln(a, b)
+                    + np.log(h / a))
+    raise ArithmeticError("Incomplete-beta continued fraction did not converge.")
+
+
+def _log_beta_tail(a, b, x, *, upper=False):
+    a, b = np.broadcast_arrays(np.asarray(a, dtype=float), np.asarray(b, dtype=float))
+    probability = betaincc(a, b, x) if upper else betainc(a, b, x)
+    with np.errstate(divide="ignore"):
+        result = np.log(probability)
+    result = np.array(result, copy=True)
+    # Avoid subtracting a CDF from one, and retain evidence in underflowed tails.
+    for index in np.flatnonzero(probability < 1e-280):
+        aa, bb = float(a.flat[index]), float(b.flat[index])
+        result.flat[index] = (_small_beta_log_tail(bb, aa, 1 - x) if upper
+                              else _small_beta_log_tail(aa, bb, x))
+    return result
+
+
+def _hybrid_log_sum(jeffreys, informed, weight):
+    if weight == 1:
+        return jeffreys
+    return np.logaddexp(np.log(weight) + jeffreys, np.log1p(-weight) + informed)
+
+
+@lru_cache(maxsize=32)
+def _directional_log_masses(prior, alpha):
+    return tuple(_hybrid_log_sum(
+        _log_beta_tail(0.5, 0.5, alpha, upper=upper),
+        _log_beta_tail(prior.a, prior.b, alpha, upper=upper),
+        prior.jeffreys_weight,
+    ) for upper in (False, True))
+
+
+def log_e_value(family: str, n: int, k, alpha: float, prior: MixturePrior | None = None):
     if family == E_PROCESS_JEFFREYS:
         return jeffreys_log_e_value(n, k, alpha)
     if family == E_PROCESS_NORMAL:
         return normal_log_e_value(n, k, alpha)
+    if family in INFORMED_FAMILIES:
+        if prior is None:
+            raise ValueError(f"{family} requires an episode-frozen prior.")
+        _validate_alpha(alpha)
+        counts = _validate_count(n, k)
+        informed = _beta_log_e_value(n, counts, alpha, prior.a, prior.b)
+        if family == E_PROCESS_INFORMED:
+            return informed
+        jeffreys = jeffreys_log_e_value(n, k, alpha)
+        if family == E_PROCESS_JEFFREYS_INFORMED:
+            return _hybrid_log_sum(jeffreys, informed, prior.jeffreys_weight)
+        log_masses = _directional_log_masses(prior, alpha)
+        sides = []
+        for upper, log_mass in enumerate(log_masses):
+            sides.append(_hybrid_log_sum(
+                jeffreys + _log_beta_tail(counts + .5, n - counts + .5, alpha, upper=upper),
+                informed + _log_beta_tail(counts + prior.a, n - counts + prior.b, alpha, upper=upper),
+                prior.jeffreys_weight,
+            ) - log_mass)
+        return _hybrid_log_sum(sides[0], sides[1], prior.directional_weight)
     raise ValueError(f"Unknown e-process family: {family}")
 
 
@@ -69,6 +217,7 @@ def critical_exceedance_counts(
     alpha: float,
     delta: float,
     family: str,
+    prior: MixturePrior | None = None,
 ) -> tuple[int, int]:
     """Return the few- and many-exceedance critical counts in equation (30)."""
     _validate_alpha(alpha)
@@ -76,6 +225,8 @@ def critical_exceedance_counts(
         raise ValueError("delta must lie in [0, 1).")
     if family not in E_PROCESS_FAMILIES:
         raise ValueError(f"Unknown e-process family: {family}")
+    if family in INFORMED_FAMILIES and prior is None:
+        raise ValueError(f"{family} requires an episode-frozen prior.")
     if n < 0:
         raise ValueError("n must be non-negative.")
     if delta == 0.0:
@@ -86,7 +237,7 @@ def critical_exceedance_counts(
     upper_start = int(np.ceil(n * alpha))
 
     def rejected(k: int) -> bool:
-        return log_e_value(family, n, k, alpha) >= boundary
+        return log_e_value(family, n, k, alpha, prior) >= boundary
 
     # Each e-value is convex in k, so its rejection set consists of two tails.
     few = -1
@@ -120,6 +271,7 @@ def precompute_critical_counts(
     alpha: float,
     delta: float,
     family: str,
+    prior: MixturePrior | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if max_samples < 0:
         raise ValueError("max_samples must be non-negative.")
@@ -131,6 +283,7 @@ def precompute_critical_counts(
             alpha=alpha,
             delta=delta,
             family=family,
+            prior=prior,
         )
     few.setflags(write=False)
     many.setflags(write=False)
@@ -147,6 +300,7 @@ class QuantileConfidenceSequence:
         delta: float,
         family: str,
         max_samples: int,
+        prior: MixturePrior | None = None,
     ) -> None:
         self.alpha = float(alpha)
         self.delta = float(delta)
@@ -157,6 +311,7 @@ class QuantileConfidenceSequence:
             self.alpha,
             self.delta,
             self.family,
+            prior,
         )
         self.sorted_scores: list[float] = []
         self.n = 0
@@ -350,6 +505,7 @@ class AnytimeEpisodeResult:
     candidate_radius_history: np.ndarray
     candidate_lower_radius_history: np.ndarray
     candidate_width_history: np.ndarray
+    prior: MixturePrior | None = None
 
 
 def run_anytime_episode(
@@ -364,6 +520,7 @@ def run_anytime_episode(
     max_samples: int,
     family: str = E_PROCESS_JEFFREYS,
     check_every: int = 1,
+    prior: MixturePrior | None = None,
 ) -> AnytimeEpisodeResult:
     if max_samples <= 0:
         raise ValueError("max_samples must be positive.")
@@ -378,6 +535,7 @@ def run_anytime_episode(
         delta=delta,
         family=family,
         max_samples=max_samples,
+        prior=prior,
     )
     current_width = radius - lower_radius
     if current_width < 0.0:
@@ -494,6 +652,7 @@ def run_anytime_episode(
             lower_radius_history, dtype=np.float64
         ),
         candidate_width_history=np.asarray(width_history, dtype=np.float64),
+        prior=prior,
     )
 
 
@@ -504,6 +663,12 @@ __all__ = [
     "BRANCH_UNRESOLVED",
     "BracketCandidate",
     "E_PROCESS_FAMILIES",
+    "E_PROCESS_INFORMED",
+    "E_PROCESS_JEFFREYS_INFORMED",
+    "E_PROCESS_DIRECTIONAL",
+    "INFORMED_FAMILIES",
+    "MixturePrior",
+    "initialize_mixture_prior",
     "E_PROCESS_JEFFREYS",
     "E_PROCESS_NORMAL",
     "QuantileConfidenceSequence",
